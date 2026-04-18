@@ -1,0 +1,27 @@
+# Dev notes
+notes/
+
+# Compiled binaries
+hearthstore
+server
+cmd/server/server
+
+# SQLite database files
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Data directory
+data/
+
+# Claude Code
+.claude/
+
+# Vim undo files
+*.un~
+
+# macOS
+.DS_Store

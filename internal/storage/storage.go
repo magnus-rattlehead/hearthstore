@@ -5,9 +5,30 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	_ "modernc.org/sqlite"
 )
+
+// dbExec is satisfied by both *sql.DB and *sql.Tx, enabling helpers to work
+// in either a plain connection or a caller-supplied transaction.
+type dbExec interface {
+	QueryRow(query string, args ...any) *sql.Row
+	Query(query string, args ...any) (*sql.Rows, error)
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+// pragmaDSN applies these pragmas to every connection via DSN query params.
+// journal_mode=WAL is omitted — it's a file-level setting, set once on wdb.
+const pragmaDSN = "_pragma=synchronous(NORMAL)" +
+	"&_pragma=busy_timeout(5000)" +
+	"&_pragma=mmap_size(8589934592)" +
+	"&_pragma=cache_size(-131072)" +
+	"&_pragma=foreign_keys(1)"
 
 const schema = `
 CREATE TABLE IF NOT EXISTS documents (
@@ -15,11 +36,100 @@ CREATE TABLE IF NOT EXISTS documents (
     database    TEXT NOT NULL,
     path        TEXT NOT NULL,
     collection  TEXT NOT NULL,
+    parent_path TEXT NOT NULL DEFAULT '',
     data        BLOB NOT NULL,
     create_time TEXT NOT NULL,
     update_time TEXT NOT NULL,
     deleted     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (project, database, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_collection ON documents (project, database, parent_path, collection);
+
+-- Cloud Datastore API entities (separate from Firestore Native documents)
+CREATE TABLE IF NOT EXISTS ds_documents (
+    project     TEXT NOT NULL,
+    database    TEXT NOT NULL DEFAULT '(default)',
+    namespace   TEXT NOT NULL DEFAULT '',
+    path        TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    parent_path TEXT NOT NULL DEFAULT '',
+    data        BLOB NOT NULL,
+    create_time TEXT NOT NULL,
+    update_time TEXT NOT NULL,
+    version     INTEGER NOT NULL DEFAULT 1,
+    deleted     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (project, database, namespace, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ds_kind
+    ON ds_documents (project, database, namespace, parent_path, kind);
+
+-- Append-only change log for Datastore snapshot reads (readTime / read-only transactions).
+-- Every entity write/delete appends a row; queries use MAX(change_time) <= readTime.
+CREATE TABLE IF NOT EXISTS ds_document_changes (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    project     TEXT NOT NULL,
+    database    TEXT NOT NULL DEFAULT '(default)',
+    namespace   TEXT NOT NULL DEFAULT '',
+    path        TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    parent_path TEXT NOT NULL DEFAULT '',
+    change_time TEXT NOT NULL,
+    deleted     INTEGER NOT NULL DEFAULT 0,
+    data        BLOB   -- NULL for deletes
+);
+
+CREATE INDEX IF NOT EXISTS idx_ds_changes_doc ON ds_document_changes
+    (project, database, namespace, path, seq);
+
+CREATE INDEX IF NOT EXISTS idx_ds_changes_kind ON ds_document_changes
+    (project, database, namespace, parent_path, kind, change_time);
+
+-- Denormalized field values for Datastore entities — enables SQL filter pushdown.
+-- Populated on every write; cleared on soft-delete.
+CREATE TABLE IF NOT EXISTS ds_field_index (
+    project      TEXT NOT NULL,
+    database     TEXT NOT NULL DEFAULT '(default)',
+    namespace    TEXT NOT NULL DEFAULT '',
+    kind         TEXT NOT NULL,
+    doc_path     TEXT NOT NULL,
+    field_path   TEXT NOT NULL,
+    value_string TEXT,
+    value_int    INTEGER,
+    value_double REAL,
+    value_bool   INTEGER,
+    value_bytes  BLOB,
+    value_null   INTEGER,
+    value_ref    TEXT,
+    value_lat    REAL,
+    value_lng    REAL,
+    in_array     INTEGER NOT NULL DEFAULT 0
+);
+
+-- Filter lookups scoped to (namespace, kind, field).
+CREATE INDEX IF NOT EXISTS idx_ds_field ON ds_field_index (
+    project, database, namespace, kind, field_path,
+    value_string, value_int, value_double
+);
+
+-- Per-document cleanup on re-index and soft-delete.
+CREATE INDEX IF NOT EXISTS idx_ds_doc_fields ON ds_field_index
+    (project, database, namespace, doc_path);
+
+-- Covering index for correlated EXISTS subqueries in WHERE clauses.
+CREATE INDEX IF NOT EXISTS idx_ds_doc_join ON ds_field_index
+    (project, database, namespace, doc_path, field_path,
+     value_string, value_int, value_double);
+
+-- Monotonic ID sequences for AllocateIds
+CREATE TABLE IF NOT EXISTS ds_id_sequences (
+    project   TEXT NOT NULL,
+    database  TEXT NOT NULL DEFAULT '(default)',
+    namespace TEXT NOT NULL DEFAULT '',
+    kind      TEXT NOT NULL,
+    next_id   INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (project, database, namespace, kind)
 );
 
 CREATE TABLE IF NOT EXISTS field_index (
@@ -34,7 +144,8 @@ CREATE TABLE IF NOT EXISTS field_index (
     value_bool      INTEGER,
     value_bytes     BLOB,
     value_null      INTEGER,
-    value_ref       TEXT
+    value_ref       TEXT,
+    in_array        INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_field ON field_index (
@@ -43,54 +154,145 @@ CREATE INDEX IF NOT EXISTS idx_field ON field_index (
 );
 
 CREATE INDEX IF NOT EXISTS idx_doc_fields ON field_index (project, database, doc_path);
+
+-- Partial index: covers only live documents; eliminates the per-row deleted=0
+-- table lookup that idx_collection requires.
+CREATE INDEX IF NOT EXISTS idx_collection_active ON documents
+    (project, database, parent_path, collection)
+    WHERE deleted=0;
+
+-- Covering index for ORDER BY LEFT JOINs. The join condition leads with doc_path,
+-- which is not in idx_field, causing full field_index scans per sort field.
+CREATE INDEX IF NOT EXISTS idx_doc_join ON field_index
+    (project, database, doc_path, field_path,
+     value_string, value_int, value_double);
+
+-- Covering index for SUM/AVG aggregations. Excludes array-element rows and
+-- null/non-numeric values at the index level so the aggregation query needs no
+-- per-row table lookups into field_index.
+CREATE INDEX IF NOT EXISTS idx_field_numeric ON field_index
+    (project, database, collection_path, field_path, value_int, value_double)
+    WHERE in_array=0 AND (value_int IS NOT NULL OR value_double IS NOT NULL);
+
+-- Append-only change log for Listen resumeToken support.
+-- Every document write/delete appends a row; seq is the token value.
+CREATE TABLE IF NOT EXISTS document_changes (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    project     TEXT NOT NULL,
+    database    TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    collection  TEXT NOT NULL,
+    parent_path TEXT NOT NULL DEFAULT '',
+    change_time TEXT NOT NULL,
+    deleted     INTEGER NOT NULL DEFAULT 0,
+    data        BLOB   -- NULL for deletes
+);
+
+-- Scoped range scan for Query-target diffs.
+CREATE INDEX IF NOT EXISTS idx_changes_scope ON document_changes
+    (project, database, parent_path, collection, seq);
+
+-- Per-document diff for Documents-target reconnects.
+CREATE INDEX IF NOT EXISTS idx_changes_doc ON document_changes
+    (project, database, path, seq);
 `
 
 // Store is the disk-backed document store.
 type Store struct {
-	db *sql.DB
+	wdb *sql.DB // single write connection — serialises all mutations
+	rdb *sql.DB // read connection pool — concurrent readers, never blocks writers (WAL)
+
+	// pub/sub for real-time Listen delivery
+	subMu  sync.Mutex
+	subs   map[uint64]chan ChangeEvent
+	nextID uint64
 }
 
 // New opens (or creates) the SQLite database at dataDir/hearthstore.db.
+// Uses two pools: one write connection (serialised) and up to 4 readers;
+// WAL mode allows concurrent reads without blocking writes.
 func New(dataDir string) (*Store, error) {
 	dbPath := filepath.Join(dataDir, "hearthstore.db")
 
-	// Ensure the data directory exists.
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("creating data dir: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	dsn := dbPath + "?" + pragmaDSN
+
+	wdb, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("opening sqlite: %w", err)
+		return nil, fmt.Errorf("opening sqlite (write): %w", err)
 	}
+	wdb.SetMaxOpenConns(1)
+	wdb.SetMaxIdleConns(1)
 
-	// WAL mode for concurrent reads + writes, mmap for OS-managed paging.
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=NORMAL",
-		"PRAGMA mmap_size=8589934592", // 8 GB — OS decides what stays in RAM
-		"PRAGMA cache_size=-131072",   // 128 MB in-process page cache
-		"PRAGMA foreign_keys=ON",
+	// WAL mode persists in the file; read pool connections inherit it.
+	if _, err := wdb.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		return nil, fmt.Errorf("setting WAL mode: %w", err)
 	}
-	for _, p := range pragmas {
-		if _, err := db.Exec(p); err != nil {
-			return nil, fmt.Errorf("setting pragma %q: %w", p, err)
-		}
-	}
-
-	if _, err := db.Exec(schema); err != nil {
+	if _, err := wdb.Exec(schema); err != nil {
 		return nil, fmt.Errorf("applying schema: %w", err)
 	}
+	// Refresh query planner statistics (non-fatal if unsupported).
+	_, _ = wdb.Exec("PRAGMA optimize")
 
-	return &Store{db: db}, nil
+	rdb, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("opening sqlite (read): %w", err)
+	}
+	rdb.SetMaxOpenConns(4)
+	rdb.SetMaxIdleConns(4)
+
+	return &Store{
+		wdb:  wdb,
+		rdb:  rdb,
+		subs: make(map[uint64]chan ChangeEvent),
+	}, nil
 }
 
-// Close closes the underlying database connection.
+// Close closes both database connections.
 func (s *Store) Close() error {
-	return s.db.Close()
+	rerr := s.rdb.Close()
+	werr := s.wdb.Close()
+	if rerr != nil {
+		return rerr
+	}
+	return werr
 }
 
-// DB returns the raw *sql.DB for use by sub-packages.
+// DB returns the write connection. Used only by tests that need direct DB access.
 func (s *Store) DB() *sql.DB {
-	return s.db
+	return s.wdb
+}
+
+// RunInTx executes fn inside a SQLite write transaction. If fn returns an
+// error the transaction is rolled back; otherwise it is committed.
+// SQLite BUSY errors (database locked) are mapped to codes.Aborted so that
+// Datastore clients with retry logic will retry the transaction.
+func (s *Store) RunInTx(fn func(tx *sql.Tx) error) error {
+	tx, err := s.wdb.Begin()
+	if err != nil {
+		return wrapBusy(err)
+	}
+	if err := fn(tx); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return wrapBusy(err)
+	}
+	return nil
+}
+
+// wrapBusy maps SQLite BUSY errors to codes.Aborted so clients will retry.
+func wrapBusy(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "database is locked") || strings.Contains(msg, "SQLITE_BUSY") {
+		return status.Errorf(codes.Aborted, "database busy, retry the transaction: %v", err)
+	}
+	return err
 }
