@@ -8,9 +8,6 @@ The official Firestore emulator stores all data in JVM heap memory, making it im
 
 - **Firestore Native API** — full gRPC + WebChannel (Firebase JS SDK) + REST support
 - **Cloud Datastore API** — gRPC and REST, compatible with all Datastore client libraries
-- **Persistent storage** — data survives restarts; no re-seeding required
-- **Low memory** — SQLite mmap; OS page cache manages hot data automatically
-- **Single binary** — no JVM, no Docker required
 
 ## Quick start
 
