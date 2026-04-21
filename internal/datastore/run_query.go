@@ -919,14 +919,20 @@ func buildDsInNotInClause(project, database, namespace, kind, prop string, filte
 
 // buildSortSpecs converts q.Order into DsSortSpec entries for SQL ORDER BY.
 // Returns nil when there are no explicit sort orders (uses SQL default d.path ASC).
+// __key__ gets Col="__path__" so it is handled via d.path without a field index join.
 func buildSortSpecs(orders []*datastorepb.PropertyOrder) []storage.DsSortSpec {
 	if len(orders) == 0 {
 		return nil
 	}
 	specs := make([]storage.DsSortSpec, len(orders))
 	for i, ord := range orders {
+		col := ""
+		if ord.Property.GetName() == "__key__" {
+			col = "__path__"
+		}
 		specs[i] = storage.DsSortSpec{
 			FieldPath: ord.Property.GetName(),
+			Col:       col,
 			Desc:      ord.Direction == datastorepb.PropertyOrder_DESCENDING,
 		}
 	}

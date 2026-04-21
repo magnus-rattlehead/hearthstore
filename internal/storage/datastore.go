@@ -25,8 +25,9 @@ type DsSortSpec struct {
 
 // CursorSortKV holds the sort-field value for one ORDER BY field in a keyset cursor.
 type CursorSortKV struct {
-	Col string `json:"c"` // ds_field_index column name
-	V   string `json:"v"` // sort value serialized as string
+	Col  string `json:"c"`           // ds_field_index column name
+	V    string `json:"v"`           // sort value serialized as string
+	Null bool   `json:"n,omitempty"` // true when the sort field value is null or absent
 }
 
 // CursorPayload is the structured cursor for keyset pagination; JSON-marshaled
@@ -373,6 +374,53 @@ func (s *Store) detectSortColumn(project, database, namespace, kind, fieldPath s
 	}
 }
 
+// runPathSortQuery handles ORDER BY __key__ (Col == "__path__") by ordering
+// directly on d.path without any ds_field_index join. Uses idx_ds_kind_path for
+// O(page-size) scans.
+func (s *Store) runPathSortQuery(
+	project, database, namespace, kind, ancestorPath string,
+	filterSQL string, filterArgs []any,
+	sort DsSortSpec,
+	cursor *CursorPayload,
+	limit int,
+) ([]*DsEntityRow, error) {
+	var sb strings.Builder
+	var args []any
+
+	sb.WriteString(`SELECT d.data, d.version, d.create_time, d.update_time, d.path`)
+	sb.WriteString(` FROM ds_documents d`)
+	sb.WriteString(` WHERE d.project=? AND d.database=? AND d.namespace=? AND d.kind=? AND d.deleted=0`)
+	args = append(args, project, database, namespace, kind)
+
+	if ancestorPath != "" {
+		sb.WriteString(` AND (d.path=? OR d.path LIKE ?)`)
+		args = append(args, ancestorPath, ancestorPath+"/%")
+	}
+	if filterSQL != "" {
+		sb.WriteString(` AND `)
+		sb.WriteString(filterSQL)
+		args = append(args, filterArgs...)
+	}
+	if cursor != nil {
+		op := ">"
+		if sort.Desc {
+			op = "<"
+		}
+		fmt.Fprintf(&sb, ` AND d.path %s ?`, op)
+		args = append(args, cursor.P)
+	}
+
+	if sort.Desc {
+		sb.WriteString(` ORDER BY d.path DESC`)
+	} else {
+		sb.WriteString(` ORDER BY d.path ASC`)
+	}
+	fmt.Fprintf(&sb, ` LIMIT ?`)
+	args = append(args, limit)
+
+	return s.scanEntityRows(sb.String(), args)
+}
+
 // runSingleSortQuery handles the common single-ORDER-BY case by driving from
 // ds_field_index (INNER JOIN to ds_documents). This lets SQLite use the
 // idx_ds_field_sort_* covering indexes to scan in ORDER BY order and stop at
@@ -408,13 +456,30 @@ func (s *Store) runSingleSortQuery(
 	}
 
 	if cursor != nil && len(cursor.S) > 0 {
-		cv := parseCursorValue(cursor.S[0].Col, cursor.S[0].V)
-		op := ">"
-		if sort.Desc {
-			op = "<"
+		kv := cursor.S[0]
+		if kv.Null {
+			// Cursor landed on a null-valued entity.
+			if sort.Desc {
+				// Null comes last in DESC; remaining nulls are after cursor path.
+				fmt.Fprintf(&sb, ` AND (fi.%s IS NULL AND d.path > ?)`, sort.Col)
+				args = append(args, cursor.P)
+			} else {
+				// Null comes first in ASC; remaining are non-nulls OR nulls after cursor path.
+				fmt.Fprintf(&sb, ` AND (fi.%s IS NOT NULL OR (fi.%s IS NULL AND d.path > ?))`, sort.Col, sort.Col)
+				args = append(args, cursor.P)
+			}
+		} else {
+			cv := parseCursorValue(kv.Col, kv.V)
+			op := ">"
+			if sort.Desc {
+				op = "<"
+				// Include null-valued entities that come after all non-nulls in DESC order.
+				fmt.Fprintf(&sb, ` AND ((fi.%s %s ?) OR (fi.%s = ? AND d.path > ?) OR fi.%s IS NULL)`, sort.Col, op, sort.Col, sort.Col)
+			} else {
+				fmt.Fprintf(&sb, ` AND ((fi.%s %s ?) OR (fi.%s = ? AND d.path > ?))`, sort.Col, op, sort.Col)
+			}
+			args = append(args, cv, cv, cursor.P)
 		}
-		fmt.Fprintf(&sb, ` AND ((fi.%s %s ?) OR (fi.%s = ? AND d.path > ?))`, sort.Col, op, sort.Col)
-		args = append(args, cv, cv, cursor.P)
 	} else if cursor != nil {
 		sb.WriteString(` AND d.path > ?`)
 		args = append(args, cursor.P)
@@ -430,9 +495,15 @@ func (s *Store) runSingleSortQuery(
 	fmt.Fprintf(&sb, ` LIMIT ?`)
 	args = append(args, limit)
 
-	rows, err := s.rdb.Query(sb.String(), args...)
+	return s.scanEntityRows(sb.String(), args)
+}
+
+// scanEntityRows executes a query that selects (data, version, create_time, update_time, path)
+// and returns the decoded entity rows.
+func (s *Store) scanEntityRows(query string, args []any) ([]*DsEntityRow, error) {
+	rows, err := s.rdb.Query(query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("ds single-sort query: %w", err)
+		return nil, fmt.Errorf("ds query: %w", err)
 	}
 	defer rows.Close()
 
@@ -442,11 +513,11 @@ func (s *Store) runSingleSortQuery(
 		var version int64
 		var createStr, updateStr, path string
 		if err := rows.Scan(&data, &version, &createStr, &updateStr, &path); err != nil {
-			return nil, fmt.Errorf("ds single-sort scan: %w", err)
+			return nil, fmt.Errorf("ds scan: %w", err)
 		}
 		var e datastorepb.Entity
 		if err := proto.Unmarshal(data, &e); err != nil {
-			return nil, fmt.Errorf("ds single-sort unmarshal: %w", err)
+			return nil, fmt.Errorf("ds unmarshal: %w", err)
 		}
 		ct, _ := time.Parse(timeLayout, createStr)
 		ut, _ := time.Parse(timeLayout, updateStr)
@@ -473,8 +544,18 @@ func (s *Store) runLimitedQuery(
 	limit int,
 ) ([]*DsEntityRow, error) {
 	if len(sorts) == 1 {
+		if sorts[0].Col == "__path__" {
+			return s.runPathSortQuery(project, database, namespace, kind, ancestorPath,
+				filterSQL, filterArgs, sorts[0], cursor, limit)
+		}
 		return s.runSingleSortQuery(project, database, namespace, kind, ancestorPath,
 			filterSQL, filterArgs, sorts[0], cursor, limit)
+	}
+	// Multi-sort with __key__ cannot be pushed to SQL; signal Go-side fallback.
+	for _, sp := range sorts {
+		if sp.Col == "__path__" {
+			return nil, ErrColumnNotDetected
+		}
 	}
 
 	var sb strings.Builder
@@ -538,35 +619,7 @@ func (s *Store) runLimitedQuery(
 	sb.WriteString(` LIMIT ?`)
 	args = append(args, limit)
 
-	rows, err := s.rdb.Query(sb.String(), args...)
-	if err != nil {
-		return nil, fmt.Errorf("ds limited query: %w", err)
-	}
-	defer rows.Close()
-
-	var results []*DsEntityRow
-	for rows.Next() {
-		var data []byte
-		var version int64
-		var createStr, updateStr, path string
-		if err := rows.Scan(&data, &version, &createStr, &updateStr, &path); err != nil {
-			return nil, fmt.Errorf("ds limited scan: %w", err)
-		}
-		var e datastorepb.Entity
-		if err := proto.Unmarshal(data, &e); err != nil {
-			return nil, fmt.Errorf("ds limited unmarshal: %w", err)
-		}
-		ct, _ := time.Parse(timeLayout, createStr)
-		ut, _ := time.Parse(timeLayout, updateStr)
-		results = append(results, &DsEntityRow{
-			Entity:     &e,
-			Version:    version,
-			CreateTime: timestamppb.New(ct),
-			UpdateTime: timestamppb.New(ut),
-			Path:       path,
-		})
-	}
-	return results, rows.Err()
+	return s.scanEntityRows(sb.String(), args)
 }
 
 // buildKeysetCondition constructs the SQL OR-chain for keyset pagination.

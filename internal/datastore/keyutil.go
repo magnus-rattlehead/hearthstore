@@ -159,6 +159,18 @@ func decodeCursorFull(b []byte) (storage.CursorPayload, bool) {
 	if jsonErr := json.Unmarshal(decoded, &cp); jsonErr == nil && cp.P != "" {
 		return cp, true
 	}
+	// The REST/JSON transport double-encodes cursors: pjsonMarshal serialises the
+	// EndCursor []byte field as StdB64, so clients receive StdB64(URLSafeB64(JSON)).
+	// After one decode above we hold URLSafeB64(JSON); one more URL-safe decode reaches
+	// the JSON payload. This depth is always exactly 2 — cursors are regenerated fresh
+	// from entity data each page, so layers never accumulate across pages.
+	if decoded2, err2 := base64.URLEncoding.DecodeString(string(decoded)); err2 == nil {
+		if jsonErr := json.Unmarshal(decoded2, &cp); jsonErr == nil && cp.P != "" {
+			return cp, true
+		}
+		// Plain path after double decode (REST plain-path cursor).
+		return storage.CursorPayload{P: string(decoded2)}, true
+	}
 	// Fall back: treat decoded bytes as a plain path (old-format cursor).
 	return storage.CursorPayload{P: string(decoded)}, true
 }
@@ -172,8 +184,21 @@ func buildCursor(path string, sorts []storage.DsSortSpec, row *storage.DsEntityR
 	}
 	kvs := make([]storage.CursorSortKV, 0, len(sorts))
 	for _, sp := range sorts {
+		if sp.Col == "__path__" {
+			// __key__ sort: path is the sort value, no field index involved.
+			kvs = append(kvs, storage.CursorSortKV{Col: "__path__", V: path})
+			continue
+		}
 		v := getProp(row.Entity, sp.FieldPath)
-		kvs = append(kvs, storage.CursorSortKV{Col: sp.Col, V: serializeSortValue(v)})
+		kv := storage.CursorSortKV{Col: sp.Col}
+		if v == nil {
+			kv.Null = true
+		} else if _, isNull := v.ValueType.(*datastorepb.Value_NullValue); isNull {
+			kv.Null = true
+		} else {
+			kv.V = serializeSortValue(v)
+		}
+		kvs = append(kvs, kv)
 	}
 	return encodeCursorFull(storage.CursorPayload{P: path, S: kvs})
 }

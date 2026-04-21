@@ -1,7 +1,9 @@
 package datastore
 
 import (
+	"encoding/base64"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -758,6 +760,239 @@ func TestRunQuery(t *testing.T) {
 				}
 				if r3.Batch.MoreResults != datastorepb.QueryResultBatch_NO_MORE_RESULTS {
 					t.Errorf("page3: want NO_MORE_RESULTS, got %v", r3.Batch.MoreResults)
+				}
+			},
+		},
+		{
+			name: "order_by_key_asc",
+			run: func(t *testing.T, s *Server, kind string) {
+				seedKind(t, s, kind, []seedRow{
+					{"charlie", map[string]*datastorepb.Value{"v": dsInt(3)}},
+					{"alpha", map[string]*datastorepb.Value{"v": dsInt(1)}},
+					{"bravo", map[string]*datastorepb.Value{"v": dsInt(2)}},
+					{"delta", map[string]*datastorepb.Value{"v": dsInt(4)}},
+					{"echo", map[string]*datastorepb.Value{"v": dsInt(5)}},
+				})
+				r1 := qKind(t, s, kind, &datastorepb.Query{
+					Order: []*datastorepb.PropertyOrder{{
+						Property:  &datastorepb.PropertyReference{Name: "__key__"},
+						Direction: datastorepb.PropertyOrder_ASCENDING,
+					}},
+					Limit: wrapperspb.Int32(3),
+				})
+				if n := len(r1.Batch.EntityResults); n != 3 {
+					t.Fatalf("page1: want 3, got %d", n)
+				}
+				names1 := [3]string{
+					r1.Batch.EntityResults[0].Entity.Key.Path[0].GetName(),
+					r1.Batch.EntityResults[1].Entity.Key.Path[0].GetName(),
+					r1.Batch.EntityResults[2].Entity.Key.Path[0].GetName(),
+				}
+				if names1 != [3]string{"alpha", "bravo", "charlie"} {
+					t.Errorf("page1 order: got %v", names1)
+				}
+				r2 := qKind(t, s, kind, &datastorepb.Query{
+					Order: []*datastorepb.PropertyOrder{{
+						Property:  &datastorepb.PropertyReference{Name: "__key__"},
+						Direction: datastorepb.PropertyOrder_ASCENDING,
+					}},
+					Limit:       wrapperspb.Int32(3),
+					StartCursor: r1.Batch.EndCursor,
+				})
+				if n := len(r2.Batch.EntityResults); n != 2 {
+					t.Fatalf("page2: want 2, got %d", n)
+				}
+				names2 := [2]string{
+					r2.Batch.EntityResults[0].Entity.Key.Path[0].GetName(),
+					r2.Batch.EntityResults[1].Entity.Key.Path[0].GetName(),
+				}
+				if names2 != [2]string{"delta", "echo"} {
+					t.Errorf("page2 order: got %v", names2)
+				}
+			},
+		},
+		{
+			name: "order_by_key_desc",
+			run: func(t *testing.T, s *Server, kind string) {
+				seedKind(t, s, kind, []seedRow{
+					{"alpha", map[string]*datastorepb.Value{"v": dsInt(1)}},
+					{"bravo", map[string]*datastorepb.Value{"v": dsInt(2)}},
+					{"charlie", map[string]*datastorepb.Value{"v": dsInt(3)}},
+					{"delta", map[string]*datastorepb.Value{"v": dsInt(4)}},
+					{"echo", map[string]*datastorepb.Value{"v": dsInt(5)}},
+				})
+				r1 := qKind(t, s, kind, &datastorepb.Query{
+					Order: []*datastorepb.PropertyOrder{{
+						Property:  &datastorepb.PropertyReference{Name: "__key__"},
+						Direction: datastorepb.PropertyOrder_DESCENDING,
+					}},
+					Limit: wrapperspb.Int32(3),
+				})
+				if n := len(r1.Batch.EntityResults); n != 3 {
+					t.Fatalf("page1: want 3, got %d", n)
+				}
+				names1 := [3]string{
+					r1.Batch.EntityResults[0].Entity.Key.Path[0].GetName(),
+					r1.Batch.EntityResults[1].Entity.Key.Path[0].GetName(),
+					r1.Batch.EntityResults[2].Entity.Key.Path[0].GetName(),
+				}
+				if names1 != [3]string{"echo", "delta", "charlie"} {
+					t.Errorf("page1 order: got %v", names1)
+				}
+				r2 := qKind(t, s, kind, &datastorepb.Query{
+					Order: []*datastorepb.PropertyOrder{{
+						Property:  &datastorepb.PropertyReference{Name: "__key__"},
+						Direction: datastorepb.PropertyOrder_DESCENDING,
+					}},
+					Limit:       wrapperspb.Int32(3),
+					StartCursor: r1.Batch.EndCursor,
+				})
+				if n := len(r2.Batch.EntityResults); n != 2 {
+					t.Fatalf("page2: want 2, got %d", n)
+				}
+				names2 := [2]string{
+					r2.Batch.EntityResults[0].Entity.Key.Path[0].GetName(),
+					r2.Batch.EntityResults[1].Entity.Key.Path[0].GetName(),
+				}
+				if names2 != [2]string{"bravo", "alpha"} {
+					t.Errorf("page2 order: got %v", names2)
+				}
+			},
+		},
+		{
+			name: "desc_null_sort_cursor",
+			run: func(t *testing.T, s *Server, kind string) {
+				// Entities with explicit null score sort last in DESC; paginate through them.
+				seedKind(t, s, kind, []seedRow{
+					{"a", map[string]*datastorepb.Value{"score": dsInt(10)}},
+					{"b", map[string]*datastorepb.Value{"score": dsInt(5)}},
+					{"c", map[string]*datastorepb.Value{"score": dsNull()}},
+					{"d", map[string]*datastorepb.Value{"score": dsNull()}},
+					{"e", map[string]*datastorepb.Value{"score": dsNull()}},
+				})
+				order := []*datastorepb.PropertyOrder{{
+					Property:  &datastorepb.PropertyReference{Name: "score"},
+					Direction: datastorepb.PropertyOrder_DESCENDING,
+				}}
+				seen := map[string]bool{}
+				cursor := []byte(nil)
+				for page := 0; page < 10; page++ {
+					q := &datastorepb.Query{Order: order, Limit: wrapperspb.Int32(2), StartCursor: cursor}
+					r := qKind(t, s, kind, q)
+					for _, er := range r.Batch.EntityResults {
+						name := er.Entity.Key.Path[0].GetName()
+						if seen[name] {
+							t.Errorf("duplicate entity %q on page %d", name, page+1)
+						}
+						seen[name] = true
+					}
+					if r.Batch.MoreResults == datastorepb.QueryResultBatch_NO_MORE_RESULTS {
+						break
+					}
+					cursor = r.Batch.EndCursor
+				}
+				if len(seen) != 5 {
+					t.Errorf("desc_null_sort_cursor: want 5 distinct entities, got %d: %v", len(seen), seen)
+				}
+			},
+		},
+		{
+			// Simulate the REST/JSON transport double-encoding: pjsonMarshal encodes the
+			// EndCursor bytes field as StdB64; the Python gcloud.rest client then applies
+			// _cursor_to_urlsafe and sends the result directly (no _cursor_from_urlsafe).
+			// pjsonUnmarshal URL-safe-decodes that, giving StdB64(URLSafeB64(JSON)) bytes
+			// as StartCursor. Without the double-decode fix, decodeCursorFull would treat
+			// URLSafeB64(JSON) as a plain path, and the keyset condition would return 0 rows.
+			name: "rest_double_encoded_cursor",
+			run: func(t *testing.T, s *Server, kind string) {
+				rows := make([]seedRow, 30)
+				for i := range rows {
+					rows[i] = seedRow{
+						fmt.Sprintf("e%04d", i),
+						map[string]*datastorepb.Value{"score": dsInt(int64(i + 1))},
+					}
+				}
+				seedKind(t, s, kind, rows)
+
+				order := []*datastorepb.PropertyOrder{
+					{Property: &datastorepb.PropertyReference{Name: "score"}, Direction: datastorepb.PropertyOrder_DESCENDING},
+				}
+				seen := make(map[string]bool, 30)
+				var cursor []byte
+				for page := 0; page < 10; page++ {
+					resp := qKind(t, s, kind, &datastorepb.Query{
+						Order:       order,
+						Limit:       wrapperspb.Int32(10),
+						StartCursor: cursor,
+					})
+					for _, er := range resp.Batch.EntityResults {
+						name := er.Entity.Key.Path[len(er.Entity.Key.Path)-1].GetName()
+						if seen[name] {
+							t.Errorf("duplicate entity %q on page %d", name, page+1)
+						}
+						seen[name] = true
+					}
+					if resp.Batch.MoreResults != datastorepb.QueryResultBatch_MORE_RESULTS_AFTER_LIMIT {
+						break
+					}
+					// Simulate REST double-encoding: pjsonMarshal encodes EndCursor bytes as
+					// StdB64, Python applies urlsafe substitution, pjsonUnmarshal URL-safe-decodes.
+					// Net result received by decodeCursorFull: StdB64(original EndCursor bytes).
+					raw := resp.Batch.EndCursor
+					stdEncoded := base64.StdEncoding.EncodeToString(raw)
+					urlSafe := strings.NewReplacer("+", "-", "/", "_").Replace(stdEncoded)
+					decoded, err := base64.URLEncoding.DecodeString(urlSafe)
+					if err != nil {
+						t.Fatalf("simulated REST re-encode failed: %v", err)
+					}
+					cursor = decoded
+				}
+				if len(seen) != 30 {
+					t.Errorf("rest_double_encoded_cursor: want 30 entities, got %d", len(seen))
+				}
+			},
+		},
+		{
+			name: "multi_database_isolation",
+			run: func(t *testing.T, s *Server, kind string) {
+				const dbA = "(default)"
+				const dbB = "mydb"
+				// Seed one entity in each database.
+				for _, db := range []string{dbA, dbB} {
+					db := db
+					key := &datastorepb.Key{
+						PartitionId: &datastorepb.PartitionId{ProjectId: testProject, DatabaseId: db},
+						Path:        []*datastorepb.Key_PathElement{{Kind: kind, IdType: &datastorepb.Key_PathElement_Name{Name: "e1"}}},
+					}
+					mustPost(t, s, "commit", &datastorepb.CommitRequest{
+						ProjectId:  testProject,
+						DatabaseId: db,
+						Mutations: []*datastorepb.Mutation{
+							{Operation: &datastorepb.Mutation_Upsert{Upsert: &datastorepb.Entity{
+								Key:        key,
+								Properties: map[string]*datastorepb.Value{"db": dsStr(db)},
+							}}},
+						},
+					}, &datastorepb.CommitResponse{})
+				}
+				// Query each database; each should return exactly one entity.
+				for _, db := range []string{dbA, dbB} {
+					var resp datastorepb.RunQueryResponse
+					mustPost(t, s, "runQuery", &datastorepb.RunQueryRequest{
+						ProjectId:  testProject,
+						DatabaseId: db,
+						QueryType: &datastorepb.RunQueryRequest_Query{
+							Query: &datastorepb.Query{Kind: []*datastorepb.KindExpression{{Name: kind}}},
+						},
+					}, &resp)
+					if n := len(resp.Batch.EntityResults); n != 1 {
+						t.Errorf("db=%q: want 1 entity, got %d", db, n)
+						continue
+					}
+					gotDB := resp.Batch.EntityResults[0].Entity.Properties["db"].GetStringValue()
+					if gotDB != db {
+						t.Errorf("db=%q: entity has db=%q", db, gotDB)
+					}
 				}
 			},
 		},

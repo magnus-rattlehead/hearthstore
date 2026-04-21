@@ -18,7 +18,4 @@
 ## Known gaps
 
 - **GeoPoint filters**: fall back to in-process Go evaluation; no SQL pushdown. Needs a dedicated test to ensure correctness.
-- **`__name__` ORDER BY**: `__key__` is not stored in `ds_field_index`, so keyset pagination falls back to Go-side processing for queries that ORDER BY `__key__`. Cursor positioning across pages may behave differently from Datastore in edge cases.
-- **Keyset pagination + DESC + NULL sort values**: when a kind has entities where a DESC-sorted field is absent (NULL in `ds_field_index`), those entities appear after all non-null values in SQLite's DESC ordering but are not included in keyset cursor conditions. Queries against uniformly-populated kinds are unaffected.
-- **Multi-database**: Firestore supports named databases (`projects/p/databases/mydb`); the path parser should be tested with non-`(default)` names.
 - **`POST /reset` endpoint**: a reset endpoint that clears all data without restarting would be useful for test suite teardown.
