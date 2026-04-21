@@ -373,7 +373,98 @@ func (s *Store) detectSortColumn(project, database, namespace, kind, fieldPath s
 	}
 }
 
-// runLimitedQuery builds and executes the paginated SQL query.
+// runSingleSortQuery handles the common single-ORDER-BY case by driving from
+// ds_field_index (INNER JOIN to ds_documents). This lets SQLite use the
+// idx_ds_field_sort_* covering indexes to scan in ORDER BY order and stop at
+// LIMIT, making each page O(page-size) rather than O(kind-size).
+func (s *Store) runSingleSortQuery(
+	project, database, namespace, kind, ancestorPath string,
+	filterSQL string, filterArgs []any,
+	sort DsSortSpec,
+	cursor *CursorPayload,
+	limit int,
+) ([]*DsEntityRow, error) {
+	var sb strings.Builder
+	var args []any
+
+	sb.WriteString(`SELECT d.data, d.version, d.create_time, d.update_time, d.path`)
+	sb.WriteString(` FROM ds_field_index fi`)
+	sb.WriteString(` INNER JOIN ds_documents d`)
+	sb.WriteString(` ON d.project=fi.project AND d.database=fi.database`)
+	sb.WriteString(` AND d.namespace=fi.namespace AND d.path=fi.doc_path AND d.deleted=0`)
+
+	sb.WriteString(` WHERE fi.project=? AND fi.database=? AND fi.namespace=? AND fi.kind=?`)
+	sb.WriteString(` AND fi.field_path=? AND fi.in_array=0`)
+	args = append(args, project, database, namespace, kind, sort.FieldPath)
+
+	if ancestorPath != "" {
+		sb.WriteString(` AND (d.path=? OR d.path LIKE ?)`)
+		args = append(args, ancestorPath, ancestorPath+"/%")
+	}
+	if filterSQL != "" {
+		sb.WriteString(` AND `)
+		sb.WriteString(filterSQL)
+		args = append(args, filterArgs...)
+	}
+
+	if cursor != nil && len(cursor.S) > 0 {
+		cv := parseCursorValue(cursor.S[0].Col, cursor.S[0].V)
+		op := ">"
+		if sort.Desc {
+			op = "<"
+		}
+		fmt.Fprintf(&sb, ` AND ((fi.%s %s ?) OR (fi.%s = ? AND d.path > ?))`, sort.Col, op, sort.Col)
+		args = append(args, cv, cv, cursor.P)
+	} else if cursor != nil {
+		sb.WriteString(` AND d.path > ?`)
+		args = append(args, cursor.P)
+	}
+
+	fmt.Fprintf(&sb, ` ORDER BY fi.%s`, sort.Col)
+	if sort.Desc {
+		sb.WriteString(` DESC`)
+	} else {
+		sb.WriteString(` ASC`)
+	}
+	sb.WriteString(`, d.path ASC`)
+	fmt.Fprintf(&sb, ` LIMIT ?`)
+	args = append(args, limit)
+
+	rows, err := s.rdb.Query(sb.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("ds single-sort query: %w", err)
+	}
+	defer rows.Close()
+
+	var results []*DsEntityRow
+	for rows.Next() {
+		var data []byte
+		var version int64
+		var createStr, updateStr, path string
+		if err := rows.Scan(&data, &version, &createStr, &updateStr, &path); err != nil {
+			return nil, fmt.Errorf("ds single-sort scan: %w", err)
+		}
+		var e datastorepb.Entity
+		if err := proto.Unmarshal(data, &e); err != nil {
+			return nil, fmt.Errorf("ds single-sort unmarshal: %w", err)
+		}
+		ct, _ := time.Parse(timeLayout, createStr)
+		ut, _ := time.Parse(timeLayout, updateStr)
+		results = append(results, &DsEntityRow{
+			Entity:     &e,
+			Version:    version,
+			CreateTime: timestamppb.New(ct),
+			UpdateTime: timestamppb.New(ut),
+			Path:       path,
+		})
+	}
+	return results, rows.Err()
+}
+
+// runLimitedQuery builds and executes the paginated SQL query. For the common
+// single-sort case it delegates to runSingleSortQuery which drives from
+// ds_field_index and is O(page-size). Multi-sort and no-sort cases use the
+// ds_documents-driven LEFT JOIN path.
 func (s *Store) runLimitedQuery(
 	project, database, namespace, kind, ancestorPath string,
 	filterSQL string, filterArgs []any,
@@ -381,6 +472,11 @@ func (s *Store) runLimitedQuery(
 	cursor *CursorPayload,
 	limit int,
 ) ([]*DsEntityRow, error) {
+	if len(sorts) == 1 {
+		return s.runSingleSortQuery(project, database, namespace, kind, ancestorPath,
+			filterSQL, filterArgs, sorts[0], cursor, limit)
+	}
+
 	var sb strings.Builder
 	var args []any
 

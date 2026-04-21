@@ -121,6 +121,26 @@ CREATE INDEX IF NOT EXISTS idx_ds_field ON ds_field_index (
 CREATE INDEX IF NOT EXISTS idx_ds_doc_fields ON ds_field_index
     (project, database, namespace, doc_path);
 
+-- Covering indexes for single-sort keyset pagination. Each index places the sort
+-- value column right after the equality prefix so SQLite can scan in ORDER BY order
+-- and stop at LIMIT, making each page O(page-size) instead of O(kind-size).
+CREATE INDEX IF NOT EXISTS idx_ds_field_sort_int ON ds_field_index
+    (project, database, namespace, kind, field_path, value_int, doc_path)
+    WHERE in_array = 0;
+
+CREATE INDEX IF NOT EXISTS idx_ds_field_sort_str ON ds_field_index
+    (project, database, namespace, kind, field_path, value_string, doc_path)
+    WHERE in_array = 0;
+
+CREATE INDEX IF NOT EXISTS idx_ds_field_sort_dbl ON ds_field_index
+    (project, database, namespace, kind, field_path, value_double, doc_path)
+    WHERE in_array = 0;
+
+-- Covering index for no-sort / path-cursor pagination (ORDER BY path with cursor).
+CREATE INDEX IF NOT EXISTS idx_ds_kind_path ON ds_documents
+    (project, database, namespace, kind, path)
+    WHERE deleted = 0;
+
 -- Monotonic ID sequences for AllocateIds
 CREATE TABLE IF NOT EXISTS ds_id_sequences (
     project   TEXT NOT NULL,
@@ -218,6 +238,12 @@ var migrations = []string{
 	// idx_ds_doc_join served correlated-EXISTS queries; replaced by IN-subquery
 	// approach that drives from idx_ds_field. Dropping it cuts write overhead by ~33%.
 	`DROP INDEX IF EXISTS idx_ds_doc_join`,
+	// Per-type sort indexes enabling O(page-size) single-sort keyset pagination.
+	`CREATE INDEX IF NOT EXISTS idx_ds_field_sort_int ON ds_field_index (project, database, namespace, kind, field_path, value_int, doc_path) WHERE in_array = 0`,
+	`CREATE INDEX IF NOT EXISTS idx_ds_field_sort_str ON ds_field_index (project, database, namespace, kind, field_path, value_string, doc_path) WHERE in_array = 0`,
+	`CREATE INDEX IF NOT EXISTS idx_ds_field_sort_dbl ON ds_field_index (project, database, namespace, kind, field_path, value_double, doc_path) WHERE in_array = 0`,
+	// Covering index for path-cursor (no-sort) pagination.
+	`CREATE INDEX IF NOT EXISTS idx_ds_kind_path ON ds_documents (project, database, namespace, kind, path) WHERE deleted = 0`,
 }
 
 func applyMigrations(db *sql.DB) error {
