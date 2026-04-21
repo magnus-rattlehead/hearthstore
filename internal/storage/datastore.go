@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -14,6 +15,30 @@ import (
 
 	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
 )
+
+// DsSortSpec describes one ORDER BY field for SQL-level keyset pagination.
+type DsSortSpec struct {
+	FieldPath string // property name
+	Col       string // auto-detected ds_field_index column (value_string/value_int/etc.)
+	Desc      bool
+}
+
+// CursorSortKV holds the sort-field value for one ORDER BY field in a keyset cursor.
+type CursorSortKV struct {
+	Col string `json:"c"` // ds_field_index column name
+	V   string `json:"v"` // sort value serialized as string
+}
+
+// CursorPayload is the structured cursor for keyset pagination; JSON-marshaled
+// and URL-safe base64-encoded before transmission.
+type CursorPayload struct {
+	P string         `json:"p"`           // entity path (tie-breaker)
+	S []CursorSortKV `json:"s,omitempty"` // one entry per ORDER BY field
+}
+
+// ErrColumnNotDetected is returned by DsQueryKindLimited when a sort field has
+// no indexed data, preventing SQL ORDER BY column auto-detection.
+var ErrColumnNotDetected = errors.New("sort column not found in field index")
 
 // dbExec is defined in storage.go (shared with document.go).
 
@@ -278,6 +303,256 @@ type DsEntityRow struct {
 	Path       string
 }
 
+// DsQueryKindLimited runs a paginated kind query with ORDER BY, keyset cursor,
+// and LIMIT pushed into SQLite. Returns the filled-in sort specs (with Col populated)
+// alongside the entity rows.
+//
+// If a sort field has no indexed data, ErrColumnNotDetected is returned and the
+// caller should fall back to DsQueryKind + Go-side processing.
+func (s *Store) DsQueryKindLimited(
+	project, database, namespace, kind, ancestorPath string,
+	filterSQL string, filterArgs []any,
+	sorts []DsSortSpec,
+	cursor *CursorPayload,
+	limit int,
+) ([]DsSortSpec, []*DsEntityRow, error) {
+	// Make a local copy so we can fill in Col without mutating the caller's slice.
+	localSorts := make([]DsSortSpec, len(sorts))
+	copy(localSorts, sorts)
+	for i := range localSorts {
+		if localSorts[i].Col != "" {
+			continue
+		}
+		col, err := s.detectSortColumn(project, database, namespace, kind, localSorts[i].FieldPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		localSorts[i].Col = col
+	}
+	rows, err := s.runLimitedQuery(project, database, namespace, kind, ancestorPath,
+		filterSQL, filterArgs, localSorts, cursor, limit)
+	return localSorts, rows, err
+}
+
+// detectSortColumn probes ds_field_index to find which value column a field uses.
+func (s *Store) detectSortColumn(project, database, namespace, kind, fieldPath string) (string, error) {
+	var vStr *string
+	var vInt *int64
+	var vDouble *float64
+	var vBool *int64
+	var vNull *int64
+	var vRef *string
+	err := s.rdb.QueryRow(
+		`SELECT value_string, value_int, value_double, value_bool, value_null, value_ref
+		 FROM ds_field_index
+		 WHERE project=? AND database=? AND namespace=? AND kind=? AND field_path=? AND in_array=0
+		 LIMIT 1`,
+		project, database, namespace, kind, fieldPath,
+	).Scan(&vStr, &vInt, &vDouble, &vBool, &vNull, &vRef)
+	if err == sql.ErrNoRows {
+		return "", ErrColumnNotDetected
+	}
+	if err != nil {
+		return "", fmt.Errorf("detect sort column: %w", err)
+	}
+	switch {
+	case vInt != nil:
+		return "value_int", nil
+	case vDouble != nil:
+		return "value_double", nil
+	case vStr != nil:
+		return "value_string", nil
+	case vBool != nil:
+		return "value_bool", nil
+	case vNull != nil:
+		return "value_null", nil
+	case vRef != nil:
+		return "value_ref", nil
+	default:
+		return "", ErrColumnNotDetected
+	}
+}
+
+// runLimitedQuery builds and executes the paginated SQL query.
+func (s *Store) runLimitedQuery(
+	project, database, namespace, kind, ancestorPath string,
+	filterSQL string, filterArgs []any,
+	sorts []DsSortSpec,
+	cursor *CursorPayload,
+	limit int,
+) ([]*DsEntityRow, error) {
+	var sb strings.Builder
+	var args []any
+
+	sb.WriteString(`SELECT d.data, d.version, d.create_time, d.update_time, d.path`)
+	sb.WriteString(` FROM ds_documents d`)
+
+	// LEFT JOIN one ds_field_index alias per sort field.
+	for i, sp := range sorts {
+		fmt.Fprintf(&sb,
+			` LEFT JOIN ds_field_index fi_%d ON fi_%d.project=d.project AND fi_%d.database=d.database`+
+				` AND fi_%d.namespace=d.namespace AND fi_%d.doc_path=d.path`+
+				` AND fi_%d.field_path=? AND fi_%d.in_array=0`,
+			i, i, i, i, i, i, i)
+		args = append(args, sp.FieldPath)
+	}
+
+	sb.WriteString(` WHERE d.project=? AND d.database=? AND d.namespace=? AND d.kind=? AND d.deleted=0`)
+	args = append(args, project, database, namespace, kind)
+
+	if ancestorPath != "" {
+		sb.WriteString(` AND (d.path=? OR d.path LIKE ?)`)
+		args = append(args, ancestorPath, ancestorPath+"/%")
+	}
+	if filterSQL != "" {
+		sb.WriteString(` AND `)
+		sb.WriteString(filterSQL)
+		args = append(args, filterArgs...)
+	}
+
+	if cursor != nil {
+		ks, ksArgs := buildKeysetCondition(sorts, cursor)
+		if ks != "" {
+			sb.WriteString(` AND (`)
+			sb.WriteString(ks)
+			sb.WriteByte(')')
+			args = append(args, ksArgs...)
+		}
+	}
+
+	// ORDER BY sort fields then d.path as tie-breaker.
+	if len(sorts) > 0 {
+		sb.WriteString(` ORDER BY `)
+		for i, sp := range sorts {
+			if i > 0 {
+				sb.WriteString(`, `)
+			}
+			fmt.Fprintf(&sb, `fi_%d.%s`, i, sp.Col)
+			if sp.Desc {
+				sb.WriteString(` DESC`)
+			} else {
+				sb.WriteString(` ASC`)
+			}
+		}
+		sb.WriteString(`, d.path ASC`)
+	} else {
+		sb.WriteString(` ORDER BY d.path ASC`)
+	}
+
+	sb.WriteString(` LIMIT ?`)
+	args = append(args, limit)
+
+	rows, err := s.rdb.Query(sb.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("ds limited query: %w", err)
+	}
+	defer rows.Close()
+
+	var results []*DsEntityRow
+	for rows.Next() {
+		var data []byte
+		var version int64
+		var createStr, updateStr, path string
+		if err := rows.Scan(&data, &version, &createStr, &updateStr, &path); err != nil {
+			return nil, fmt.Errorf("ds limited scan: %w", err)
+		}
+		var e datastorepb.Entity
+		if err := proto.Unmarshal(data, &e); err != nil {
+			return nil, fmt.Errorf("ds limited unmarshal: %w", err)
+		}
+		ct, _ := time.Parse(timeLayout, createStr)
+		ut, _ := time.Parse(timeLayout, updateStr)
+		results = append(results, &DsEntityRow{
+			Entity:     &e,
+			Version:    version,
+			CreateTime: timestamppb.New(ct),
+			UpdateTime: timestamppb.New(ut),
+			Path:       path,
+		})
+	}
+	return results, rows.Err()
+}
+
+// buildKeysetCondition constructs the SQL OR-chain for keyset pagination.
+// Each OR-branch advances one position in the sort key hierarchy, e.g.:
+//
+//	(f0>v0) OR (f0=v0 AND f1<v1) OR (f0=v0 AND f1=v1 AND path>cursor_path)
+//
+// The direction of inequality follows each field's Desc flag.
+func buildKeysetCondition(sorts []DsSortSpec, cursor *CursorPayload) (string, []any) {
+	if cursor == nil {
+		return "", nil
+	}
+	if len(sorts) == 0 || len(cursor.S) == 0 {
+		return "d.path > ?", []any{cursor.P}
+	}
+
+	n := len(sorts)
+	if len(cursor.S) < n {
+		n = len(cursor.S)
+	}
+
+	var parts []string
+	var allArgs []any
+
+	for outerIdx := 0; outerIdx <= n; outerIdx++ {
+		var branch strings.Builder
+		var branchArgs []any
+
+		// Equality for all sort fields before outerIdx.
+		for i := 0; i < outerIdx; i++ {
+			if i > 0 {
+				branch.WriteString(" AND ")
+			}
+			fmt.Fprintf(&branch, "fi_%d.%s = ?", i, sorts[i].Col)
+			branchArgs = append(branchArgs, parseCursorValue(cursor.S[i].Col, cursor.S[i].V))
+		}
+
+		if outerIdx < n {
+			// Inequality on field outerIdx: > for ASC, < for DESC.
+			if outerIdx > 0 {
+				branch.WriteString(" AND ")
+			}
+			op := ">"
+			if sorts[outerIdx].Desc {
+				op = "<"
+			}
+			fmt.Fprintf(&branch, "fi_%d.%s %s ?", outerIdx, sorts[outerIdx].Col, op)
+			branchArgs = append(branchArgs, parseCursorValue(cursor.S[outerIdx].Col, cursor.S[outerIdx].V))
+		} else {
+			// Tie-breaker: path is always ascending.
+			if outerIdx > 0 {
+				branch.WriteString(" AND ")
+			}
+			branch.WriteString("d.path > ?")
+			branchArgs = append(branchArgs, cursor.P)
+		}
+
+		parts = append(parts, "("+branch.String()+")")
+		allArgs = append(allArgs, branchArgs...)
+	}
+
+	if len(parts) == 1 {
+		return parts[0], allArgs
+	}
+	return strings.Join(parts, " OR "), allArgs
+}
+
+// parseCursorValue converts a string cursor value back to the Go type appropriate
+// for the given ds_field_index column.
+func parseCursorValue(col, v string) any {
+	switch col {
+	case "value_int", "value_bool", "value_null":
+		n, _ := strconv.ParseInt(v, 10, 64)
+		return n
+	case "value_double":
+		f, _ := strconv.ParseFloat(v, 64)
+		return f
+	default: // value_string, value_ref
+		return v
+	}
+}
+
 // DsAllocateIds atomically reserves count IDs for the given (project, database, namespace, kind).
 // Returns the first allocated ID; caller uses [first, first+count).
 func (s *Store) DsAllocateIds(project, database, namespace, kind string, count int) (int64, error) {
@@ -476,7 +751,7 @@ func dsKeyToPath(key *datastorepb.Key) string {
 // dsCollectValue extracts indexable values from a Datastore property value recursively.
 // inArray=true means we are already inside an array — nested arrays are skipped.
 func dsCollectValue(fieldPath string, v *datastorepb.Value, inArray bool, rows *[]dsFiRow) {
-	if v == nil {
+	if v == nil || v.GetExcludeFromIndexes() {
 		return
 	}
 	switch vt := v.GetValueType().(type) {
@@ -563,6 +838,62 @@ func dsIndexDocFields(exec dbExec, project, database, namespace, kind, docPath s
 
 // dsBatchInsertFI inserts field index rows in chunks of 500 to stay within
 // SQLite's bound-variable limit.
+// RebuildDsFieldIndex rebuilds ds_field_index from all active entities in ds_documents.
+// Run once after a schema change or manual truncation of the index table.
+// Processes entities in batches of 200 to bound transaction size.
+func (s *Store) RebuildDsFieldIndex() error {
+	const batchSize = 200
+	type erow struct{ project, database, namespace, path, kind string; data []byte }
+
+	offset := 0
+	for {
+		rows, err := s.rdb.Query(
+			`SELECT project, database, namespace, path, kind, data
+			 FROM ds_documents WHERE deleted=0
+			 ORDER BY rowid LIMIT ? OFFSET ?`,
+			batchSize, offset,
+		)
+		if err != nil {
+			return fmt.Errorf("reindex query: %w", err)
+		}
+		var batch []erow
+		for rows.Next() {
+			var r erow
+			if err := rows.Scan(&r.project, &r.database, &r.namespace, &r.path, &r.kind, &r.data); err != nil {
+				rows.Close()
+				return fmt.Errorf("reindex scan: %w", err)
+			}
+			batch = append(batch, r)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("reindex rows: %w", err)
+		}
+		if len(batch) == 0 {
+			break
+		}
+		if err := s.RunInTx(func(tx *sql.Tx) error {
+			for _, r := range batch {
+				var entity datastorepb.Entity
+				if err := proto.Unmarshal(r.data, &entity); err != nil {
+					return fmt.Errorf("reindex unmarshal %s: %w", r.path, err)
+				}
+				if err := dsIndexDocFields(tx, r.project, r.database, r.namespace, r.kind, r.path, &entity); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		offset += len(batch)
+		if len(batch) < batchSize {
+			break
+		}
+	}
+	return nil
+}
+
 func dsBatchInsertFI(exec dbExec, project, database, namespace, kind, docPath string, rows []dsFiRow) error {
 	if len(rows) == 0 {
 		return nil

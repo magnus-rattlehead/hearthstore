@@ -2,6 +2,8 @@ package datastore
 
 import (
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -255,6 +257,65 @@ func TestCommit(t *testing.T) {
 				path := mr.Key.Path
 				if len(path) == 0 || path[len(path)-1].GetId() == 0 {
 					t.Errorf("allocated key should have non-zero numeric ID")
+				}
+			},
+		},
+		{
+			name: "upsert_incomplete_key",
+			run: func(t *testing.T, s *Server) {
+				// Send the exact JSON body shape the Python Datastore client sends:
+				// incomplete key with explicit namespaceId:"" and excludeFromIndexes on props.
+				rawBody := `{
+					"mode":"NON_TRANSACTIONAL",
+					"mutations":[{"upsert":{
+						"key":{
+							"partitionId":{"projectId":"` + testProject + `","namespaceId":""},
+							"path":[{"kind":"K_uik"}]
+						},
+						"properties":{
+							"timezone":{"excludeFromIndexes":true,"stringValue":"US/Pacific"},
+							"status":{"excludeFromIndexes":false,"stringValue":"active"}
+						}
+					}}]
+				}`
+				hr := httptest.NewRequest(http.MethodPost, projectURL("commit"), strings.NewReader(rawBody))
+				hr.Header.Set("Content-Type", "application/json")
+				rw := httptest.NewRecorder()
+				s.Handler().ServeHTTP(rw, hr)
+				if rw.Code != 200 {
+					t.Fatalf("status %d: %s", rw.Code, rw.Body.String())
+				}
+				t.Logf("response JSON: %s", rw.Body.String())
+				var resp datastorepb.CommitResponse
+				if err := pjsonUnmarshal.Unmarshal(rw.Body.Bytes(), &resp); err != nil {
+					t.Fatalf("unmarshal: %v", err)
+				}
+				if len(resp.MutationResults) != 1 {
+					t.Fatalf("want 1 mutation result, got %d", len(resp.MutationResults))
+				}
+				mr := resp.MutationResults[0]
+				if mr.Key == nil {
+					t.Fatal("MutationResult.Key should be non-nil for incomplete key upsert")
+				}
+				path := mr.Key.Path
+				if len(path) == 0 || path[len(path)-1].GetId() == 0 {
+					t.Errorf("allocated key should have non-zero numeric ID, got path: %v", path)
+				}
+			},
+		},
+		{
+			name: "commit_time_returned",
+			run: func(t *testing.T, s *Server) {
+				key := dsKey("K_ct", "ct1")
+				var resp datastorepb.CommitResponse
+				mustPost(t, s, "commit", &datastorepb.CommitRequest{
+					ProjectId: testProject,
+					Mutations: []*datastorepb.Mutation{
+						{Operation: &datastorepb.Mutation_Upsert{Upsert: dsEntity(key, nil)}},
+					},
+				}, &resp)
+				if resp.CommitTime == nil {
+					t.Error("CommitTime should be populated in CommitResponse")
 				}
 			},
 		},

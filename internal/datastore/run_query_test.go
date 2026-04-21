@@ -1,6 +1,7 @@
 package datastore
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -480,6 +481,283 @@ func TestRunQuery(t *testing.T) {
 					if _, ok := er.Entity.Properties["color"]; !ok {
 						t.Error("projection: result should include 'color'")
 					}
+				}
+			},
+		},
+		{
+			name: "cursor_large_pages",
+			run: func(t *testing.T, s *Server, kind string) {
+				rows := make([]seedRow, 200)
+				for i := range rows {
+					rows[i] = seedRow{
+						fmt.Sprintf("e%04d", i),
+						map[string]*datastorepb.Value{"v": dsInt(int64(i))},
+					}
+				}
+				seedKind(t, s, kind, rows)
+
+				seen := make(map[string]bool, 200)
+				var cursor []byte
+				for page := 0; page < 4; page++ {
+					resp := qKind(t, s, kind, &datastorepb.Query{
+						Limit:       wrapperspb.Int32(50),
+						StartCursor: cursor,
+					})
+					if n := len(resp.Batch.EntityResults); n != 50 {
+						t.Errorf("page %d: want 50, got %d", page, n)
+						return
+					}
+					for _, er := range resp.Batch.EntityResults {
+						name := er.Entity.Key.Path[len(er.Entity.Key.Path)-1].GetName()
+						if seen[name] {
+							t.Errorf("duplicate entity %q on page %d", name, page)
+						}
+						seen[name] = true
+					}
+					cursor = resp.Batch.EndCursor
+				}
+				// 5th page must be empty with NO_MORE_RESULTS
+				resp := qKind(t, s, kind, &datastorepb.Query{
+					Limit:       wrapperspb.Int32(50),
+					StartCursor: cursor,
+				})
+				if n := len(resp.Batch.EntityResults); n != 0 {
+					t.Errorf("page5: want 0, got %d", n)
+				}
+				if resp.Batch.MoreResults != datastorepb.QueryResultBatch_NO_MORE_RESULTS {
+					t.Errorf("page5: want NO_MORE_RESULTS, got %v", resp.Batch.MoreResults)
+				}
+				if len(seen) != 200 {
+					t.Errorf("total distinct entities: want 200, got %d", len(seen))
+				}
+			},
+		},
+		{
+			name: "cursor_with_eq_filter",
+			run: func(t *testing.T, s *Server, kind string) {
+				rows := make([]seedRow, 20)
+				for i := range rows {
+					status := "inactive"
+					if i < 10 {
+						status = "active"
+					}
+					rows[i] = seedRow{
+						fmt.Sprintf("s%04d", i),
+						map[string]*datastorepb.Value{"status": dsStr(status)},
+					}
+				}
+				seedKind(t, s, kind, rows)
+
+				filter := propFilter("status", datastorepb.PropertyFilter_EQUAL, dsStr("active"))
+				seen := make(map[string]bool, 10)
+				var cursor []byte
+				for {
+					resp := qKind(t, s, kind, &datastorepb.Query{
+						Filter:      filter,
+						Limit:       wrapperspb.Int32(3),
+						StartCursor: cursor,
+					})
+					for _, er := range resp.Batch.EntityResults {
+						name := er.Entity.Key.Path[len(er.Entity.Key.Path)-1].GetName()
+						if seen[name] {
+							t.Errorf("duplicate entity %q", name)
+						}
+						seen[name] = true
+						if er.Entity.Properties["status"].GetStringValue() != "active" {
+							t.Errorf("got non-active entity %q", name)
+						}
+					}
+					if resp.Batch.MoreResults != datastorepb.QueryResultBatch_MORE_RESULTS_AFTER_LIMIT {
+						break
+					}
+					cursor = resp.Batch.EndCursor
+				}
+				if len(seen) != 10 {
+					t.Errorf("want 10 active entities, got %d", len(seen))
+				}
+			},
+		},
+		{
+			name: "cursor_order_asc",
+			run: func(t *testing.T, s *Server, kind string) {
+				// Seed in reverse order to verify SQL sorts correctly
+				rows := make([]seedRow, 20)
+				for i := range rows {
+					rows[i] = seedRow{
+						fmt.Sprintf("o%04d", 19-i),
+						map[string]*datastorepb.Value{"score": dsInt(int64(20 - i))},
+					}
+				}
+				seedKind(t, s, kind, rows)
+
+				order := []*datastorepb.PropertyOrder{
+					{Property: &datastorepb.PropertyReference{Name: "score"}, Direction: datastorepb.PropertyOrder_ASCENDING},
+				}
+				var prevScore int64 = -1
+				var cursor []byte
+				total := 0
+				for {
+					resp := qKind(t, s, kind, &datastorepb.Query{
+						Order:       order,
+						Limit:       wrapperspb.Int32(5),
+						StartCursor: cursor,
+					})
+					for _, er := range resp.Batch.EntityResults {
+						score := er.Entity.Properties["score"].GetIntegerValue()
+						if score <= prevScore {
+							t.Errorf("order violated: score %d after %d (asc)", score, prevScore)
+						}
+						prevScore = score
+						total++
+					}
+					if resp.Batch.MoreResults != datastorepb.QueryResultBatch_MORE_RESULTS_AFTER_LIMIT {
+						break
+					}
+					cursor = resp.Batch.EndCursor
+				}
+				if total != 20 {
+					t.Errorf("want 20 total, got %d", total)
+				}
+			},
+		},
+		{
+			name: "cursor_order_desc",
+			run: func(t *testing.T, s *Server, kind string) {
+				rows := make([]seedRow, 20)
+				for i := range rows {
+					rows[i] = seedRow{
+						fmt.Sprintf("d%04d", i),
+						map[string]*datastorepb.Value{"score": dsInt(int64(i + 1))},
+					}
+				}
+				seedKind(t, s, kind, rows)
+
+				order := []*datastorepb.PropertyOrder{
+					{Property: &datastorepb.PropertyReference{Name: "score"}, Direction: datastorepb.PropertyOrder_DESCENDING},
+				}
+				prevScore := int64(21) // sentinel: above max score
+				var cursor []byte
+				total := 0
+				for {
+					resp := qKind(t, s, kind, &datastorepb.Query{
+						Order:       order,
+						Limit:       wrapperspb.Int32(5),
+						StartCursor: cursor,
+					})
+					for _, er := range resp.Batch.EntityResults {
+						score := er.Entity.Properties["score"].GetIntegerValue()
+						if score >= prevScore {
+							t.Errorf("order violated: score %d after %d (desc)", score, prevScore)
+						}
+						prevScore = score
+						total++
+					}
+					if resp.Batch.MoreResults != datastorepb.QueryResultBatch_MORE_RESULTS_AFTER_LIMIT {
+						break
+					}
+					cursor = resp.Batch.EndCursor
+				}
+				if total != 20 {
+					t.Errorf("want 20 total, got %d", total)
+				}
+			},
+		},
+		{
+			name: "cursor_order_multi",
+			run: func(t *testing.T, s *Server, kind string) {
+				// 10 "a" entities + 10 "b" entities, each with scores 1–10
+				var rows []seedRow
+				for i := 1; i <= 10; i++ {
+					rows = append(rows, seedRow{
+						fmt.Sprintf("ma%04d", i),
+						map[string]*datastorepb.Value{"cat": dsStr("a"), "score": dsInt(int64(i))},
+					})
+					rows = append(rows, seedRow{
+						fmt.Sprintf("mb%04d", i),
+						map[string]*datastorepb.Value{"cat": dsStr("b"), "score": dsInt(int64(i))},
+					})
+				}
+				seedKind(t, s, kind, rows)
+
+				// ORDER BY cat ASC, score DESC → a/10, a/9, ..., a/1, b/10, ..., b/1
+				order := []*datastorepb.PropertyOrder{
+					{Property: &datastorepb.PropertyReference{Name: "cat"}, Direction: datastorepb.PropertyOrder_ASCENDING},
+					{Property: &datastorepb.PropertyReference{Name: "score"}, Direction: datastorepb.PropertyOrder_DESCENDING},
+				}
+				prevCat := ""
+				prevScore := int64(11) // sentinel
+				var cursor []byte
+				total := 0
+				for {
+					resp := qKind(t, s, kind, &datastorepb.Query{
+						Order:       order,
+						Limit:       wrapperspb.Int32(5),
+						StartCursor: cursor,
+					})
+					for _, er := range resp.Batch.EntityResults {
+						cat := er.Entity.Properties["cat"].GetStringValue()
+						score := er.Entity.Properties["score"].GetIntegerValue()
+						if cat < prevCat || (cat == prevCat && score >= prevScore) {
+							t.Errorf("order violated: %s/%d after %s/%d", cat, score, prevCat, prevScore)
+						}
+						if cat != prevCat {
+							prevScore = 11 // reset when category advances
+						}
+						prevCat = cat
+						prevScore = score
+						total++
+					}
+					if resp.Batch.MoreResults != datastorepb.QueryResultBatch_MORE_RESULTS_AFTER_LIMIT {
+						break
+					}
+					cursor = resp.Batch.EndCursor
+				}
+				if total != 20 {
+					t.Errorf("want 20 total, got %d", total)
+				}
+			},
+		},
+		{
+			name: "cursor_exact_boundary",
+			run: func(t *testing.T, s *Server, kind string) {
+				seedKind(t, s, kind, []seedRow{
+					{"a", map[string]*datastorepb.Value{"v": dsInt(1)}},
+					{"b", map[string]*datastorepb.Value{"v": dsInt(2)}},
+					{"c", map[string]*datastorepb.Value{"v": dsInt(3)}},
+					{"d", map[string]*datastorepb.Value{"v": dsInt(4)}},
+					{"e", map[string]*datastorepb.Value{"v": dsInt(5)}},
+					{"f", map[string]*datastorepb.Value{"v": dsInt(6)}},
+					{"g", map[string]*datastorepb.Value{"v": dsInt(7)}},
+					{"h", map[string]*datastorepb.Value{"v": dsInt(8)}},
+					{"i", map[string]*datastorepb.Value{"v": dsInt(9)}},
+					{"j", map[string]*datastorepb.Value{"v": dsInt(10)}},
+				})
+				r1 := qKind(t, s, kind, &datastorepb.Query{Limit: wrapperspb.Int32(5)})
+				if n := len(r1.Batch.EntityResults); n != 5 {
+					t.Fatalf("page1: want 5, got %d", n)
+				}
+				if r1.Batch.MoreResults != datastorepb.QueryResultBatch_MORE_RESULTS_AFTER_LIMIT {
+					t.Errorf("page1: want MORE_RESULTS_AFTER_LIMIT, got %v", r1.Batch.MoreResults)
+				}
+				r2 := qKind(t, s, kind, &datastorepb.Query{
+					Limit:       wrapperspb.Int32(5),
+					StartCursor: r1.Batch.EndCursor,
+				})
+				if n := len(r2.Batch.EntityResults); n != 5 {
+					t.Fatalf("page2: want 5, got %d", n)
+				}
+				if r2.Batch.MoreResults != datastorepb.QueryResultBatch_MORE_RESULTS_AFTER_LIMIT {
+					t.Errorf("page2: want MORE_RESULTS_AFTER_LIMIT, got %v", r2.Batch.MoreResults)
+				}
+				r3 := qKind(t, s, kind, &datastorepb.Query{
+					Limit:       wrapperspb.Int32(5),
+					StartCursor: r2.Batch.EndCursor,
+				})
+				if n := len(r3.Batch.EntityResults); n != 0 {
+					t.Errorf("page3: want 0, got %d", n)
+				}
+				if r3.Batch.MoreResults != datastorepb.QueryResultBatch_NO_MORE_RESULTS {
+					t.Errorf("page3: want NO_MORE_RESULTS, got %v", r3.Batch.MoreResults)
 				}
 			},
 		},

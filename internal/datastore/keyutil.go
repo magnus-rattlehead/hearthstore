@@ -2,11 +2,14 @@ package datastore
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 
 	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
+
+	"github.com/magnus-rattlehead/hearthstore/internal/storage"
 )
 
 const defaultDatabase = "(default)"
@@ -108,9 +111,11 @@ func withID(key *datastorepb.Key, id int64) *datastorepb.Key {
 	return &datastorepb.Key{PartitionId: key.GetPartitionId(), Path: parts}
 }
 
-// encodeCursor encodes an entity path as an opaque cursor (base64).
+// encodeCursor encodes an entity path as an opaque cursor (URL-safe base64).
+// Clients (e.g. the Dialpad ds library) validate cursors with urlsafe_b64decode,
+// so URL-safe encoding is required for correct round-trip handling.
 func encodeCursor(path string) []byte {
-	return []byte(base64.StdEncoding.EncodeToString([]byte(path)))
+	return []byte(base64.URLEncoding.EncodeToString([]byte(path)))
 }
 
 // decodeCursor decodes a cursor back to a path string.
@@ -118,9 +123,79 @@ func decodeCursor(cursor []byte) string {
 	if len(cursor) == 0 {
 		return ""
 	}
-	b, err := base64.StdEncoding.DecodeString(string(cursor))
+	b, err := base64.URLEncoding.DecodeString(string(cursor))
 	if err != nil {
-		return ""
+		// Fall back to standard encoding for cursors issued before this change.
+		b, err = base64.StdEncoding.DecodeString(string(cursor))
+		if err != nil {
+			return ""
+		}
 	}
 	return string(b)
+}
+
+// encodeCursorFull encodes a CursorPayload as JSON then URL-safe base64.
+func encodeCursorFull(cp storage.CursorPayload) []byte {
+	data, _ := json.Marshal(cp)
+	return []byte(base64.URLEncoding.EncodeToString(data))
+}
+
+// decodeCursorFull decodes a cursor byte slice to a CursorPayload.
+// New-format cursors are JSON objects; old-format cursors are plain paths.
+// Returns (zero, false) if the cursor cannot be decoded at all.
+func decodeCursorFull(b []byte) (storage.CursorPayload, bool) {
+	if len(b) == 0 {
+		return storage.CursorPayload{}, false
+	}
+	decoded, err := base64.URLEncoding.DecodeString(string(b))
+	if err != nil {
+		decoded, err = base64.StdEncoding.DecodeString(string(b))
+		if err != nil {
+			return storage.CursorPayload{}, false
+		}
+	}
+	// Try JSON (new-format cursor).
+	var cp storage.CursorPayload
+	if jsonErr := json.Unmarshal(decoded, &cp); jsonErr == nil && cp.P != "" {
+		return cp, true
+	}
+	// Fall back: treat decoded bytes as a plain path (old-format cursor).
+	return storage.CursorPayload{P: string(decoded)}, true
+}
+
+// buildCursor constructs the per-entity cursor for keyset pagination.
+// When sorts is non-empty it encodes a CursorPayload with sort field values;
+// otherwise it falls back to the plain-path cursor.
+func buildCursor(path string, sorts []storage.DsSortSpec, row *storage.DsEntityRow) []byte {
+	if len(sorts) == 0 {
+		return encodeCursor(path)
+	}
+	kvs := make([]storage.CursorSortKV, 0, len(sorts))
+	for _, sp := range sorts {
+		v := getProp(row.Entity, sp.FieldPath)
+		kvs = append(kvs, storage.CursorSortKV{Col: sp.Col, V: serializeSortValue(v)})
+	}
+	return encodeCursorFull(storage.CursorPayload{P: path, S: kvs})
+}
+
+// serializeSortValue converts a Datastore property value to a string
+// for storage in a CursorSortKV entry.
+func serializeSortValue(v *datastorepb.Value) string {
+	if v == nil {
+		return ""
+	}
+	_, sqlVal, ok := dsValueColumn(v)
+	if !ok {
+		return ""
+	}
+	switch sv := sqlVal.(type) {
+	case string:
+		return sv
+	case int64:
+		return strconv.FormatInt(sv, 10)
+	case float64:
+		return strconv.FormatFloat(sv, 'f', -1, 64)
+	default:
+		return ""
+	}
 }

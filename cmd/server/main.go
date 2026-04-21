@@ -50,6 +50,7 @@ func main() {
 	mode          := flag.String("mode", "both", "Server mode: firestore | datastore | both")
 	logLevel      := flag.String("log-level", "info", "Log level: debug | info | warn | error")
 	indexConfig   := flag.String("index-config", "", "Path to index.yaml for Datastore composite index configuration")
+	reindexDS     := flag.Bool("reindex-ds", false, "Rebuild ds_field_index from ds_documents then serve normally")
 	flag.Parse()
 
 	var level slog.Level
@@ -68,6 +69,14 @@ func main() {
 		log.Fatalf("failed to open storage: %v", err)
 	}
 	defer store.Close()
+
+	if *reindexDS {
+		slog.Info("rebuilding ds_field_index from ds_documents…")
+		if err := store.RebuildDsFieldIndex(); err != nil {
+			log.Fatalf("reindex failed: %v", err)
+		}
+		slog.Info("ds_field_index rebuild complete")
+	}
 
 	switch *mode {
 	case "firestore":

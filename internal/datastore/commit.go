@@ -63,9 +63,9 @@ func (g *GRPCServer) Commit(ctx context.Context, req *datastorepb.CommitRequest)
 		return nil, err
 	}
 
-	// Emulator compatibility: CommitTime is not populated (matches Google Cloud Datastore emulator).
 	return &datastorepb.CommitResponse{
 		MutationResults: results,
+		CommitTime:      commitTime,
 	}, nil
 }
 

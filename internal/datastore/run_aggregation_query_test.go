@@ -1,6 +1,7 @@
 package datastore
 
 import (
+	"fmt"
 	"testing"
 
 	"google.golang.org/protobuf/types/known/wrapperspb"
@@ -173,6 +174,31 @@ func TestAggregation(t *testing.T) {
 				v := resp.Batch.AggregationResults[0].AggregateProperties["avg"]
 				if _, ok := v.ValueType.(*datastorepb.Value_NullValue); !ok {
 					t.Errorf("avg of missing property: want null, got %v", v)
+				}
+			},
+		},
+		{
+			name: "count_filtered_pushdown",
+			run: func(t *testing.T, s *Server, kind string) {
+				rows := make([]seedRow, 100)
+				for i := range rows {
+					status := "inactive"
+					if i < 50 {
+						status = "active"
+					}
+					rows[i] = seedRow{
+						fmt.Sprintf("e%04d", i),
+						map[string]*datastorepb.Value{"status": dsStr(status)},
+					}
+				}
+				seedKind(t, s, kind, rows)
+
+				resp := runAggKind(t, s, kind,
+					propFilter("status", datastorepb.PropertyFilter_EQUAL, dsStr("active")),
+					[]*datastorepb.AggregationQuery_Aggregation{countAgg("n")},
+				)
+				if n := resp.Batch.AggregationResults[0].AggregateProperties["n"].GetIntegerValue(); n != 50 {
+					t.Errorf("want 50 active, got %d", n)
 				}
 			},
 		},

@@ -72,6 +72,8 @@ Two connection pools share a single file:
 
 Firestore `StructuredQuery` filters are translated to SQL EXISTS subqueries against `field_index` by `internal/query`. The same pattern applies for Datastore queries via `ds_field_index`. Types that cannot be expressed in SQL (GeoPoint, KeyValue, EntityValue filters) fall back to in-process Go evaluation on the reduced result set.
 
+Datastore `RunQuery` uses **keyset pagination** when `limit > 0` and no snapshot read / DISTINCT is required: `ORDER BY`, the cursor condition, and `LIMIT` are pushed entirely into SQLite. Each page is O(page-size) rather than O(table-size). Sort columns are auto-detected from `ds_field_index` on first use; if a sort field has no indexed data the query falls back to the Go-side path. Cursors are URL-safe base64-encoded JSON (`{"p": path, "s": [{c, v}, ...]}`); plain-path cursors from earlier versions are accepted for backward compatibility.
+
 ### Listen (real-time)
 
 Document writes publish to an in-process pub/sub channel. Watch streams receive change events and deliver `DocumentChange` messages to the client. Resume tokens encode the last-seen change log sequence number; on reconnect the server replays only the diff.

@@ -2,6 +2,7 @@ package datastore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -70,22 +71,54 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 	var filterArgs []any
 	var needsGoFilter bool
 	if q.Filter != nil && readAt == nil {
-		filterSQL, filterArgs, needsGoFilter = buildDsWhereClause(req.ProjectId, database, namespace, q.Filter)
+		filterSQL, filterArgs, needsGoFilter = buildDsWhereClause(req.ProjectId, database, namespace, kind, q.Filter)
 		if filterSQL == "" {
 			needsGoFilter = true // no SQL clause generated; Go must filter
 		}
 	}
 
+	// limit=0 means "return no entities" (used by count() to read skipped_results only).
+	hasLimit := q.Limit != nil
+	limit := 0
+	if hasLimit {
+		limit = int(q.Limit.Value)
+	}
+
+	// useSQL: push ORDER BY, keyset cursor, and LIMIT into SQLite.
+	// Conditions: live read (no snapshot), no Go-side filter needed, no DISTINCT,
+	// a positive LIMIT, and no OFFSET (offset is not pushed to SQL).
+	useSQL := readAt == nil && !needsGoFilter &&
+		len(q.DistinctOn) == 0 && hasLimit && limit > 0 && q.Offset == 0
+
 	start := time.Now()
 	var rows []*storage.DsEntityRow
-	var err error
-	if readAt != nil {
-		rows, err = g.store.DsQueryKindAsOf(req.ProjectId, database, namespace, kind, ancestorPath, *readAt)
-	} else {
-		rows, err = g.store.DsQueryKind(req.ProjectId, database, namespace, kind, ancestorPath, filterSQL, filterArgs)
+	var filledSorts []storage.DsSortSpec
+
+	if useSQL {
+		sortSpecs := buildSortSpecs(q.Order)
+		cp := decodeCursorPayload(q.StartCursor)
+		var sqlErr error
+		filledSorts, rows, sqlErr = g.store.DsQueryKindLimited(
+			req.ProjectId, database, namespace, kind, ancestorPath,
+			filterSQL, filterArgs, sortSpecs, cp, limit,
+		)
+		if errors.Is(sqlErr, storage.ErrColumnNotDetected) {
+			useSQL = false // fall through to Go-side path
+		} else if sqlErr != nil {
+			return nil, sqlErr
+		}
 	}
-	if err != nil {
-		return nil, err
+
+	if !useSQL {
+		var fetchErr error
+		if readAt != nil {
+			rows, fetchErr = g.store.DsQueryKindAsOf(req.ProjectId, database, namespace, kind, ancestorPath, *readAt)
+		} else {
+			rows, fetchErr = g.store.DsQueryKind(req.ProjectId, database, namespace, kind, ancestorPath, filterSQL, filterArgs)
+		}
+		if fetchErr != nil {
+			return nil, fetchErr
+		}
 	}
 
 	// Apply Go-side filter when: snapshot read (no pushdown), or pushdown was partial/absent.
@@ -114,80 +147,84 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 		g.txMu.Unlock()
 	}
 
-	if len(q.Order) > 0 {
-		sort.SliceStable(rows, func(i, j int) bool {
-			for _, ord := range q.Order {
-				prop := ord.Property.GetName()
-				vi := getProp(rows[i].Entity, prop)
-				vj := getProp(rows[j].Entity, prop)
-				cmp := compareValues(vi, vj)
-				if cmp == 0 {
-					continue
+	if !useSQL {
+		if len(q.Order) > 0 {
+			sort.SliceStable(rows, func(i, j int) bool {
+				for _, ord := range q.Order {
+					prop := ord.Property.GetName()
+					vi := getProp(rows[i].Entity, prop)
+					vj := getProp(rows[j].Entity, prop)
+					cmp := compareValues(vi, vj)
+					if cmp == 0 {
+						continue
+					}
+					if ord.Direction == datastorepb.PropertyOrder_DESCENDING {
+						return cmp > 0
+					}
+					return cmp < 0
 				}
-				if ord.Direction == datastorepb.PropertyOrder_DESCENDING {
-					return cmp > 0
-				}
-				return cmp < 0
-			}
-			return false
-		})
-	} else if hasKeyFilter(q.Filter) {
-		// When filtering by __key__ (IN, NOT_IN, EQUAL), results are returned in full-path key order
-		// (parent before child), consistent with Datastore's multi-key lookup semantics.
-		sort.SliceStable(rows, func(i, j int) bool {
-			return rows[i].Path < rows[j].Path
-		})
-	} else {
-		// Default sort for kind queries: ascending by entity name (last path segment),
-		// matching Datastore's kind-index ordering where entities sort by own key name.
-		sort.SliceStable(rows, func(i, j int) bool {
-			return entityName(rows[i].Path) < entityName(rows[j].Path)
-		})
-	}
-
-	// Apply distinct_on (groupBy) deduplication: keep first entity per unique field combination.
-	if len(q.DistinctOn) > 0 {
-		seen := make(map[string]bool)
-		var distinct []*storage.DsEntityRow
-		for _, row := range rows {
-			key := distinctKey(row.Entity, q.DistinctOn)
-			if !seen[key] {
-				seen[key] = true
-				distinct = append(distinct, row)
-			}
-		}
-		rows = distinct
-	}
-
-	if len(q.StartCursor) > 0 {
-		startPath := decodeCursor(q.StartCursor)
-		if startPath != "" {
-			// Find the cursor entity in the sorted result set and return everything after it.
-			cutIdx := 0
-			for i, row := range rows {
-				if row.Path == startPath {
-					cutIdx = i + 1
-					break
-				}
-			}
-			rows = rows[cutIdx:]
-		}
-	}
-
-	if q.Offset > 0 {
-		if int(q.Offset) >= len(rows) {
-			rows = nil
+				return false
+			})
+		} else if hasKeyFilter(q.Filter) {
+			// When filtering by __key__ (IN, NOT_IN, EQUAL), results are returned in full-path key order
+			// (parent before child), consistent with Datastore's multi-key lookup semantics.
+			sort.SliceStable(rows, func(i, j int) bool {
+				return rows[i].Path < rows[j].Path
+			})
 		} else {
-			rows = rows[q.Offset:]
+			// Default sort for kind queries: ascending by entity name (last path segment),
+			// matching Datastore's kind-index ordering where entities sort by own key name.
+			sort.SliceStable(rows, func(i, j int) bool {
+				return entityName(rows[i].Path) < entityName(rows[j].Path)
+			})
+		}
+
+		// Apply distinct_on (groupBy) deduplication: keep first entity per unique field combination.
+		if len(q.DistinctOn) > 0 {
+			seen := make(map[string]bool)
+			var distinct []*storage.DsEntityRow
+			for _, row := range rows {
+				key := distinctKey(row.Entity, q.DistinctOn)
+				if !seen[key] {
+					seen[key] = true
+					distinct = append(distinct, row)
+				}
+			}
+			rows = distinct
+		}
+
+		if len(q.StartCursor) > 0 {
+			startPath := decodeCursor(q.StartCursor)
+			if startPath != "" {
+				// Find the cursor entity in the sorted result set and return everything after it.
+				cutIdx := 0
+				for i, row := range rows {
+					if row.Path == startPath {
+						cutIdx = i + 1
+						break
+					}
+				}
+				rows = rows[cutIdx:]
+			}
 		}
 	}
 
-	limit := 0
-	if q.Limit != nil {
-		limit = int(q.Limit.Value)
-	}
-	if limit > 0 && limit < len(rows) {
-		rows = rows[:limit]
+	var skippedResults int32
+	if !useSQL {
+		if q.Offset > 0 {
+			if int(q.Offset) >= len(rows) {
+				skippedResults = int32(len(rows))
+				rows = nil
+			} else {
+				skippedResults = q.Offset
+				rows = rows[q.Offset:]
+			}
+		}
+		if hasLimit && limit == 0 {
+			rows = nil
+		} else if limit > 0 && limit < len(rows) {
+			rows = rows[:limit]
+		}
 	}
 
 	keysOnly := isKeysOnly(q)
@@ -196,6 +233,12 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 	results := make([]*datastorepb.EntityResult, 0, len(rows))
 	var endCursor []byte
 	for _, row := range rows {
+		var rowCursor []byte
+		if useSQL {
+			rowCursor = buildCursor(row.Path, filledSorts, row)
+		} else {
+			rowCursor = encodeCursor(row.Path)
+		}
 		e := row.Entity
 		if keysOnly {
 			results = append(results, &datastorepb.EntityResult{
@@ -203,7 +246,7 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 				Version:    row.Version,
 				CreateTime: row.CreateTime,
 				UpdateTime: row.UpdateTime,
-				Cursor:     encodeCursor(row.Path),
+				Cursor:     rowCursor,
 			})
 		} else if len(projFields) > 0 {
 			// Projection: expand array-valued projected fields into multiple rows.
@@ -213,7 +256,7 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 					Version:    row.Version,
 					CreateTime: row.CreateTime,
 					UpdateTime: row.UpdateTime,
-					Cursor:     encodeCursor(row.Path),
+					Cursor:     rowCursor,
 				})
 			}
 		} else {
@@ -222,10 +265,10 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 				Version:    row.Version,
 				CreateTime: row.CreateTime,
 				UpdateTime: row.UpdateTime,
-				Cursor:     encodeCursor(row.Path),
+				Cursor:     rowCursor,
 			})
 		}
-		endCursor = encodeCursor(row.Path)
+		endCursor = rowCursor
 	}
 
 	moreResults := datastorepb.QueryResultBatch_NO_MORE_RESULTS
@@ -237,12 +280,20 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 		moreResults = datastorepb.QueryResultBatch_MORE_RESULTS_AFTER_LIMIT
 	}
 
+	entityResultType := datastorepb.EntityResult_FULL
+	if keysOnly {
+		entityResultType = datastorepb.EntityResult_KEY_ONLY
+	} else if len(projFields) > 0 {
+		entityResultType = datastorepb.EntityResult_PROJECTION
+	}
+
 	resp := &datastorepb.RunQueryResponse{
 		Batch: &datastorepb.QueryResultBatch{
 			EntityResults:    results,
+			SkippedResults:   skippedResults,
 			EndCursor:        endCursor,
 			MoreResults:      moreResults,
-			EntityResultType: datastorepb.EntityResult_FULL,
+			EntityResultType: entityResultType,
 			ReadTime:         timestamppb.Now(),
 		},
 	}
@@ -591,8 +642,21 @@ func hasKeyFilter(f *datastorepb.Filter) bool {
 // dsTimeLayout must match storage.timeLayout for lexicographic timestamp comparisons.
 const dsTimeLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
-// dsExistsPrefix is the correlated EXISTS subquery preamble against alias "d" (ds_documents).
-const dsExistsPrefix = `EXISTS(SELECT 1 FROM ds_field_index fi WHERE fi.project=d.project AND fi.database=d.database AND fi.namespace=d.namespace AND fi.doc_path=d.path AND fi.field_path=?`
+// dsInSubquery builds the preamble for a field-index IN-subquery filter.
+// Drives from idx_ds_field (project, database, namespace, kind, field_path, …)
+// instead of the old correlated EXISTS approach, which lets idx_ds_doc_join be dropped.
+// prefix ends just before the closing ')'; callers append the value condition and ')'.
+func dsInSubquery(project, database, namespace, kind string) (prefix string, baseArgs []any) {
+	return `d.path IN (SELECT doc_path FROM ds_field_index ` +
+		`WHERE project=? AND database=? AND namespace=? AND kind=? AND field_path=?`,
+		[]any{project, database, namespace, kind}
+}
+
+func dsNotInSubquery(project, database, namespace, kind string) (prefix string, baseArgs []any) {
+	return `d.path NOT IN (SELECT doc_path FROM ds_field_index ` +
+		`WHERE project=? AND database=? AND namespace=? AND kind=? AND field_path=?`,
+		[]any{project, database, namespace, kind}
+}
 
 // dsValueColumn maps a datastorepb.Value to the ds_field_index column name and
 // a SQL-compatible value for that column. Returns ok=false for types handled
@@ -637,18 +701,18 @@ func dsValueColumn(v *datastorepb.Value) (col string, sqlVal any, ok bool) {
 //
 // __key__ HAS_ANCESTOR is already handled via ancestorPath in DsQueryKind, so it
 // is skipped here. Other __key__ filters emit direct conditions on d.path.
-func buildDsWhereClause(project, database, namespace string, f *datastorepb.Filter) (clause string, args []any, needsGoFilter bool) {
+func buildDsWhereClause(project, database, namespace, kind string, f *datastorepb.Filter) (clause string, args []any, needsGoFilter bool) {
 	if f == nil {
 		return "", nil, false
 	}
 	switch ft := f.FilterType.(type) {
 	case *datastorepb.Filter_PropertyFilter:
-		return buildDsPropClause(ft.PropertyFilter)
+		return buildDsPropClause(project, database, namespace, kind, ft.PropertyFilter)
 	case *datastorepb.Filter_CompositeFilter:
 		cf := ft.CompositeFilter
 		var parts []string
 		for _, sub := range cf.Filters {
-			sc, sa, sg := buildDsWhereClause(project, database, namespace, sub)
+			sc, sa, sg := buildDsWhereClause(project, database, namespace, kind, sub)
 			if sg {
 				needsGoFilter = true
 			}
@@ -677,7 +741,7 @@ func buildDsWhereClause(project, database, namespace string, f *datastorepb.Filt
 	return "", nil, false
 }
 
-func buildDsPropClause(pf *datastorepb.PropertyFilter) (clause string, args []any, needsGoFilter bool) {
+func buildDsPropClause(project, database, namespace, kind string, pf *datastorepb.PropertyFilter) (clause string, args []any, needsGoFilter bool) {
 	prop := pf.Property.GetName()
 	if prop == "__key__" {
 		return buildDsKeyClause(pf)
@@ -686,39 +750,38 @@ func buildDsPropClause(pf *datastorepb.PropertyFilter) (clause string, args []an
 		return "", nil, false // already handled by ancestorPath
 	}
 
-	// GeoPoint EQUAL: two-condition EXISTS on (value_lat, value_lng).
-	// Range operators on GeoPoint fall back to Go (cross-pair semantics can't be
-	// expressed with single-column SQL comparisons).
+	inPfx, inBase := dsInSubquery(project, database, namespace, kind)
+	notInPfx, notInBase := dsNotInSubquery(project, database, namespace, kind)
+
+	// GeoPoint EQUAL: two-column IN-subquery on (value_lat, value_lng).
 	if gp, ok := pf.Value.ValueType.(*datastorepb.Value_GeoPointValue); ok {
 		if pf.Op == datastorepb.PropertyFilter_EQUAL && gp.GeoPointValue != nil {
 			lat := gp.GeoPointValue.Latitude
 			lng := gp.GeoPointValue.Longitude
-			return fmt.Sprintf("%s AND fi.value_lat=? AND fi.value_lng=?)", dsExistsPrefix),
-				[]any{prop, lat, lng}, false
+			return fmt.Sprintf("%s AND value_lat=? AND value_lng=?)", inPfx),
+				append(append(inBase, prop), lat, lng), false
 		}
 		return "", nil, true
 	}
 
-	// EntityValue EQUAL: compare canonical proto bytes stored in value_bytes.
-	// Ordering operators fall back to Go (byte order ≠ semantic order).
+	// EntityValue EQUAL: canonical proto bytes in value_bytes.
 	if ev, ok := pf.Value.ValueType.(*datastorepb.Value_EntityValue); ok {
 		if pf.Op == datastorepb.PropertyFilter_EQUAL {
 			opts := proto.MarshalOptions{Deterministic: true}
 			b, _ := opts.Marshal(ev.EntityValue)
-			return fmt.Sprintf("%s AND fi.value_bytes=?)", dsExistsPrefix),
-				[]any{prop, b}, false
+			return fmt.Sprintf("%s AND value_bytes=?)", inPfx),
+				append(append(inBase, prop), b), false
 		}
 		return "", nil, true
 	}
 
-	// ArrayValue EQUAL: compare canonical proto bytes stored in value_bytes.
-	// IN/NOT_IN with array values are handled upstream by buildDsInClause/buildDsNotInClause.
+	// ArrayValue EQUAL: canonical proto bytes in value_bytes.
 	if av, ok := pf.Value.ValueType.(*datastorepb.Value_ArrayValue); ok {
 		if pf.Op == datastorepb.PropertyFilter_EQUAL {
 			opts := proto.MarshalOptions{Deterministic: true}
 			b, _ := opts.Marshal(av.ArrayValue)
-			return fmt.Sprintf("%s AND fi.value_bytes=?)", dsExistsPrefix),
-				[]any{prop, b}, false
+			return fmt.Sprintf("%s AND value_bytes=?)", inPfx),
+				append(append(inBase, prop), b), false
 		}
 		return "", nil, true
 	}
@@ -730,28 +793,27 @@ func buildDsPropClause(pf *datastorepb.PropertyFilter) (clause string, args []an
 
 	switch pf.Op {
 	case datastorepb.PropertyFilter_EQUAL:
-		return fmt.Sprintf("%s AND fi.%s=?)", dsExistsPrefix, col),
-			[]any{prop, sqlVal}, false
+		return fmt.Sprintf("%s AND %s=?)", inPfx, col),
+			append(append(inBase, prop), sqlVal), false
 	case datastorepb.PropertyFilter_NOT_EQUAL:
-		// NOT EXISTS is a superset (also matches absent properties); Go corrects.
-		return fmt.Sprintf("NOT %s AND fi.%s=?)", dsExistsPrefix, col),
-			[]any{prop, sqlVal}, true
+		return fmt.Sprintf("%s AND %s=?)", notInPfx, col),
+			append(append(notInBase, prop), sqlVal), true
 	case datastorepb.PropertyFilter_LESS_THAN:
-		return fmt.Sprintf("%s AND fi.%s<?)", dsExistsPrefix, col),
-			[]any{prop, sqlVal}, false
+		return fmt.Sprintf("%s AND %s<?)", inPfx, col),
+			append(append(inBase, prop), sqlVal), false
 	case datastorepb.PropertyFilter_LESS_THAN_OR_EQUAL:
-		return fmt.Sprintf("%s AND fi.%s<=?)", dsExistsPrefix, col),
-			[]any{prop, sqlVal}, false
+		return fmt.Sprintf("%s AND %s<=?)", inPfx, col),
+			append(append(inBase, prop), sqlVal), false
 	case datastorepb.PropertyFilter_GREATER_THAN:
-		return fmt.Sprintf("%s AND fi.%s>?)", dsExistsPrefix, col),
-			[]any{prop, sqlVal}, false
+		return fmt.Sprintf("%s AND %s>?)", inPfx, col),
+			append(append(inBase, prop), sqlVal), false
 	case datastorepb.PropertyFilter_GREATER_THAN_OR_EQUAL:
-		return fmt.Sprintf("%s AND fi.%s>=?)", dsExistsPrefix, col),
-			[]any{prop, sqlVal}, false
+		return fmt.Sprintf("%s AND %s>=?)", inPfx, col),
+			append(append(inBase, prop), sqlVal), false
 	case datastorepb.PropertyFilter_IN:
-		return buildDsInNotInClause(prop, pf.Value, false)
+		return buildDsInNotInClause(project, database, namespace, kind, prop, pf.Value, false)
 	case datastorepb.PropertyFilter_NOT_IN:
-		return buildDsInNotInClause(prop, pf.Value, true)
+		return buildDsInNotInClause(project, database, namespace, kind, prop, pf.Value, true)
 	}
 	return "", nil, true
 }
@@ -816,10 +878,8 @@ func buildDsKeyClause(pf *datastorepb.PropertyFilter) (clause string, args []any
 	return "", nil, true
 }
 
-// buildDsInNotInClause builds the SQL EXISTS clause for IN and NOT_IN filters.
-// negate=true produces the NOT_IN variant, which also sets needsGoFilter=true
-// because NOT EXISTS is a superset that includes entities lacking the property.
-func buildDsInNotInClause(prop string, filterVal *datastorepb.Value, negate bool) (clause string, args []any, needsGoFilter bool) {
+// buildDsInNotInClause builds the IN-subquery clause for IN and NOT_IN filters.
+func buildDsInNotInClause(project, database, namespace, kind, prop string, filterVal *datastorepb.Value, negate bool) (clause string, args []any, needsGoFilter bool) {
 	av := filterVal.GetArrayValue()
 	if av == nil || len(av.Values) == 0 {
 		if negate {
@@ -848,13 +908,42 @@ func buildDsInNotInClause(prop string, filterVal *datastorepb.Value, negate bool
 		return "1=0", nil, false
 	}
 	ph := strings.Repeat(",?", len(vals))[1:]
-	prefix := dsExistsPrefix
+	pfx, base := dsInSubquery(project, database, namespace, kind)
 	if negate {
-		prefix = "NOT " + dsExistsPrefix
+		pfx, base = dsNotInSubquery(project, database, namespace, kind)
 	}
-	clause = fmt.Sprintf("%s AND fi.%s IN (%s))", prefix, col, ph)
-	args = append([]any{prop}, vals...)
+	clause = fmt.Sprintf("%s AND %s IN (%s))", pfx, col, ph)
+	args = append(append(base, prop), vals...)
 	return clause, args, negate
+}
+
+// buildSortSpecs converts q.Order into DsSortSpec entries for SQL ORDER BY.
+// Returns nil when there are no explicit sort orders (uses SQL default d.path ASC).
+func buildSortSpecs(orders []*datastorepb.PropertyOrder) []storage.DsSortSpec {
+	if len(orders) == 0 {
+		return nil
+	}
+	specs := make([]storage.DsSortSpec, len(orders))
+	for i, ord := range orders {
+		specs[i] = storage.DsSortSpec{
+			FieldPath: ord.Property.GetName(),
+			Desc:      ord.Direction == datastorepb.PropertyOrder_DESCENDING,
+		}
+	}
+	return specs
+}
+
+// decodeCursorPayload decodes a start-cursor byte slice to a *CursorPayload.
+// Returns nil when the cursor is empty or cannot be decoded.
+func decodeCursorPayload(b []byte) *storage.CursorPayload {
+	if len(b) == 0 {
+		return nil
+	}
+	cp, ok := decodeCursorFull(b)
+	if !ok {
+		return nil
+	}
+	return &cp
 }
 
 // distinctKey returns a string key representing the distinct_on field values of an entity.

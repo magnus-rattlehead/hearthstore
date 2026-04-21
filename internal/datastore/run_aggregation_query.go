@@ -95,19 +95,30 @@ func (g *GRPCServer) RunAggregationQuery(ctx context.Context, req *datastorepb.R
 		ancestorPath = extractAncestorPath(q.Filter, req.ProjectId, database, namespace)
 	}
 
+	// Build SQL filter clause for pushdown (live reads only).
+	var aggFilterSQL string
+	var aggFilterArgs []any
+	var aggNeedsGoFilter bool
+	if q.Filter != nil && readAt == nil {
+		aggFilterSQL, aggFilterArgs, aggNeedsGoFilter = buildDsWhereClause(req.ProjectId, database, namespace, kind, q.Filter)
+		if aggFilterSQL == "" {
+			aggNeedsGoFilter = true
+		}
+	}
+
 	start := time.Now()
 	var rows []*storage.DsEntityRow
 	var err error
 	if readAt != nil {
 		rows, err = g.store.DsQueryKindAsOf(req.ProjectId, database, namespace, kind, ancestorPath, *readAt)
 	} else {
-		rows, err = g.store.DsQueryKind(req.ProjectId, database, namespace, kind, ancestorPath, "", nil)
+		rows, err = g.store.DsQueryKind(req.ProjectId, database, namespace, kind, ancestorPath, aggFilterSQL, aggFilterArgs)
 	}
 	if err != nil {
 		return nil, err
 	}
 
-	if q.Filter != nil {
+	if q.Filter != nil && (readAt != nil || aggNeedsGoFilter) {
 		filtered := rows[:0]
 		for _, row := range rows {
 			if matchesFilter(row.Entity, q.Filter) {
