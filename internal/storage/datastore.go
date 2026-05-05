@@ -90,17 +90,76 @@ func (s *Store) DsGetWithTimes(project, database, namespace, path string) (*data
 	return &e, version, timestamppb.New(ct), timestamppb.New(ut), nil
 }
 
+// DsGetManyWithTimes fetches multiple entities by path in one SQL query.
+// Keys are grouped by (project, database, namespace); paths must be unique within each group.
+// Returns found rows and the paths that were absent or deleted (missing).
+func (s *Store) DsGetManyWithTimes(project, database, namespace string, paths []string) ([]*DsEntityRow, []string, error) {
+	if len(paths) == 0 {
+		return nil, nil, nil
+	}
+	ph := strings.Repeat("?,", len(paths))
+	ph = ph[:len(ph)-1]
+	args := make([]any, 0, 3+len(paths))
+	args = append(args, project, database, namespace)
+	pathSet := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		args = append(args, p)
+		pathSet[p] = struct{}{}
+	}
+	rows, err := s.rdb.Query(
+		`SELECT data, version, create_time, update_time, path FROM ds_documents
+		 WHERE project=? AND database=? AND namespace=? AND deleted=0 AND path IN (`+ph+`)`,
+		args...,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("ds get many: %w", err)
+	}
+	defer rows.Close()
+	var found []*DsEntityRow
+	for rows.Next() {
+		var data []byte
+		var version int64
+		var createStr, updateStr, path string
+		if err := rows.Scan(&data, &version, &createStr, &updateStr, &path); err != nil {
+			return nil, nil, fmt.Errorf("ds get many scan: %w", err)
+		}
+		var e datastorepb.Entity
+		if err := proto.Unmarshal(data, &e); err != nil {
+			return nil, nil, fmt.Errorf("ds get many unmarshal: %w", err)
+		}
+		ct, _ := time.Parse(timeLayout, createStr)
+		ut, _ := time.Parse(timeLayout, updateStr)
+		found = append(found, &DsEntityRow{
+			Entity:     &e,
+			Version:    version,
+			CreateTime: timestamppb.New(ct),
+			UpdateTime: timestamppb.New(ut),
+			Path:       path,
+		})
+		delete(pathSet, path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("ds get many: %w", err)
+	}
+	missing := make([]string, 0, len(pathSet))
+	for p := range pathSet {
+		missing = append(missing, p)
+	}
+	return found, missing, nil
+}
+
 // DsInsert creates a new entity, returning codes.AlreadyExists if one is active.
 func (s *Store) DsInsert(project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, error) {
-	return dsInsertExec(s.wdb, project, database, namespace, path, kind, parentPath, entity)
+	return dsInsertExec(s.wdb, project, database, namespace, path, kind, parentPath, entity, nil)
 }
 
 // DsInsertTx is like DsInsert but runs within the provided transaction.
-func (s *Store) DsInsertTx(tx *sql.Tx, project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, error) {
-	return dsInsertExec(tx, project, database, namespace, path, kind, parentPath, entity)
+// Pass acc to defer change-log and field-index writes for bulk flushing.
+func (s *Store) DsInsertTx(tx *sql.Tx, project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity, acc *CommitAccumulator) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, error) {
+	return dsInsertExec(tx, project, database, namespace, path, kind, parentPath, entity, acc)
 }
 
-func dsInsertExec(exec dbExec, project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, error) {
+func dsInsertExec(exec dbExec, project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity, acc *CommitAccumulator) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, error) {
 	var dummy int
 	err := exec.QueryRow(
 		`SELECT 1 FROM ds_documents WHERE project=? AND database=? AND namespace=? AND path=? AND deleted=0`,
@@ -111,30 +170,31 @@ func dsInsertExec(exec dbExec, project, database, namespace, path, kind, parentP
 	}
 	now := timestamppb.Now()
 	e := proto.Clone(entity).(*datastorepb.Entity)
-	ver, err := dsSaveExec(exec, project, database, namespace, path, kind, parentPath, e, 0, now, now)
+	ver, err := dsSaveExec(exec, project, database, namespace, path, kind, parentPath, e, 0, now, now, acc)
 	return e, ver, now, now, err
 }
 
 // DsUpdate merges into an existing entity. Returns codes.NotFound if absent.
 // If baseVersion > 0 and current version differs, returns conflictDetected=true without writing.
 func (s *Store) DsUpdate(project, database, namespace, path string, entity *datastorepb.Entity, baseVersion int64) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
-	return dsUpdateExec(s.wdb, project, database, namespace, path, entity, baseVersion)
+	return dsUpdateExec(s.wdb, project, database, namespace, path, entity, baseVersion, nil)
 }
 
 // DsUpdateTx is like DsUpdate but runs within the provided transaction.
-func (s *Store) DsUpdateTx(tx *sql.Tx, project, database, namespace, path string, entity *datastorepb.Entity, baseVersion int64) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
-	return dsUpdateExec(tx, project, database, namespace, path, entity, baseVersion)
+// Pass acc to defer change-log and field-index writes for bulk flushing.
+func (s *Store) DsUpdateTx(tx *sql.Tx, project, database, namespace, path string, entity *datastorepb.Entity, baseVersion int64, acc *CommitAccumulator) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
+	return dsUpdateExec(tx, project, database, namespace, path, entity, baseVersion, acc)
 }
 
-func dsUpdateExec(exec dbExec, project, database, namespace, path string, entity *datastorepb.Entity, baseVersion int64) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
+func dsUpdateExec(exec dbExec, project, database, namespace, path string, entity *datastorepb.Entity, baseVersion int64, acc *CommitAccumulator) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
 	var data []byte
 	var curVersion int64
-	var createStr string
+	var createStr, kind, parentPath string
 	err := exec.QueryRow(
-		`SELECT data, version, create_time FROM ds_documents
+		`SELECT data, version, create_time, kind, parent_path FROM ds_documents
 		 WHERE project=? AND database=? AND namespace=? AND path=? AND deleted=0`,
 		project, database, namespace, path,
-	).Scan(&data, &curVersion, &createStr)
+	).Scan(&data, &curVersion, &createStr, &kind, &parentPath)
 	if err == sql.ErrNoRows {
 		return nil, 0, nil, nil, false, status.Errorf(codes.NotFound, "entity not found: %s", path)
 	}
@@ -150,31 +210,190 @@ func dsUpdateExec(exec dbExec, project, database, namespace, path string, entity
 	createTime := timestamppb.New(ct)
 	now := timestamppb.Now()
 
-	// Fetch existing entity to recover kind/parentPath from row metadata.
-	var kind, parentPath string
-	_ = exec.QueryRow(`SELECT kind, parent_path FROM ds_documents WHERE project=? AND database=? AND namespace=? AND path=?`,
-		project, database, namespace, path).Scan(&kind, &parentPath)
-
 	e := proto.Clone(entity).(*datastorepb.Entity)
-	newVer, err := dsSaveExec(exec, project, database, namespace, path, kind, parentPath, e, curVersion, createTime, now)
+	newVer, err := dsSaveExec(exec, project, database, namespace, path, kind, parentPath, e, curVersion, createTime, now, acc)
 	return e, newVer, createTime, now, false, err
 }
 
 // DsUpsert creates or replaces an entity, preserving create_time for existing docs.
 // If baseVersion > 0 and the entity exists with a different version, returns conflictDetected=true.
 func (s *Store) DsUpsert(project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity, baseVersion int64) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
-	return dsUpsertExec(s.wdb, project, database, namespace, path, kind, parentPath, entity, baseVersion)
+	return dsUpsertExec(s.wdb, project, database, namespace, path, kind, parentPath, entity, baseVersion, nil)
 }
 
 // DsUpsertTx is like DsUpsert but runs within the provided transaction.
-func (s *Store) DsUpsertTx(tx *sql.Tx, project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity, baseVersion int64) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
-	return dsUpsertExec(tx, project, database, namespace, path, kind, parentPath, entity, baseVersion)
+// Pass acc to defer change-log and field-index writes for bulk flushing.
+func (s *Store) DsUpsertTx(tx *sql.Tx, project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity, baseVersion int64, acc *CommitAccumulator) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
+	return dsUpsertExec(tx, project, database, namespace, path, kind, parentPath, entity, baseVersion, acc)
 }
 
-func dsUpsertExec(exec dbExec, project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity, baseVersion int64) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
-	now := timestamppb.Now()
-	createTime := now
+// UpsertManyRow describes one entity in a bulk upsert.
+type UpsertManyRow struct {
+	Namespace, Path, Kind, ParentPath string
+	Entity                            *datastorepb.Entity
+}
 
+// DsUpsertManyTx upserts multiple entities in a single SQL statement (baseVersion=0 only).
+// Returns a map from path to new version. Change-log and field-index writes are deferred to acc.
+func (s *Store) DsUpsertManyTx(tx *sql.Tx, project, database string, rows []UpsertManyRow, now *timestamppb.Timestamp, acc *CommitAccumulator) (map[string]int64, error) {
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	nowStr := now.AsTime().UTC().Format(timeLayout)
+
+	const colCount = 9 // number of ? per row in VALUES
+	const prefix = `INSERT INTO ds_documents ` +
+		`(project, database, namespace, path, kind, parent_path, data, create_time, update_time, version, deleted) VALUES `
+	const placeholder = `(?,?,?,?,?,?,?,?,?,1,0)`
+	const suffix = `
+		ON CONFLICT (project, database, namespace, path) DO UPDATE SET
+			kind        = excluded.kind,
+			parent_path = excluded.parent_path,
+			data        = excluded.data,
+			create_time = CASE WHEN ds_documents.deleted = 0 THEN ds_documents.create_time ELSE excluded.create_time END,
+			update_time = excluded.update_time,
+			version     = ds_documents.version + 1,
+			deleted     = 0
+		RETURNING path, version`
+
+	// Marshal all entities up front.
+	type marshaledRow struct {
+		UpsertManyRow
+		data []byte
+	}
+	mRows := make([]marshaledRow, len(rows))
+	for i, r := range rows {
+		data, err := proto.Marshal(r.Entity)
+		if err != nil {
+			return nil, fmt.Errorf("ds upsert many marshal %s: %w", r.Path, err)
+		}
+		mRows[i] = marshaledRow{r, data}
+	}
+
+	// Build and execute batch INSERT in chunks of 500 to stay within SQLite's variable limit.
+	const batchSize = 500
+	versions := make(map[string]int64, len(rows))
+
+	for start := 0; start < len(mRows); start += batchSize {
+		end := start + batchSize
+		if end > len(mRows) {
+			end = len(mRows)
+		}
+		batch := mRows[start:end]
+
+		var sb strings.Builder
+		sb.WriteString(prefix)
+		args := make([]any, 0, len(batch)*colCount)
+		for i, r := range batch {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteString(placeholder)
+			args = append(args, project, database, r.Namespace, r.Path, r.Kind, r.ParentPath, r.data, nowStr, nowStr)
+		}
+		sb.WriteString(suffix)
+
+		sqlRows, err := tx.Query(sb.String(), args...)
+		if err != nil {
+			return nil, fmt.Errorf("ds upsert many: %w", err)
+		}
+		for sqlRows.Next() {
+			var path string
+			var ver int64
+			if err := sqlRows.Scan(&path, &ver); err != nil {
+				sqlRows.Close()
+				return nil, fmt.Errorf("ds upsert many scan: %w", err)
+			}
+			versions[path] = ver
+		}
+		sqlRows.Close()
+		if err := sqlRows.Err(); err != nil {
+			return nil, fmt.Errorf("ds upsert many rows: %w", err)
+		}
+	}
+
+	// Accumulate change-log and field-index operations for bulk flush.
+	for _, r := range mRows {
+		acc.changes = append(acc.changes, changeRow{
+			project: project, database: database, namespace: r.Namespace,
+			path: r.Path, kind: r.Kind, parentPath: r.ParentPath,
+			changeTime: nowStr, deleted: 0, data: r.data,
+		})
+		acc.fiDeletes = append(acc.fiDeletes, fiDeleteKey{project, database, r.Namespace, r.Path})
+		for propName, v := range r.Entity.Properties {
+			var fiRows []dsFiRow
+			dsCollectValue(propName, v, false, &fiRows)
+			for _, fr := range fiRows {
+				acc.fiInserts = append(acc.fiInserts, fiBulkRow{project, database, r.Namespace, r.Kind, r.Path, fr})
+			}
+		}
+	}
+
+	return versions, nil
+}
+
+func dsUpsertExec(exec dbExec, project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity, baseVersion int64, acc *CommitAccumulator) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
+	now := timestamppb.Now()
+
+	// Fast path: no baseVersion conflict check needed — skip the SELECT and use
+	// a single INSERT ON CONFLICT DO UPDATE with RETURNING to get the new version.
+	if baseVersion == 0 {
+		e := proto.Clone(entity).(*datastorepb.Entity)
+		data, err := proto.Marshal(e)
+		if err != nil {
+			return nil, 0, nil, nil, false, fmt.Errorf("ds marshal: %w", err)
+		}
+		nowStr := now.AsTime().UTC().Format(timeLayout)
+		var newVer int64
+		if err := exec.QueryRow(`
+			INSERT INTO ds_documents
+				(project, database, namespace, path, kind, parent_path, data, create_time, update_time, version, deleted)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
+			ON CONFLICT (project, database, namespace, path) DO UPDATE SET
+				kind        = excluded.kind,
+				parent_path = excluded.parent_path,
+				data        = excluded.data,
+				create_time = CASE WHEN ds_documents.deleted = 0 THEN ds_documents.create_time ELSE excluded.create_time END,
+				update_time = excluded.update_time,
+				version     = ds_documents.version + 1,
+				deleted     = 0
+			RETURNING version`,
+			project, database, namespace, path, kind, parentPath, data, nowStr, nowStr,
+		).Scan(&newVer); err != nil {
+			return nil, 0, nil, nil, false, err
+		}
+		if acc != nil {
+			acc.changes = append(acc.changes, changeRow{
+				project: project, database: database, namespace: namespace,
+				path: path, kind: kind, parentPath: parentPath,
+				changeTime: nowStr, deleted: 0, data: data,
+			})
+			acc.fiDeletes = append(acc.fiDeletes, fiDeleteKey{project, database, namespace, path})
+			for propName, v := range e.Properties {
+				var fiRows []dsFiRow
+				dsCollectValue(propName, v, false, &fiRows)
+				for _, r := range fiRows {
+					acc.fiInserts = append(acc.fiInserts, fiBulkRow{project, database, namespace, kind, path, r})
+				}
+			}
+		} else {
+			if _, err := exec.Exec(`
+				INSERT INTO ds_document_changes
+					(project, database, namespace, path, kind, parent_path, change_time, deleted, data)
+				VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
+				project, database, namespace, path, kind, parentPath, nowStr, data,
+			); err != nil {
+				return nil, 0, nil, nil, false, err
+			}
+			if err := dsIndexDocFields(exec, project, database, namespace, kind, path, e); err != nil {
+				return nil, 0, nil, nil, false, err
+			}
+		}
+		return e, newVer, now, now, false, nil
+	}
+
+	// Slow path: baseVersion check requires reading current state first.
+	createTime := now
 	var curVersion int64
 	var createStr string
 	err := exec.QueryRow(
@@ -183,8 +402,7 @@ func dsUpsertExec(exec dbExec, project, database, namespace, path, kind, parentP
 		project, database, namespace, path,
 	).Scan(&curVersion, &createStr)
 	if err == nil {
-		// Existing active entity.
-		if baseVersion > 0 && curVersion != baseVersion {
+		if curVersion != baseVersion {
 			return nil, curVersion, nil, nil, true, nil // conflict
 		}
 		ct, _ := time.Parse(timeLayout, createStr)
@@ -192,44 +410,60 @@ func dsUpsertExec(exec dbExec, project, database, namespace, path, kind, parentP
 	}
 
 	e := proto.Clone(entity).(*datastorepb.Entity)
-	newVer, err := dsSaveExec(exec, project, database, namespace, path, kind, parentPath, e, curVersion, createTime, now)
+	newVer, err := dsSaveExec(exec, project, database, namespace, path, kind, parentPath, e, curVersion, createTime, now, acc)
 	return e, newVer, createTime, now, false, err
 }
 
 // DsDelete soft-deletes an entity. No-ops silently if absent.
 func (s *Store) DsDelete(project, database, namespace, path string) error {
-	return dsDeleteExec(s.wdb, project, database, namespace, path)
+	return dsDeleteExec(s.wdb, project, database, namespace, path, nil)
 }
 
 // DsDeleteTx is like DsDelete but runs within the provided transaction.
-func (s *Store) DsDeleteTx(tx *sql.Tx, project, database, namespace, path string) error {
-	return dsDeleteExec(tx, project, database, namespace, path)
+// Pass acc to defer field-index and change-log writes for bulk flushing.
+func (s *Store) DsDeleteTx(tx *sql.Tx, project, database, namespace, path string, acc *CommitAccumulator) error {
+	return dsDeleteExec(tx, project, database, namespace, path, acc)
 }
 
-func dsDeleteExec(exec dbExec, project, database, namespace, path string) error {
+func dsDeleteExec(exec dbExec, project, database, namespace, path string, acc *CommitAccumulator) error {
 	now := time.Now().UTC().Format(timeLayout)
-	_, err := exec.Exec(
+	// Soft-delete and retrieve kind/parent_path in one round-trip via RETURNING.
+	var kind, parentPath string
+	err := exec.QueryRow(
 		`UPDATE ds_documents SET deleted=1, update_time=?
-		 WHERE project=? AND database=? AND namespace=? AND path=? AND deleted=0`,
+		 WHERE project=? AND database=? AND namespace=? AND path=? AND deleted=0
+		 RETURNING kind, parent_path`,
 		now, project, database, namespace, path,
-	)
+	).Scan(&kind, &parentPath)
+	if err == sql.ErrNoRows {
+		return nil // entity absent or already deleted — no-op
+	}
 	if err != nil {
 		return err
 	}
+
+	if acc != nil {
+		acc.fiDeletes = append(acc.fiDeletes, fiDeleteKey{project, database, namespace, path})
+		acc.changes = append(acc.changes, changeRow{
+			project: project, database: database, namespace: namespace,
+			path: path, kind: kind, parentPath: parentPath,
+			changeTime: now, deleted: 1, data: nil,
+		})
+		return nil
+	}
+
+	// Immediate mode (non-transactional call): run SQL directly.
 	if _, err := exec.Exec(
 		`DELETE FROM ds_field_index WHERE project=? AND database=? AND namespace=? AND doc_path=?`,
 		project, database, namespace, path,
 	); err != nil {
 		return fmt.Errorf("ds_field_index delete: %w", err)
 	}
-	// Append tombstone to change log.
 	_, err = exec.Exec(`
 		INSERT INTO ds_document_changes
 			(project, database, namespace, path, kind, parent_path, change_time, deleted, data)
-		SELECT ?, ?, ?, ?, kind, parent_path, ?, 1, NULL
-		FROM ds_documents WHERE project=? AND database=? AND namespace=? AND path=?`,
-		project, database, namespace, path, now,
-		project, database, namespace, path,
+		VALUES (?, ?, ?, ?, ?, ?, ?, 1, NULL)`,
+		project, database, namespace, path, kind, parentPath, now,
 	)
 	return err
 }
@@ -747,7 +981,9 @@ func dsAllocateIdsExec(exec dbExec, project, database, namespace, kind string, c
 
 // dsSaveExec marshals and persists an entity using the given executor.
 // nextVersion is the new version assigned (curVersion+1).
-func dsSaveExec(exec dbExec, project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity, curVersion int64, createTime, updateTime *timestamppb.Timestamp) (int64, error) {
+// When acc is non-nil, change-log and field-index writes are deferred into the
+// accumulator for bulk flushing; otherwise they execute immediately.
+func dsSaveExec(exec dbExec, project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity, curVersion int64, createTime, updateTime *timestamppb.Timestamp, acc *CommitAccumulator) (int64, error) {
 	data, err := proto.Marshal(entity)
 	if err != nil {
 		return 0, fmt.Errorf("ds marshal: %w", err)
@@ -772,7 +1008,23 @@ func dsSaveExec(exec dbExec, project, database, namespace, path, kind, parentPat
 	if err != nil {
 		return 0, err
 	}
-	// Append to change log for snapshot read support.
+	if acc != nil {
+		acc.changes = append(acc.changes, changeRow{
+			project: project, database: database, namespace: namespace,
+			path: path, kind: kind, parentPath: parentPath,
+			changeTime: updateStr, deleted: 0, data: data,
+		})
+		acc.fiDeletes = append(acc.fiDeletes, fiDeleteKey{project, database, namespace, path})
+		for propName, v := range entity.Properties {
+			var fiRows []dsFiRow
+			dsCollectValue(propName, v, false, &fiRows)
+			for _, r := range fiRows {
+				acc.fiInserts = append(acc.fiInserts, fiBulkRow{project, database, namespace, kind, path, r})
+			}
+		}
+		return newVersion, nil
+	}
+	// Immediate mode: write change-log and field-index now.
 	_, err = exec.Exec(`
 		INSERT INTO ds_document_changes
 			(project, database, namespace, path, kind, parent_path, change_time, deleted, data)
@@ -782,7 +1034,6 @@ func dsSaveExec(exec dbExec, project, database, namespace, path, kind, parentPat
 	if err != nil {
 		return 0, err
 	}
-	// Populate field index for SQL filter pushdown.
 	if err := dsIndexDocFields(exec, project, database, namespace, kind, path, entity); err != nil {
 		return 0, err
 	}
@@ -875,6 +1126,114 @@ type dsFiRow struct {
 	vLat      *float64
 	vLng      *float64
 	inArray   bool
+}
+
+type changeRow struct {
+	project, database, namespace, path, kind, parentPath, changeTime string
+	deleted                                                           int
+	data                                                              []byte
+}
+
+type fiDeleteKey struct {
+	project, database, namespace, docPath string
+}
+
+type fiBulkRow struct {
+	project, database, namespace, kind, docPath string
+	row                                         dsFiRow
+}
+
+// CommitAccumulator batches write-side effects (change-log rows, field-index
+// operations) from multiple mutations so they can be flushed in bulk at the
+// end of a commit transaction, cutting SQL round-trips from O(n) to O(1).
+type CommitAccumulator struct {
+	changes   []changeRow
+	fiDeletes []fiDeleteKey
+	fiInserts []fiBulkRow
+}
+
+// NewCommitAccumulator returns an empty accumulator for bulk commit use.
+func NewCommitAccumulator() *CommitAccumulator { return &CommitAccumulator{} }
+
+// Flush writes all accumulated change-log rows and field-index operations to exec.
+// Call once, at the end of the commit transaction, after all mutations.
+func (a *CommitAccumulator) Flush(exec dbExec) error {
+	if err := a.flushFiDeletes(exec); err != nil {
+		return err
+	}
+	if err := a.flushFiInserts(exec); err != nil {
+		return err
+	}
+	return a.flushChanges(exec)
+}
+
+func (a *CommitAccumulator) flushFiDeletes(exec dbExec) error {
+	if len(a.fiDeletes) == 0 {
+		return nil
+	}
+	type nsKey struct{ project, database, namespace string }
+	groups := make(map[nsKey][]string, len(a.fiDeletes))
+	for _, d := range a.fiDeletes {
+		k := nsKey{d.project, d.database, d.namespace}
+		groups[k] = append(groups[k], d.docPath)
+	}
+	const chunkSize = 900
+	for k, paths := range groups {
+		for start := 0; start < len(paths); start += chunkSize {
+			end := start + chunkSize
+			if end > len(paths) {
+				end = len(paths)
+			}
+			chunk := paths[start:end]
+			ph := strings.Repeat("?,", len(chunk))
+			ph = ph[:len(ph)-1]
+			args := make([]any, 0, 3+len(chunk))
+			args = append(args, k.project, k.database, k.namespace)
+			for _, p := range chunk {
+				args = append(args, p)
+			}
+			q := `DELETE FROM ds_field_index WHERE project=? AND database=? AND namespace=? AND doc_path IN (` + ph + `)`
+			if _, err := exec.Exec(q, args...); err != nil {
+				return fmt.Errorf("ds_field_index bulk delete: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+func (a *CommitAccumulator) flushFiInserts(exec dbExec) error {
+	return dsBatchInsertFIBulk(exec, a.fiInserts)
+}
+
+func (a *CommitAccumulator) flushChanges(exec dbExec) error {
+	if len(a.changes) == 0 {
+		return nil
+	}
+	const batchSize = 500
+	const prefix = `INSERT INTO ds_document_changes ` +
+		`(project, database, namespace, path, kind, parent_path, change_time, deleted, data) VALUES `
+	const placeholder = `(?,?,?,?,?,?,?,?,?)`
+	for start := 0; start < len(a.changes); start += batchSize {
+		end := start + batchSize
+		if end > len(a.changes) {
+			end = len(a.changes)
+		}
+		batch := a.changes[start:end]
+		var sb strings.Builder
+		sb.WriteString(prefix)
+		args := make([]any, 0, len(batch)*9)
+		for i, c := range batch {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteString(placeholder)
+			args = append(args, c.project, c.database, c.namespace, c.path, c.kind, c.parentPath, c.changeTime, c.deleted, c.data)
+		}
+		if _, err := exec.Exec(sb.String(), args...); err != nil {
+			return fmt.Errorf("ds_document_changes bulk insert: %w", err)
+		}
+	}
+	return nil
 }
 
 // dsKeyToPath builds a storage path string from a *datastorepb.Key.
@@ -1038,6 +1397,52 @@ func (s *Store) RebuildDsFieldIndex() error {
 		offset += len(batch)
 		if len(batch) < batchSize {
 			break
+		}
+	}
+	return nil
+}
+
+// dsBatchInsertFIBulk inserts field index rows where each row carries its own
+// project/database/namespace/kind/docPath metadata. Used by CommitAccumulator.Flush
+// to write all accumulated field-index rows in one batched operation.
+func dsBatchInsertFIBulk(exec dbExec, rows []fiBulkRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	const batchSize = 500
+	const prefix = `INSERT INTO ds_field_index` +
+		` (project, database, namespace, kind, doc_path, field_path,` +
+		`  value_string, value_int, value_double, value_bool, value_null, value_ref, value_bytes, value_lat, value_lng, in_array)` +
+		` VALUES `
+	const placeholder = `(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+
+	for start := 0; start < len(rows); start += batchSize {
+		end := start + batchSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+		batch := rows[start:end]
+		var sb strings.Builder
+		sb.WriteString(prefix)
+		args := make([]any, 0, len(batch)*16)
+		for i, br := range batch {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteString(placeholder)
+			inArrayInt := 0
+			if br.row.inArray {
+				inArrayInt = 1
+			}
+			args = append(args,
+				br.project, br.database, br.namespace, br.kind, br.docPath, br.row.fieldPath,
+				br.row.vStr, br.row.vInt, br.row.vDouble, br.row.vBool, br.row.vNull, br.row.vRef, nilIfEmpty(br.row.vBytes),
+				br.row.vLat, br.row.vLng,
+				inArrayInt,
+			)
+		}
+		if _, err := exec.Exec(sb.String(), args...); err != nil {
+			return fmt.Errorf("ds_field_index bulk insert: %w", err)
 		}
 	}
 	return nil

@@ -32,18 +32,56 @@ type txEntry struct {
 
 // checkOCCConflicts verifies that no entity in the read set has been modified
 // since it was read. Returns Aborted if any version has increased.
+// Issues one batched SELECT instead of one per entity.
 func checkOCCConflicts(tx *sql.Tx, reads map[txReadKey]int64) error {
-	for k, readVer := range reads {
-		var curVer int64
-		err := tx.QueryRow(
-			`SELECT version FROM ds_documents WHERE project=? AND database=? AND namespace=? AND path=? AND deleted=0`,
-			k.project, k.database, k.namespace, k.path,
-		).Scan(&curVer)
-		if err == sql.ErrNoRows || curVer > readVer {
-			return status.Error(codes.Aborted, "too much contention on these datastore entities. please try again.")
+	if len(reads) == 0 {
+		return nil
+	}
+
+	// Group reads by (project, database, namespace) to allow per-namespace IN queries.
+	type nsKey struct{ project, database, namespace string }
+	type pathVer struct{ path string; ver int64 }
+	groups := make(map[nsKey][]pathVer, len(reads))
+	for k, v := range reads {
+		nk := nsKey{k.project, k.database, k.namespace}
+		groups[nk] = append(groups[nk], pathVer{k.path, v})
+	}
+
+	for nk, entries := range groups {
+		placeholders := strings.Repeat("?,", len(entries))
+		placeholders = placeholders[:len(placeholders)-1]
+		args := make([]any, 0, 3+len(entries))
+		args = append(args, nk.project, nk.database, nk.namespace)
+		readVers := make(map[string]int64, len(entries))
+		for _, e := range entries {
+			args = append(args, e.path)
+			readVers[e.path] = e.ver
 		}
+		q := `SELECT path, version FROM ds_documents WHERE project=? AND database=? AND namespace=? AND deleted=0 AND path IN (` + placeholders + `)`
+		rows, err := tx.Query(q, args...)
 		if err != nil {
 			return fmt.Errorf("occ version check: %w", err)
+		}
+		for rows.Next() {
+			var path string
+			var curVer int64
+			if err := rows.Scan(&path, &curVer); err != nil {
+				rows.Close()
+				return fmt.Errorf("occ version scan: %w", err)
+			}
+			if curVer > readVers[path] {
+				rows.Close()
+				return status.Error(codes.Aborted, "too much contention on these datastore entities. please try again.")
+			}
+			delete(readVers, path)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("occ version check: %w", err)
+		}
+		// Any path not returned by the query was deleted — treat as conflict.
+		if len(readVers) > 0 {
+			return status.Error(codes.Aborted, "too much contention on these datastore entities. please try again.")
 		}
 	}
 	return nil

@@ -12,7 +12,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // dbExec is satisfied by both *sql.DB and *sql.Tx, enabling helpers to work
@@ -27,12 +27,16 @@ type dbExec interface {
 // journal_mode=WAL is omitted — it's a file-level setting, set once on wdb.
 // wal_autocheckpoint=0 disables automatic checkpointing; a background goroutine
 // checkpoints every 30 s via PASSIVE mode so write transactions never block on it.
-const pragmaDSN = "_pragma=synchronous(NORMAL)" +
-	"&_pragma=busy_timeout(5000)" +
-	"&_pragma=mmap_size(8589934592)" +
-	"&_pragma=cache_size(-524288)" + // 512 MB — covers more B-tree hot pages
-	"&_pragma=foreign_keys(1)" +
-	"&_pragma=wal_autocheckpoint(0)"
+// synchronous=OFF is safe for an emulator (developer tool; no crash-durability
+// requirement). It removes the checkpoint fsync entirely, the dominant cost for
+// write-heavy workloads. See: rqlite, phiresky sqlite-perf, ericdraken benchmarks.
+const pragmaDSN = "_synchronous=OFF" +
+	"&_busy_timeout=5000" +
+	"&_cache_size=-524288" + // 512 MB — covers more B-tree hot pages
+	"&_foreign_keys=on" +
+	"&_stmt_cache_size=100" // per-connection prepared-statement LRU cache
+// _wal_autocheckpoint and mmap_size are applied via explicit PRAGMA after open;
+// mattn/go-sqlite3 silently ignores them in the DSN.
 
 const schema = `
 CREATE TABLE IF NOT EXISTS documents (
@@ -267,12 +271,18 @@ func New(dataDir string) (*Store, error) {
 
 	dsn := dbPath + "?" + pragmaDSN
 
-	wdb, err := sql.Open("sqlite", dsn)
+	wdb, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening sqlite (write): %w", err)
 	}
 	wdb.SetMaxOpenConns(1)
 	wdb.SetMaxIdleConns(1)
+	if _, err := wdb.Exec("PRAGMA mmap_size=8589934592"); err != nil {
+		return nil, fmt.Errorf("setting mmap_size: %w", err)
+	}
+	if _, err := wdb.Exec("PRAGMA wal_autocheckpoint=0"); err != nil {
+		return nil, fmt.Errorf("disabling wal_autocheckpoint: %w", err)
+	}
 
 	// WAL mode persists in the file; read pool connections inherit it.
 	if _, err := wdb.Exec("PRAGMA journal_mode=WAL"); err != nil {
@@ -287,12 +297,15 @@ func New(dataDir string) (*Store, error) {
 	// Refresh query planner statistics (non-fatal if unsupported).
 	_, _ = wdb.Exec("PRAGMA optimize")
 
-	rdb, err := sql.Open("sqlite", dsn)
+	rdb, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening sqlite (read): %w", err)
 	}
 	rdb.SetMaxOpenConns(4)
 	rdb.SetMaxIdleConns(4)
+	if _, err := rdb.Exec("PRAGMA mmap_size=8589934592"); err != nil {
+		return nil, fmt.Errorf("setting mmap_size (read): %w", err)
+	}
 
 	s := &Store{
 		wdb:  wdb,
@@ -313,7 +326,7 @@ func (s *Store) checkpointLoop() {
 	for {
 		select {
 		case <-t.C:
-			_, _ = s.wdb.Exec("PRAGMA wal_checkpoint(PASSIVE)")
+			_, _ = s.wdb.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 		case <-s.done:
 			_, _ = s.wdb.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 			return

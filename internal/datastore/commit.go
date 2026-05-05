@@ -12,6 +12,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
+	"github.com/magnus-rattlehead/hearthstore/internal/storage"
 )
 
 func (g *GRPCServer) Commit(ctx context.Context, req *datastorepb.CommitRequest) (*datastorepb.CommitResponse, error) {
@@ -45,20 +46,40 @@ func (g *GRPCServer) Commit(ctx context.Context, req *datastorepb.CommitRequest)
 
 	// Wrap all mutations in a single SQLite transaction for atomicity and
 	// performance (one WAL commit instead of two per mutation).
+	// The accumulator defers change-log and field-index writes so they can be
+	// flushed in bulk at the end, reducing SQL round-trips from O(n) to O(1).
 	var results []*datastorepb.MutationResult
 	if err := g.store.RunInTx(func(tx *sql.Tx) error {
 		if err := checkOCCConflicts(tx, entry.reads); err != nil {
 			return err
 		}
+		acc := storage.NewCommitAccumulator()
 		results = make([]*datastorepb.MutationResult, 0, len(req.Mutations))
+
+		// Fast path: all mutations are simple upserts (complete key, baseVersion=0,
+		// no property mask, no transforms) — execute as one batch INSERT.
+		if bulkRows, ok := g.collectSimpleUpserts(req.ProjectId, database, req.Mutations); ok {
+			versions, err := g.store.DsUpsertManyTx(tx, req.ProjectId, database, bulkRows, commitTime, acc)
+			if err != nil {
+				return err
+			}
+			for _, r := range bulkRows {
+				results = append(results, &datastorepb.MutationResult{
+					Version:    versions[r.Path],
+					UpdateTime: commitTime,
+				})
+			}
+			return acc.Flush(tx)
+		}
+
 		for _, m := range req.Mutations {
-			mr, err := g.applyMutationTx(tx, req.ProjectId, database, m, commitTime)
+			mr, err := g.applyMutationTx(tx, req.ProjectId, database, m, commitTime, acc)
 			if err != nil {
 				return err
 			}
 			results = append(results, mr)
 		}
-		return nil
+		return acc.Flush(tx)
 	}); err != nil {
 		return nil, err
 	}
@@ -85,8 +106,49 @@ func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, project st
 	writeProtoJSON(w, resp)
 }
 
+// collectSimpleUpserts checks whether every mutation is a plain upsert (complete key,
+// baseVersion=0, no property mask, no transforms). If so, it returns the batch rows
+// and true so the caller can use a single multi-row INSERT instead of N round-trips.
+func (g *GRPCServer) collectSimpleUpserts(project, database string, mutations []*datastorepb.Mutation) ([]storage.UpsertManyRow, bool) {
+	if len(mutations) == 0 {
+		return nil, false
+	}
+	rows := make([]storage.UpsertManyRow, 0, len(mutations))
+	for _, m := range mutations {
+		op, ok := m.Operation.(*datastorepb.Mutation_Upsert)
+		if !ok {
+			return nil, false
+		}
+		if m.GetBaseVersion() != 0 || m.GetPropertyMask() != nil || len(m.PropertyTransforms) != 0 {
+			return nil, false
+		}
+		e := op.Upsert
+		if isIncompleteKey(e.Key) {
+			return nil, false
+		}
+		proj, db, ns, kind, parentPath, path := keyComponents(e.Key)
+		if proj == "" {
+			proj = project
+		}
+		if db == "" {
+			db = database
+		}
+		if proj != project || db != database {
+			return nil, false // cross-project/database mutations fall back to per-mutation path
+		}
+		rows = append(rows, storage.UpsertManyRow{
+			Namespace:  ns,
+			Path:       path,
+			Kind:       kind,
+			ParentPath: parentPath,
+			Entity:     e,
+		})
+	}
+	return rows, true
+}
+
 // applyMutationTx executes a single Mutation within the given transaction and returns its MutationResult.
-func (g *GRPCServer) applyMutationTx(tx *sql.Tx, project, database string, m *datastorepb.Mutation, commitTime *timestamppb.Timestamp) (*datastorepb.MutationResult, error) {
+func (g *GRPCServer) applyMutationTx(tx *sql.Tx, project, database string, m *datastorepb.Mutation, commitTime *timestamppb.Timestamp, acc *storage.CommitAccumulator) (*datastorepb.MutationResult, error) {
 	var (
 		resultKey        *datastorepb.Key
 		version          int64
@@ -118,7 +180,7 @@ func (g *GRPCServer) applyMutationTx(tx *sql.Tx, project, database string, m *da
 		_, _, _, _, parentPath, path := keyComponents(e.Key)
 		var ct *timestamppb.Timestamp
 		var err error
-		entity, version, ct, updateTime, err = g.store.DsInsertTx(tx, proj, db, ns, path, kind, parentPath, e)
+		entity, version, ct, updateTime, err = g.store.DsInsertTx(tx, proj, db, ns, path, kind, parentPath, e, acc)
 		if err != nil {
 			return nil, err
 		}
@@ -141,7 +203,7 @@ func (g *GRPCServer) applyMutationTx(tx *sql.Tx, project, database string, m *da
 			return existing, err
 		})
 		var err error
-		entity, version, _, updateTime, conflictDetected, err = g.store.DsUpdateTx(tx, proj, db, ns, path, e, m.GetBaseVersion())
+		entity, version, _, updateTime, conflictDetected, err = g.store.DsUpdateTx(tx, proj, db, ns, path, e, m.GetBaseVersion(), acc)
 		if err != nil {
 			return nil, err
 		}
@@ -170,7 +232,7 @@ func (g *GRPCServer) applyMutationTx(tx *sql.Tx, project, database string, m *da
 			return existing, err
 		})
 		var err error
-		entity, version, _, updateTime, conflictDetected, err = g.store.DsUpsertTx(tx, proj, db, ns, path, kind, parentPath, e, m.GetBaseVersion())
+		entity, version, _, updateTime, conflictDetected, err = g.store.DsUpsertTx(tx, proj, db, ns, path, kind, parentPath, e, m.GetBaseVersion(), acc)
 		if err != nil {
 			return nil, err
 		}
@@ -186,7 +248,7 @@ func (g *GRPCServer) applyMutationTx(tx *sql.Tx, project, database string, m *da
 		if db == "" {
 			db = database
 		}
-		if err := g.store.DsDeleteTx(tx, proj, db, ns, path); err != nil {
+		if err := g.store.DsDeleteTx(tx, proj, db, ns, path, acc); err != nil {
 			return nil, err
 		}
 		updateTime = commitTime
@@ -211,7 +273,7 @@ func (g *GRPCServer) applyMutationTx(tx *sql.Tx, project, database string, m *da
 		if err != nil {
 			return nil, err
 		}
-		if err := g.resaveEntityTx(tx, project, database, entity); err != nil {
+		if err := g.resaveEntityTx(tx, project, database, entity, acc); err != nil {
 			return nil, err
 		}
 	}
@@ -225,7 +287,7 @@ func (g *GRPCServer) applyMutationTx(tx *sql.Tx, project, database string, m *da
 }
 
 // resaveEntityTx writes the transformed entity back to storage within the given transaction.
-func (g *GRPCServer) resaveEntityTx(tx *sql.Tx, project, database string, entity *datastorepb.Entity) error {
+func (g *GRPCServer) resaveEntityTx(tx *sql.Tx, project, database string, entity *datastorepb.Entity, acc *storage.CommitAccumulator) error {
 	proj, db, ns, kind, parentPath, path := keyComponents(entity.Key)
 	if proj == "" {
 		proj = project
@@ -233,7 +295,7 @@ func (g *GRPCServer) resaveEntityTx(tx *sql.Tx, project, database string, entity
 	if db == "" {
 		db = database
 	}
-	_, _, _, _, _, err := g.store.DsUpdateTx(tx, proj, db, ns, path, entity, 0)
+	_, _, _, _, _, err := g.store.DsUpdateTx(tx, proj, db, ns, path, entity, 0, acc)
 	_ = kind
 	_ = parentPath
 	return err

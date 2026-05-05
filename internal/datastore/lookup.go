@@ -28,6 +28,15 @@ func (g *GRPCServer) Lookup(ctx context.Context, req *datastorepb.LookupRequest)
 	}
 	seen := make(map[string]bool, len(req.Keys))
 
+	// Deduplicate keys and group by (project, database, namespace) for batch fetch.
+	type nsKey struct{ project, database, namespace string }
+	type keyMeta struct {
+		key  *datastorepb.Key
+		path string
+	}
+	groups := make(map[nsKey][]keyMeta)
+	keyByPath := make(map[string]*datastorepb.Key, len(req.Keys))
+
 	for _, key := range req.Keys {
 		ks := keyString(key)
 		if seen[ks] {
@@ -44,6 +53,7 @@ func (g *GRPCServer) Lookup(ctx context.Context, req *datastorepb.LookupRequest)
 		}
 
 		if readAt != nil {
+			// Snapshot reads must be per-entity (time-based query).
 			entity, err := g.store.DsGetAsOf(proj, db, ns, path, *readAt)
 			if err != nil {
 				resp.Missing = append(resp.Missing, &datastorepb.EntityResult{
@@ -55,19 +65,35 @@ func (g *GRPCServer) Lookup(ctx context.Context, req *datastorepb.LookupRequest)
 				})
 			}
 		} else {
-			entity, ver, ct, ut, err := g.store.DsGetWithTimes(proj, db, ns, path)
-			if err != nil {
-				resp.Missing = append(resp.Missing, &datastorepb.EntityResult{
-					Entity: &datastorepb.Entity{Key: key},
-				})
-			} else {
-				resp.Found = append(resp.Found, &datastorepb.EntityResult{
-					Entity:     entity,
-					Version:    ver,
-					CreateTime: ct,
-					UpdateTime: ut,
-				})
-			}
+			nk := nsKey{proj, db, ns}
+			groups[nk] = append(groups[nk], keyMeta{key, path})
+			keyByPath[path] = key
+		}
+	}
+
+	// Batch fetch all non-snapshot keys per namespace group.
+	for nk, metas := range groups {
+		paths := make([]string, len(metas))
+		for i, m := range metas {
+			paths[i] = m.path
+		}
+		found, missing, err := g.store.DsGetManyWithTimes(nk.project, nk.database, nk.namespace, paths)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range found {
+			resp.Found = append(resp.Found, &datastorepb.EntityResult{
+				Entity:     row.Entity,
+				Version:    row.Version,
+				CreateTime: row.CreateTime,
+				UpdateTime: row.UpdateTime,
+			})
+		}
+		for _, path := range missing {
+			key := keyByPath[path]
+			resp.Missing = append(resp.Missing, &datastorepb.EntityResult{
+				Entity: &datastorepb.Entity{Key: key},
+			})
 		}
 	}
 
