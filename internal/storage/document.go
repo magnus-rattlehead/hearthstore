@@ -209,6 +209,17 @@ func (s *Store) InsertDocTx(tx *sql.Tx, project, database, collection, parentPat
 	return d, nil
 }
 
+// InsertDocTxAcc creates a new document within a transaction, collecting the
+// ChangeEvent in acc for post-tx fan-out instead of notifying inline.
+func (s *Store) InsertDocTxAcc(tx *sql.Tx, project, database, collection, parentPath, path string, doc *firestorepb.Document, acc *FsCommitAccumulator) (*firestorepb.Document, error) {
+	d, seq, err := insertDocExec(tx, project, database, collection, parentPath, path, doc)
+	if err != nil {
+		return nil, err
+	}
+	acc.events = append(acc.events, ChangeEvent{Name: d.Name, Doc: d, Seq: seq, Project: project, Database: database, Collection: collection, ParentPath: parentPath})
+	return d, nil
+}
+
 func insertDocExec(exec dbExec, project, database, collection, parentPath, path string, doc *firestorepb.Document) (*firestorepb.Document, int64, error) {
 	var dummy int
 	err := exec.QueryRow(
@@ -255,6 +266,17 @@ func (s *Store) UpsertDocTx(tx *sql.Tx, project, database, collection, parentPat
 	return d, nil
 }
 
+// UpsertDocTxAcc creates or replaces a document within a transaction, collecting the
+// ChangeEvent in acc for post-tx fan-out instead of notifying inline.
+func (s *Store) UpsertDocTxAcc(tx *sql.Tx, project, database, collection, parentPath, path string, doc *firestorepb.Document, acc *FsCommitAccumulator) (*firestorepb.Document, error) {
+	d, seq, err := upsertDocExec(tx, project, database, collection, parentPath, path, doc)
+	if err != nil {
+		return nil, err
+	}
+	acc.events = append(acc.events, ChangeEvent{Name: d.Name, Doc: d, Seq: seq, Project: project, Database: database, Collection: collection, ParentPath: parentPath})
+	return d, nil
+}
+
 func upsertDocExec(exec dbExec, project, database, collection, parentPath, path string, doc *firestorepb.Document) (*firestorepb.Document, int64, error) {
 	now := monotonicNow()
 
@@ -294,6 +316,26 @@ func (s *Store) DeleteDoc(project, database, path string) error {
 // DeleteDocTx soft-deletes a document within a transaction.
 func (s *Store) DeleteDocTx(tx *sql.Tx, project, database, path string) error {
 	return s.deleteDocWith(tx, project, database, path)
+}
+
+// DeleteDocTxAcc soft-deletes a document within a transaction, collecting the
+// ChangeEvent in acc for post-tx fan-out instead of notifying inline.
+func (s *Store) DeleteDocTxAcc(tx *sql.Tx, project, database, path string, acc *FsCommitAccumulator) error {
+	doc, _ := getDocExec(tx, project, database, path)
+	name := path
+	if doc != nil {
+		name = doc.Name
+	}
+	if err := deleteDocExec(tx, project, database, path); err != nil {
+		return err
+	}
+	coll, parent := splitChangePath(path)
+	seq, err := appendChangeExec(tx, project, database, path, coll, parent, true, nil, time.Now())
+	if err != nil {
+		return err
+	}
+	acc.events = append(acc.events, ChangeEvent{Name: name, Deleted: true, Seq: seq, Project: project, Database: database, Collection: coll, ParentPath: parent})
+	return nil
 }
 
 func (s *Store) deleteDocWith(exec dbExec, project, database, path string) error {
