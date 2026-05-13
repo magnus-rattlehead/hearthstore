@@ -236,7 +236,7 @@ func (s *Store) UpsertDocsManyTx(tx *sql.Tx, project, database string, rows []Fs
 		d.CreateTime = createTime
 		d.UpdateTime = now
 
-		// Persist document + field-index using cached single-row SQL (same SQL text → cache hit).
+		// Persist document + field-index using cached single-row SQL (same SQL text -> cache hit).
 		if err := saveDocExec(tx, project, database, r.Collection, r.ParentPath, r.Path, d); err != nil {
 			return nil, fmt.Errorf("upsert doc %s: %w", r.Path, err)
 		}

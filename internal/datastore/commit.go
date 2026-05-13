@@ -57,7 +57,7 @@ func (g *GRPCServer) Commit(ctx context.Context, req *datastorepb.CommitRequest)
 		results = make([]*datastorepb.MutationResult, 0, len(req.Mutations))
 
 		// Fast path: all mutations are simple upserts (complete key, baseVersion=0,
-		// no property mask, no transforms) — execute as one batch INSERT.
+		// no property mask, no transforms) - execute as one batch INSERT.
 		if bulkRows, ok := g.collectSimpleUpserts(req.ProjectId, database, req.Mutations); ok {
 			versions, err := g.store.DsUpsertManyTx(tx, req.ProjectId, database, bulkRows, commitTime, acc)
 			if err != nil {
@@ -492,7 +492,7 @@ func applyPropertyMask(incoming *datastorepb.Entity, mask *datastorepb.PropertyM
 	}
 	existing, err := fetchExisting()
 	if err != nil {
-		// Entity does not exist yet — write only the masked fields from incoming.
+		// Entity does not exist yet - write only the masked fields from incoming.
 		merged := proto.Clone(incoming).(*datastorepb.Entity)
 		if merged.Properties == nil {
 			merged.Properties = make(map[string]*datastorepb.Value)

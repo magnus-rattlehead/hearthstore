@@ -19,7 +19,7 @@ import (
 // which breaks SQLite lexicographic comparison ('.' < 'Z').
 const timeLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
-// monotonicNow returns a timestamp strictly greater (by ≥1ms) than the last,
+// monotonicNow returns a timestamp strictly greater (by >=1ms) than the last,
 // so sequential writes within the same millisecond get distinct update times.
 var (
 	monoMu     sync.Mutex
@@ -50,8 +50,8 @@ type ChangeEvent struct {
 }
 
 // SubScope describes the watch scope for a subscriber shard.
-// AllDescendants=true → collection-group listener (any parent depth).
-// AllDescendants=false → single-collection listener at ParentPath.
+// AllDescendants=true -> collection-group listener (any parent depth).
+// AllDescendants=false -> single-collection listener at ParentPath.
 type SubScope struct {
 	Project, Database, ParentPath, Collection string
 	AllDescendants                            bool
@@ -374,7 +374,7 @@ func deleteDocExec(exec dbExec, project, database, path string) error {
 // ListDocs returns documents in a specific collection under parentPath, with cursor pagination.
 // pageToken is the path of the last document returned in the previous page (empty for first page).
 // When showMissing is true, documents that don't exist but have subcollections are also included
-// (with name set but fields/timestamps absent — matching Firestore's showMissing semantics).
+// (with name set but fields/timestamps absent - matching Firestore's showMissing semantics).
 // Returns (docs, nextPageToken, error); nextPageToken is empty when there are no more results.
 func (s *Store) ListDocs(project, database, parentPath, collection string, pageSize int32, pageToken string, showMissing bool) ([]*firestorepb.Document, string, error) {
 	limit := int(pageSize)
@@ -432,7 +432,7 @@ func (s *Store) ListDocs(project, database, parentPath, collection string, pageS
 		return nil, "", err
 	}
 
-	// Query virtual (missing) document IDs — ancestors of descendant docs that don't exist.
+	// Query virtual (missing) document IDs - ancestors of descendant docs that don't exist.
 	if showMissing {
 		// offset is the 1-based starting position of the docId segment in path.
 		// collPrefix + "/" + docId + "/" + rest
@@ -913,7 +913,7 @@ func saveDocExec(exec dbExec, project, database, collection, parentPath, path st
 }
 
 // buildCollectionPath returns the relative collection path stored in field_index.collection_path.
-// e.g. ("companies/c1", "users") → "companies/c1/users"; ("", "users") → "users"
+// e.g. ("companies/c1", "users") -> "companies/c1/users"; ("", "users") -> "users"
 func buildCollectionPath(parentPath, collection string) string {
 	if parentPath == "" {
 		return collection
@@ -996,7 +996,7 @@ func indexDocFields(exec dbExec, project, database, collectionPath, docPath stri
 }
 
 // collectValue recursively appends field_index rows for a single Firestore value.
-// inArray=true means we are already inside an array — nested arrays are skipped
+// inArray=true means we are already inside an array - nested arrays are skipped
 // (Firestore does not index array-of-arrays).
 func collectValue(fieldPath string, v *firestorepb.Value, inArray bool, rows *[]fiPendingRow) {
 	if v == nil {
@@ -1035,7 +1035,7 @@ func collectValue(fieldPath string, v *firestorepb.Value, inArray bool, rows *[]
 		*rows = append(*rows, fiPendingRow{fieldPath, fiVals{ref: &ref}, inArray})
 
 	case *firestorepb.Value_TimestampValue:
-		// Stored as RFC3339Nano in value_string — ISO 8601 sorts lexicographically.
+		// Stored as RFC3339Nano in value_string - ISO 8601 sorts lexicographically.
 		s := vt.TimestampValue.AsTime().UTC().Format(time.RFC3339Nano)
 		*rows = append(*rows, fiPendingRow{fieldPath, fiVals{str: &s}, inArray})
 

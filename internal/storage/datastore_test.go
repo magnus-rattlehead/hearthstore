@@ -13,7 +13,7 @@ import (
 	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
 )
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// -- helpers ------------------------------------------------------------------
 
 const (
 	dsTestProject   = "ds-proj"
@@ -133,7 +133,7 @@ func dsUpsertEntity(t *testing.T, s *Store, path, kind string, entity *datastore
 	}
 }
 
-// ── ds_field_index tests ─────────────────────────────────────────────────────
+// -- ds_field_index tests -----------------------------------------------------
 
 func TestDsFieldIndex_PopulatedOnUpsert(t *testing.T) {
 	s := newDsTestStore(t)
@@ -147,7 +147,7 @@ func TestDsFieldIndex_PopulatedOnUpsert(t *testing.T) {
 	})
 	dsUpsertEntity(t, s, path, "Widget", e)
 
-	// 4 properties → 4 rows.
+	// 4 properties -> 4 rows.
 	if n := countDsFI(t, s.DB(), path); n != 4 {
 		t.Errorf("want 4 ds_field_index rows, got %d", n)
 	}
@@ -371,12 +371,12 @@ func TestDsFieldIndex_ArrayCanonicalBytes(t *testing.T) {
 	}
 }
 
-// ── concurrent r/w tests ─────────────────────────────────────────────────────
+// -- concurrent r/w tests -----------------------------------------------------
 
 // TestConcurrentReadWrite verifies that SQLite WAL mode allows reads on the rdb
 // pool to proceed concurrently with an open write transaction on wdb.
 // Without WAL mode (or if rdb and wdb share the same connection), the readers
-// would block until the write transaction commits — this test catches that.
+// would block until the write transaction commits - this test catches that.
 func TestConcurrentReadWrite(t *testing.T) {
 	s := newDsTestStore(t)
 
@@ -422,7 +422,7 @@ func TestConcurrentReadWrite(t *testing.T) {
 
 	select {
 	case <-readsDone:
-		// Reads completed while the write transaction was still open — WAL is working.
+		// Reads completed while the write transaction was still open - WAL is working.
 	case <-time.After(5 * time.Second):
 		t.Fatal("reads blocked on open write transaction: WAL mode may not be active or r/w pool split is broken")
 	}

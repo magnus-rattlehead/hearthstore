@@ -17,7 +17,7 @@ import (
 	"github.com/magnus-rattlehead/hearthstore/internal/storage"
 )
 
-// ── benchmark helpers ─────────────────────────────────────────────────────────
+// -- benchmark helpers ---------------------------------------------------------
 
 func newBenchDsServer(b *testing.B) *Server {
 	b.Helper()
@@ -93,10 +93,10 @@ func bulkSeed(tb testing.TB, s *Server, n int) {
 	}
 }
 
-// ── performance assertions ────────────────────────────────────────────────────
+// -- performance assertions ----------------------------------------------------
 // These run with go test ./... and catch catastrophic regressions.
 // Thresholds are extremely conservative (100-1000x below real hardware performance)
-// so the tests are never flaky; they only trip on O(n²) bugs or broken WAL mode.
+// so the tests are never flaky; they only trip on O(n^2) bugs or broken WAL mode.
 
 // TestPerf_SequentialCommits writes N entities one commit at a time.
 func TestPerf_SequentialCommits(t *testing.T) {
@@ -117,7 +117,7 @@ func TestPerf_SequentialCommits(t *testing.T) {
 	rate := float64(n) / elapsed.Seconds()
 	t.Logf("%d sequential commits: %v (%.0f commits/sec)", n, elapsed.Round(time.Millisecond), rate)
 
-	const floor = 10.0 // commits/sec — real hardware typically does 500-5000+
+	const floor = 10.0 // commits/sec - real hardware typically does 500-5000+
 	if rate < floor {
 		t.Errorf("sequential commit rate %.1f/sec is below floor %.0f/sec", rate, floor)
 	}
@@ -315,7 +315,7 @@ func TestPerf_CursorPagination(t *testing.T) {
 	}
 }
 
-// ── benchmarks ────────────────────────────────────────────────────────────────
+// -- benchmarks ----------------------------------------------------------------
 
 // BenchmarkDs_CommitSingle measures a single-mutation commit.
 func BenchmarkDs_CommitSingle(b *testing.B) {

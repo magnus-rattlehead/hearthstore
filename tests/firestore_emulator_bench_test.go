@@ -142,7 +142,7 @@ func fsBulkBatchWrite(collection string, batchSize, iter int) *firestorepb.Batch
 	return &firestorepb.BatchWriteRequest{Writes: writes}
 }
 
-// BenchmarkFsEmulator_CommitSingle — 1 upsert per Commit RPC.
+// BenchmarkFsEmulator_CommitSingle - 1 upsert per Commit RPC.
 func BenchmarkFsEmulator_CommitSingle(b *testing.B) {
 	for _, ep := range activeFsEndpoints(b) {
 		ep := ep
@@ -157,7 +157,7 @@ func BenchmarkFsEmulator_CommitSingle(b *testing.B) {
 	}
 }
 
-// BenchmarkFsEmulator_CommitBulk100 — 100 upserts per Commit RPC.
+// BenchmarkFsEmulator_CommitBulk100 - 100 upserts per Commit RPC.
 func BenchmarkFsEmulator_CommitBulk100(b *testing.B) {
 	for _, ep := range activeFsEndpoints(b) {
 		ep := ep
@@ -172,7 +172,7 @@ func BenchmarkFsEmulator_CommitBulk100(b *testing.B) {
 	}
 }
 
-// BenchmarkFsEmulator_CommitBulk500 — 500 upserts per Commit RPC.
+// BenchmarkFsEmulator_CommitBulk500 - 500 upserts per Commit RPC.
 func BenchmarkFsEmulator_CommitBulk500(b *testing.B) {
 	for _, ep := range activeFsEndpoints(b) {
 		ep := ep
@@ -187,7 +187,7 @@ func BenchmarkFsEmulator_CommitBulk500(b *testing.B) {
 	}
 }
 
-// BenchmarkFsEmulator_BatchWrite100 — 100 upserts per BatchWrite RPC.
+// BenchmarkFsEmulator_BatchWrite100 - 100 upserts per BatchWrite RPC.
 func BenchmarkFsEmulator_BatchWrite100(b *testing.B) {
 	for _, ep := range activeFsEndpoints(b) {
 		ep := ep

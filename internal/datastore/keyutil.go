@@ -49,33 +49,6 @@ func keyComponents(key *datastorepb.Key) (project, database, namespace, kind, pa
 	return
 }
 
-// pathToKey reconstructs a Key from storage path components.
-func pathToKey(project, database, namespace, path string) *datastorepb.Key {
-	if database == defaultDatabase {
-		database = ""
-	}
-	parts := strings.Split(path, "/")
-	var pathElems []*datastorepb.Key_PathElement
-	for i := 0; i+1 < len(parts); i += 2 {
-		kind := parts[i]
-		idOrName := parts[i+1]
-		pe := &datastorepb.Key_PathElement{Kind: kind}
-		if n, err := strconv.ParseInt(idOrName, 10, 64); err == nil {
-			pe.IdType = &datastorepb.Key_PathElement_Id{Id: n}
-		} else {
-			pe.IdType = &datastorepb.Key_PathElement_Name{Name: idOrName}
-		}
-		pathElems = append(pathElems, pe)
-	}
-	return &datastorepb.Key{
-		PartitionId: &datastorepb.PartitionId{
-			ProjectId:   project,
-			DatabaseId:  database,
-			NamespaceId: namespace,
-		},
-		Path: pathElems,
-	}
-}
 
 // keyString returns a canonical string for deduplication (used in Lookup).
 func keyString(key *datastorepb.Key) string {
@@ -162,7 +135,7 @@ func decodeCursorFull(b []byte) (storage.CursorPayload, bool) {
 	// The REST/JSON transport double-encodes cursors: pjsonMarshal serialises the
 	// EndCursor []byte field as StdB64, so clients receive StdB64(URLSafeB64(JSON)).
 	// After one decode above we hold URLSafeB64(JSON); one more URL-safe decode reaches
-	// the JSON payload. This depth is always exactly 2 — cursors are regenerated fresh
+	// the JSON payload. This depth is always exactly 2 - cursors are regenerated fresh
 	// from entity data each page, so layers never accumulate across pages.
 	if decoded2, err2 := base64.URLEncoding.DecodeString(string(decoded)); err2 == nil {
 		if jsonErr := json.Unmarshal(decoded2, &cp); jsonErr == nil && cp.P != "" {

@@ -24,7 +24,7 @@ type dbExec interface {
 }
 
 // pragmaDSN applies these pragmas to every connection via DSN query params.
-// journal_mode=WAL is omitted — it's a file-level setting, set once on wdb.
+// journal_mode=WAL is omitted - it's a file-level setting, set once on wdb.
 // wal_autocheckpoint=0 disables automatic checkpointing; a background goroutine
 // checkpoints every 30 s via PASSIVE mode so write transactions never block on it.
 // synchronous=OFF is safe for an emulator (developer tool; no crash-durability
@@ -32,7 +32,7 @@ type dbExec interface {
 // write-heavy workloads. See: rqlite, phiresky sqlite-perf, ericdraken benchmarks.
 const pragmaDSN = "_synchronous=OFF" +
 	"&_busy_timeout=5000" +
-	"&_cache_size=-524288" + // 512 MB — covers more B-tree hot pages
+	"&_cache_size=-524288" + // 512 MB - covers more B-tree hot pages
 	"&_foreign_keys=on" +
 	"&_stmt_cache_size=100" // per-connection prepared-statement LRU cache
 // _wal_autocheckpoint and mmap_size are applied via explicit PRAGMA after open;
@@ -237,10 +237,10 @@ CREATE INDEX IF NOT EXISTS idx_changes_doc ON document_changes
 
 // Store is the disk-backed document store.
 type Store struct {
-	wdb *sql.DB // single write connection — serialises all mutations
-	rdb *sql.DB // read connection pool — concurrent readers, never blocks writers (WAL)
+	wdb *sql.DB // single write connection - serialises all mutations
+	rdb *sql.DB // read connection pool - concurrent readers, never blocks writers (WAL)
 
-	// pub/sub for real-time Listen delivery — sharded by (project, database, parent, collection)
+	// pub/sub for real-time Listen delivery - sharded by (project, database, parent, collection)
 	subMu      sync.RWMutex
 	subEntries map[uint64]*subEntry
 	byScope    map[subScopeKey]map[uint64]chan ChangeEvent

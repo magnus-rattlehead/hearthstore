@@ -2,9 +2,10 @@ package server
 
 import (
 	"bytes"
+	"cmp"
 	"math"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -34,14 +35,6 @@ func parseVirtualDocID(id string) (int64, bool) {
 		return 0, false
 	}
 	return n, true
-}
-
-// docIDFromPath returns the final path segment (document ID) from a full or relative path.
-func docIDFromPath(path string) string {
-	if i := strings.LastIndexByte(path, '/'); i >= 0 {
-		return path[i+1:]
-	}
-	return path
 }
 
 // compareDocNames compares two Firestore document resource names using full
@@ -697,43 +690,17 @@ func compareValues(a, b *firestorepb.Value) int {
 	case *firestorepb.Value_TimestampValue:
 		at := av.TimestampValue.AsTime()
 		bt := b.GetTimestampValue().AsTime()
-		if at.Before(bt) {
-			return -1
-		}
-		if at.After(bt) {
-			return 1
-		}
-		return 0
+		return at.Compare(bt)
 	case *firestorepb.Value_GeoPointValue:
 		ag, bg := av.GeoPointValue, b.GetGeoPointValue()
-		if ag.GetLatitude() < bg.GetLatitude() {
-			return -1
-		}
-		if ag.GetLatitude() > bg.GetLatitude() {
-			return 1
-		}
-		if ag.GetLongitude() < bg.GetLongitude() {
-			return -1
-		}
-		if ag.GetLongitude() > bg.GetLongitude() {
-			return 1
-		}
-		return 0
+		return cmp.Or(
+			cmp.Compare(ag.GetLatitude(), bg.GetLatitude()),
+			cmp.Compare(ag.GetLongitude(), bg.GetLongitude()),
+		)
 	case *firestorepb.Value_ArrayValue:
 		aElems := av.ArrayValue.GetValues()
 		bElems := b.GetArrayValue().GetValues()
-		for i := 0; i < len(aElems) && i < len(bElems); i++ {
-			if c := compareValues(aElems[i], bElems[i]); c != 0 {
-				return c
-			}
-		}
-		if len(aElems) < len(bElems) {
-			return -1
-		}
-		if len(aElems) > len(bElems) {
-			return 1
-		}
-		return 0
+		return slices.CompareFunc(aElems, bElems, compareValues)
 	case *firestorepb.Value_MapValue:
 		// Vectors compare by dimension (length) first, then element-by-element.
 		if isVector(a) {
@@ -745,12 +712,7 @@ func compareValues(a, b *firestorepb.Value) int {
 			if len(aElems) > len(bElems) {
 				return 1
 			}
-			for i := range aElems {
-				if c := compareValues(aElems[i], bElems[i]); c != 0 {
-					return c
-				}
-			}
-			return 0
+			return slices.CompareFunc(aElems, bElems, compareValues)
 		}
 		// Plain map: compare key-by-key in sorted order.
 		aFields := av.MapValue.GetFields()
@@ -784,7 +746,7 @@ func sortedMapKeys(m map[string]*firestorepb.Value) []string {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	return keys
 }
 
@@ -884,28 +846,23 @@ func filterInequalityField(f *firestorepb.StructuredQuery_Filter) string {
 // applying Firestore's cross-type value ordering via compareValues.
 // For __name__ ordering, virtual IDs (__id<N>__) sort before all regular IDs, by numeric value.
 func sortDocsByOrderBy(docs []*firestorepb.Document, orders []*firestorepb.StructuredQuery_Order) {
-	sort.SliceStable(docs, func(i, j int) bool {
+	slices.SortStableFunc(docs, func(a, b *firestorepb.Document) int {
 		for _, order := range orders {
 			fp := order.Field.GetFieldPath()
-			var cmp int
+			var c int
 			if fp == "__name__" {
-				cmp = compareDocNames(docs[i].Name, docs[j].Name)
+				c = compareDocNames(a.Name, b.Name)
 			} else {
-				vi := getField(docs[i], fp)
-				vj := getField(docs[j], fp)
-				cmp = compareValues(vi, vj)
+				c = compareValues(getField(a, fp), getField(b, fp))
 			}
 			if order.Direction == firestorepb.StructuredQuery_DESCENDING {
-				cmp = -cmp
+				c = -c
 			}
-			if cmp < 0 {
-				return true
-			}
-			if cmp > 0 {
-				return false
+			if c != 0 {
+				return c
 			}
 		}
-		return false
+		return 0
 	})
 }
 

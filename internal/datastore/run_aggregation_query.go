@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
-	"sort"
+	"slices"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -39,7 +39,7 @@ func (g *GRPCServer) RunAggregationQuery(ctx context.Context, req *datastorepb.R
 	}
 	q := sq.NestedQuery
 
-	// Handle ExplainOptions: analyze=false (or unset) → plan only, no execution.
+	// Handle ExplainOptions: analyze=false (or unset) -> plan only, no execution.
 	explainOpts := req.GetExplainOptions()
 	if explainOpts != nil && !explainOpts.Analyze {
 		plan := buildAggregationQueryPlan(ag, q)
@@ -133,10 +133,8 @@ func (g *GRPCServer) RunAggregationQuery(ctx context.Context, req *datastorepb.R
 	// behavior where limit picks the entities with the lowest field values.
 	if q.Limit != nil && len(q.Order) == 0 {
 		if prop := aggSortField(ag.Aggregations); prop != "" {
-			sort.SliceStable(rows, func(i, j int) bool {
-				vi := getProp(rows[i].Entity, prop)
-				vj := getProp(rows[j].Entity, prop)
-				return compareValues(vi, vj) < 0
+			slices.SortStableFunc(rows, func(a, b *storage.DsEntityRow) int {
+				return compareValues(getProp(a.Entity, prop), getProp(b.Entity, prop))
 			})
 		}
 	}
@@ -249,7 +247,7 @@ func aggSortField(aggs []*datastorepb.AggregationQuery_Aggregation) string {
 		case *datastorepb.AggregationQuery_Aggregation_Avg_:
 			prop = op.Avg.GetProperty().GetName()
 		default:
-			// count or unknown — no field to sort by
+			// count or unknown - no field to sort by
 			return ""
 		}
 		if prop == "" {

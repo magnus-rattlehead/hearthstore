@@ -131,7 +131,7 @@ func fsIntVal(i int64) *firestorepb.Value {
 	return &firestorepb.Value{ValueType: &firestorepb.Value_IntegerValue{IntegerValue: i}}
 }
 
-// ── basic CRUD ─────────────────────────────────────────────────────────────
+// -- basic CRUD -------------------------------------------------------------
 
 func TestFSREST_SetAndGet(t *testing.T) {
 	s := newFSRESTServer(t)

@@ -667,7 +667,7 @@ func TestRunQuery(t *testing.T) {
 		{
 			name: "cursor_order_multi",
 			run: func(t *testing.T, s *Server, kind string) {
-				// 10 "a" entities + 10 "b" entities, each with scores 1–10
+				// 10 "a" entities + 10 "b" entities, each with scores 1-10
 				var rows []seedRow
 				for i := 1; i <= 10; i++ {
 					rows = append(rows, seedRow{
@@ -681,7 +681,7 @@ func TestRunQuery(t *testing.T) {
 				}
 				seedKind(t, s, kind, rows)
 
-				// ORDER BY cat ASC, score DESC → a/10, a/9, ..., a/1, b/10, ..., b/1
+				// ORDER BY cat ASC, score DESC -> a/10, a/9, ..., a/1, b/10, ..., b/1
 				order := []*datastorepb.PropertyOrder{
 					{Property: &datastorepb.PropertyReference{Name: "cat"}, Direction: datastorepb.PropertyOrder_ASCENDING},
 					{Property: &datastorepb.PropertyReference{Name: "score"}, Direction: datastorepb.PropertyOrder_DESCENDING},

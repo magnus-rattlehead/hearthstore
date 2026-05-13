@@ -55,7 +55,7 @@ type session struct {
 	recvCh      chan *firestorepb.ListenRequest // non-nil for Listen sessions
 	writeRecvCh chan *firestorepb.WriteRequest  // non-nil for Write sessions
 
-	// Response buffer — guarded by mu.
+	// Response buffer - guarded by mu.
 	// seqNo/chunks grow atomically so data and noop heartbeats never interleave.
 	// notify is closed on each append to wake GET pollers without busy-waiting.
 	// recvOfs deduplicates the SDK's retransmit-before-ACK: messages with
@@ -224,7 +224,7 @@ func (h *Handler) handleInitialPOST(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 
 	writeHandshake(w, f, sid)
-	// Handler returns here — initial POST response is complete (handshake only).
+	// Handler returns here - initial POST response is complete (handshake only).
 
 	// Seed the initial request if the initial POST included one (req0___data__
 	// present). Advance recvOfs past message 0 so any retransmit is discarded.
@@ -333,7 +333,7 @@ func (h *Handler) handleWriteInitialPOST(w http.ResponseWriter, r *http.Request)
 			// Deliver the error as a WebChannel message chunk so the SDK
 			// receives the gRPC status (e.g. NOT_FOUND) instead of seeing a
 			// silent stream close. Without this, the SDK logs a transport error
-			// and retries blindly — preventing "to top" row creation from working
+			// and retries blindly - preventing "to top" row creation from working
 			// when the collection is empty (exists:true precondition on missing doc).
 			st, _ := status.FromError(err)
 			statusStr := grpcCodeToRESTStatus(st.Code())
@@ -438,7 +438,7 @@ func (h *Handler) handleGETPoll(w http.ResponseWriter, r *http.Request) {
 
 		select {
 		case <-notify:
-			// New chunk arrived — reset the heartbeat timer and loop to deliver.
+			// New chunk arrived - reset the heartbeat timer and loop to deliver.
 			if !hb.Stop() {
 				select {
 				case <-hb.C:
@@ -456,7 +456,7 @@ func (h *Handler) handleGETPoll(w http.ResponseWriter, r *http.Request) {
 		case <-sess.ctx.Done():
 			return
 		case <-hb.C:
-			// Idle too long — for Listen sessions, append a noop so the
+			// Idle too long - for Listen sessions, append a noop so the
 			// response is non-empty and the browser's long-poll does not time
 			// out. Write sessions must NOT receive noops: the Write stream's
 			// onMessage handler asserts every message has non-empty proto data
@@ -464,7 +464,7 @@ func (h *Handler) handleGETPoll(w http.ResponseWriter, r *http.Request) {
 			// reaches that assertion and triggers "Unexpected state".
 			//
 			// Also refresh lastPollAt so the GC does not sweep a session whose
-			// streaming GET is open but quiescent (no writes → no notify wakes).
+			// streaming GET is open but quiescent (no writes -> no notify wakes).
 			sess.mu.Lock()
 			sess.lastPollAt = time.Now()
 			sess.mu.Unlock()
@@ -565,7 +565,7 @@ func (h *Handler) handleSubsequentPOST(w http.ResponseWriter, r *http.Request, i
 	}
 
 	// Return a framed WebChannel backchannel ACK: "<len>\n[1, lastSeqNo, 7]"
-	// The SDK's uc() parser requires the "<len>\n" framing prefix — without it,
+	// The SDK's uc() parser requires the "<len>\n" framing prefix - without it,
 	// it returns fc (incomplete) and retransmits the messages indefinitely.
 	// e[0]=1 ("has outstanding data") keeps the existing back-channel GET alive;
 	// e[0]=0 would call zc() to cancel the GET whenever it is >3s old.
@@ -582,7 +582,7 @@ func (h *Handler) handleSubsequentPOST(w http.ResponseWriter, r *http.Request, i
 
 
 
-// listenStream bridges the session buffer ↔ firestorepb.Firestore_ListenServer.
+// listenStream bridges the session buffer <-> firestorepb.Firestore_ListenServer.
 // Send appends each response as a WebChannel chunk to the session buffer.
 // Recv blocks on the session's receive channel fed by handleSubsequentPOST.
 type listenStream struct {
@@ -692,7 +692,7 @@ func (s *writeStream) RecvMsg(m any) error {
 // The magic numbers match the real Firebase emulator:
 //   - 8     = VER (client version hint)
 //   - 12    = SVER (server version)
-//   - 30000 = backChannelRequestTimeoutMs base (SDK multiplies by 1.5 → 45s GET timeout)
+//   - 30000 = backChannelRequestTimeoutMs base (SDK multiplies by 1.5 -> 45s GET timeout)
 func writeHandshake(w http.ResponseWriter, f http.Flusher, sid string) {
 	handshake, _ := json.Marshal([]any{[]any{0, []any{"c", sid, "", 8, 12, 30000}}})
 	fmt.Fprintf(w, "%d\n", len(handshake))
@@ -788,7 +788,7 @@ func setCORSHeaders(w http.ResponseWriter, r *http.Request) {
 // grpcCodeToRESTStatus converts a gRPC status code to the Firestore REST API
 // error status format (UPPER_SNAKE_CASE). The Firebase JS SDK parses the status
 // field by lowercasing and replacing underscores with dashes, so NOT_FOUND
-// becomes "not-found" — matching the SDK's internal error code enum.
+// becomes "not-found" - matching the SDK's internal error code enum.
 //
 // gRPC codes use CamelCase (e.g. "NotFound"); we insert underscores before
 // each uppercase letter that follows a lowercase letter, then uppercase all.

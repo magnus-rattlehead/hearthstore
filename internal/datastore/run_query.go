@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -40,7 +40,7 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 		return nil, status.Error(codes.InvalidArgument, "query is required")
 	}
 
-	// Handle ExplainOptions: analyze=false (or unset) → plan only, no execution.
+	// Handle ExplainOptions: analyze=false (or unset) -> plan only, no execution.
 	explainOpts := req.GetExplainOptions()
 	if explainOpts != nil && !explainOpts.Analyze {
 		plan := buildRunQueryPlan(q)
@@ -149,33 +149,31 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 
 	if !useSQL {
 		if len(q.Order) > 0 {
-			sort.SliceStable(rows, func(i, j int) bool {
+			slices.SortStableFunc(rows, func(a, b *storage.DsEntityRow) int {
 				for _, ord := range q.Order {
 					prop := ord.Property.GetName()
-					vi := getProp(rows[i].Entity, prop)
-					vj := getProp(rows[j].Entity, prop)
-					cmp := compareValues(vi, vj)
-					if cmp == 0 {
+					c := compareValues(getProp(a.Entity, prop), getProp(b.Entity, prop))
+					if c == 0 {
 						continue
 					}
 					if ord.Direction == datastorepb.PropertyOrder_DESCENDING {
-						return cmp > 0
+						return -c
 					}
-					return cmp < 0
+					return c
 				}
-				return false
+				return 0
 			})
 		} else if hasKeyFilter(q.Filter) {
 			// When filtering by __key__ (IN, NOT_IN, EQUAL), results are returned in full-path key order
 			// (parent before child), consistent with Datastore's multi-key lookup semantics.
-			sort.SliceStable(rows, func(i, j int) bool {
-				return rows[i].Path < rows[j].Path
+			slices.SortStableFunc(rows, func(a, b *storage.DsEntityRow) int {
+				return strings.Compare(a.Path, b.Path)
 			})
 		} else {
 			// Default sort for kind queries: ascending by entity name (last path segment),
 			// matching Datastore's kind-index ordering where entities sort by own key name.
-			sort.SliceStable(rows, func(i, j int) bool {
-				return entityName(rows[i].Path) < entityName(rows[j].Path)
+			slices.SortStableFunc(rows, func(a, b *storage.DsEntityRow) int {
+				return strings.Compare(entityName(a.Path), entityName(b.Path))
 			})
 		}
 
@@ -643,7 +641,7 @@ func hasKeyFilter(f *datastorepb.Filter) bool {
 const dsTimeLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
 // dsInSubquery builds the preamble for a field-index IN-subquery filter.
-// Drives from idx_ds_field (project, database, namespace, kind, field_path, …)
+// Drives from idx_ds_field (project, database, namespace, kind, field_path, ...)
 // instead of the old correlated EXISTS approach, which lets idx_ds_doc_join be dropped.
 // prefix ends just before the closing ')'; callers append the value condition and ')'.
 func dsInSubquery(project, database, namespace, kind string) (prefix string, baseArgs []any) {
@@ -897,7 +895,7 @@ func buildDsInNotInClause(project, database, namespace, kind, prop string, filte
 		if col == "" {
 			col = c
 		} else if col != c {
-			return "", nil, true // mixed types → Go fallback
+			return "", nil, true // mixed types -> Go fallback
 		}
 		vals = append(vals, v)
 	}

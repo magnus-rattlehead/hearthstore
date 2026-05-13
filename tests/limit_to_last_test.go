@@ -9,7 +9,7 @@ import (
 	"cloud.google.com/go/firestore"
 )
 
-// TestLimitToLast_Basic seeds 5 docs with scores 1–5 and expects the last 3
+// TestLimitToLast_Basic seeds 5 docs with scores 1-5 and expects the last 3
 // (scores 3, 4, 5) in ascending order.
 func TestLimitToLast_Basic(t *testing.T) {
 	client := newClient(t)
@@ -61,7 +61,7 @@ func TestLimitToLast_WithFilter(t *testing.T) {
 	if len(docs) != 2 {
 		t.Fatalf("want 2 docs, got %d", len(docs))
 	}
-	// Active docs have scores 2,4,6,8,10 — last 2 are 8 and 10.
+	// Active docs have scores 2,4,6,8,10 - last 2 are 8 and 10.
 	want := []int64{8, 10}
 	for i, doc := range docs {
 		got := doc.Data()["score"].(int64)
@@ -99,7 +99,7 @@ func TestLimitToLast_MultiOrderBy(t *testing.T) {
 	if len(docs) != 2 {
 		t.Fatalf("want 2 docs, got %d", len(docs))
 	}
-	// Sorted: alice/1, alice/3, bob/2, bob/4, carol/1 — last 2 are bob/4, carol/1.
+	// Sorted: alice/1, alice/3, bob/2, bob/4, carol/1 - last 2 are bob/4, carol/1.
 	type pair struct{ name string; rank int64 }
 	want := []pair{{"bob", 4}, {"carol", 1}}
 	for i, doc := range docs {

@@ -62,7 +62,7 @@ func newDatastoreClient(t *testing.T) *datastore.Client {
 	return client
 }
 
-// ── basic CRUD ─────────────────────────────────────────────────────────────
+// -- basic CRUD -------------------------------------------------------------
 
 func TestDSGRPC_PutAndGet(t *testing.T) {
 	client := newDatastoreClient(t)
@@ -157,7 +157,7 @@ func TestDSGRPC_GetMulti(t *testing.T) {
 	}
 }
 
-// ── queries ────────────────────────────────────────────────────────────────
+// -- queries ----------------------------------------------------------------
 
 func TestDSGRPC_Query_Equality(t *testing.T) {
 	client := newDatastoreClient(t)
@@ -201,7 +201,7 @@ func TestDSGRPC_Query_OrderByLimit(t *testing.T) {
 	}
 }
 
-// ── transactions ───────────────────────────────────────────────────────────
+// -- transactions -----------------------------------------------------------
 
 func TestDSGRPC_Transaction_Commit(t *testing.T) {
 	client := newDatastoreClient(t)
@@ -254,7 +254,7 @@ func TestDSGRPC_Transaction_Rollback(t *testing.T) {
 	}
 }
 
-// ── aggregation ────────────────────────────────────────────────────────────
+// -- aggregation ------------------------------------------------------------
 
 func TestDSGRPC_Count(t *testing.T) {
 	client := newDatastoreClient(t)
@@ -273,7 +273,7 @@ func TestDSGRPC_Count(t *testing.T) {
 	}
 }
 
-// ── allocated IDs ──────────────────────────────────────────────────────────
+// -- allocated IDs ----------------------------------------------------------
 
 func TestDSGRPC_AllocatedID(t *testing.T) {
 	client := newDatastoreClient(t)
@@ -289,7 +289,7 @@ func TestDSGRPC_AllocatedID(t *testing.T) {
 	}
 }
 
-// ── mixed operations ───────────────────────────────────────────────────────
+// -- mixed operations -------------------------------------------------------
 
 func TestDSGRPC_MixedOps(t *testing.T) {
 	client := newDatastoreClient(t)

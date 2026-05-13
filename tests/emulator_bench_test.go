@@ -150,7 +150,7 @@ func bulkUpsertCommit(batchSize, iter int) *datastorepb.CommitRequest {
 	}
 }
 
-// BenchmarkEmulator_CommitSingle — 1 upsert per RPC.
+// BenchmarkEmulator_CommitSingle - 1 upsert per RPC.
 func BenchmarkEmulator_CommitSingle(b *testing.B) {
 	for _, ep := range activeEndpoints(b) {
 		ep := ep
@@ -164,7 +164,7 @@ func BenchmarkEmulator_CommitSingle(b *testing.B) {
 	}
 }
 
-// BenchmarkEmulator_CommitBulk100 — 100 upserts per RPC.
+// BenchmarkEmulator_CommitBulk100 - 100 upserts per RPC.
 func BenchmarkEmulator_CommitBulk100(b *testing.B) {
 	for _, ep := range activeEndpoints(b) {
 		ep := ep
@@ -178,7 +178,7 @@ func BenchmarkEmulator_CommitBulk100(b *testing.B) {
 	}
 }
 
-// BenchmarkEmulator_Lookup100 — seeds 100 entities then fetches all in one Lookup.
+// BenchmarkEmulator_Lookup100 - seeds 100 entities then fetches all in one Lookup.
 func BenchmarkEmulator_Lookup100(b *testing.B) {
 	for _, ep := range activeEndpoints(b) {
 		ep := ep

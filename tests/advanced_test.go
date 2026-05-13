@@ -17,7 +17,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// ── cursor-based pagination ────────────────────────────────────────────────
+// -- cursor-based pagination ------------------------------------------------
 //
 // Firespotter pattern: run a query, capture the last snapshot, use it as the
 // start cursor for the next page. This exercises the cursor SQL translation
@@ -127,7 +127,7 @@ func TestAdvanced_CursorPagination_CoversFull(t *testing.T) {
 }
 
 // TestAdvanced_EndBefore_Range exercises a bounded range query using both
-// StartAt and EndBefore — the cursor range pattern from firespotter.
+// StartAt and EndBefore - the cursor range pattern from firespotter.
 func TestAdvanced_EndBefore_Range(t *testing.T) {
 	client := newClient(t)
 	ctx := context.Background()
@@ -140,7 +140,7 @@ func TestAdvanced_EndBefore_Range(t *testing.T) {
 	q := col.OrderBy("v", firestore.Asc)
 	all, _ := q.Documents(ctx).GetAll()
 
-	// Range: v in [3, 7) — StartAt snap for v=3, EndBefore snap for v=7.
+	// Range: v in [3, 7) - StartAt snap for v=3, EndBefore snap for v=7.
 	var start, end *firestore.DocumentSnapshot
 	for _, s := range all {
 		v, _ := s.DataAt("v")
@@ -168,7 +168,7 @@ func TestAdvanced_EndBefore_Range(t *testing.T) {
 	}
 }
 
-// ── batch get ─────────────────────────────────────────────────────────────
+// -- batch get -------------------------------------------------------------
 //
 // Firespotter uses batch gets ("get [key1, key2, key3]") returning results
 // in the same order with nil for missing keys.
@@ -199,7 +199,7 @@ func TestAdvanced_BatchGet(t *testing.T) {
 	if p, _ := snaps[0].DataAt("price"); p != int64(10) {
 		t.Errorf("a.price = %v, want 10", p)
 	}
-	// Second result: missing — snapshot exists but DataAt should fail or data be empty.
+	// Second result: missing - snapshot exists but DataAt should fail or data be empty.
 	if snaps[1].Exists() {
 		t.Error("missing doc should not exist")
 	}
@@ -209,7 +209,7 @@ func TestAdvanced_BatchGet(t *testing.T) {
 	}
 }
 
-// ── batch write ────────────────────────────────────────────────────────────
+// -- batch write ------------------------------------------------------------
 //
 // Firespotter's mutation batches: multiple creates, updates, and deletes in
 // one atomic commit.
@@ -257,7 +257,7 @@ func TestAdvanced_WriteBatch_MultipleOps(t *testing.T) {
 	}
 }
 
-// ── compound queries ───────────────────────────────────────────────────────
+// -- compound queries -------------------------------------------------------
 //
 // Firespotter uses multiple .where() chains (AND), which is common in
 // production service queries (e.g. filter by service_ref AND active AND date range).
@@ -340,7 +340,7 @@ func TestAdvanced_CompoundQuery_NotEqual_ExcludesMissingField(t *testing.T) {
 	}
 }
 
-// ── cross-collection transaction (XG-style) ────────────────────────────────
+// -- cross-collection transaction (XG-style) --------------------------------
 //
 // Firespotter's XG transactions span multiple entity groups / collections.
 // This is the critical scenario for payment/balance operations.
@@ -436,7 +436,7 @@ func TestAdvanced_Transaction_IncrementCounter(t *testing.T) {
 	}
 }
 
-// ── timestamp ordering ─────────────────────────────────────────────────────
+// -- timestamp ordering -----------------------------------------------------
 //
 // Firespotter stores created_at / modified_at as UTC timestamps and queries
 // by them. This exercises timestamp encoding and ordering through field_index.
@@ -505,7 +505,7 @@ func TestAdvanced_TimestampFilter_Range(t *testing.T) {
 	}
 }
 
-// ── reference fields ───────────────────────────────────────────────────────
+// -- reference fields -------------------------------------------------------
 //
 // Firespotter stores DocumentReferences (service_ref, service_acc_ref) and
 // filters by them. This exercises the value_ref column in field_index.
@@ -538,7 +538,7 @@ func TestAdvanced_ReferenceField_Filter(t *testing.T) {
 	}
 }
 
-// ── collection group (allDescendants) with filter ─────────────────────────
+// -- collection group (allDescendants) with filter -------------------------
 //
 // Firespotter queries across entity groups. In Firestore this maps to
 // collection group queries.
@@ -561,13 +561,13 @@ func TestAdvanced_CollectionGroup_WithFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collection group: %v", err)
 	}
-	// 3 posts × 1 approved comment each = 3.
+	// 3 posts * 1 approved comment each = 3.
 	if len(docs) != 3 {
 		t.Errorf("approved comments: want 3, got %d", len(docs))
 	}
 }
 
-// ── array-contains-any ─────────────────────────────────────────────────────
+// -- array-contains-any -----------------------------------------------------
 
 func TestAdvanced_ArrayContainsAny(t *testing.T) {
 	client := newClient(t)
@@ -590,7 +590,7 @@ func TestAdvanced_ArrayContainsAny(t *testing.T) {
 	}
 }
 
-// ── offset + limit pagination ──────────────────────────────────────────────
+// -- offset + limit pagination ----------------------------------------------
 //
 // Firespotter uses .offset(n).limit(m) for page-based results.
 
@@ -605,7 +605,7 @@ func TestAdvanced_OffsetPagination(t *testing.T) {
 
 	q := col.OrderBy("n", firestore.Asc)
 
-	// Page 2 of size 3: offset=3, limit=3 → n=4,5,6.
+	// Page 2 of size 3: offset=3, limit=3 -> n=4,5,6.
 	page, err := q.Offset(3).Limit(3).Documents(ctx).GetAll()
 	if err != nil {
 		t.Fatalf("offset pagination: %v", err)
@@ -621,7 +621,7 @@ func TestAdvanced_OffsetPagination(t *testing.T) {
 	}
 }
 
-// ── is_null / is_not_null on missing fields ────────────────────────────────
+// -- is_null / is_not_null on missing fields --------------------------------
 //
 // Firespotter tests null fields. IS_NOT_NULL must exclude docs where the
 // field is entirely absent (not stored), not just docs where it is null.
@@ -645,7 +645,7 @@ func TestAdvanced_IsNull_OnlyMatchesExplicitNull(t *testing.T) {
 	}
 }
 
-// ── DocumentIterator / streaming ──────────────────────────────────────────
+// -- DocumentIterator / streaming ------------------------------------------
 //
 // Firespotter uses .run() for streaming iteration. Test the equivalent Go
 // iterator pattern which streams results one at a time without buffering all.
@@ -682,7 +682,7 @@ func TestAdvanced_StreamingIterator(t *testing.T) {
 	}
 }
 
-// ── aggregation sum + avg with filter ─────────────────────────────────────
+// -- aggregation sum + avg with filter -------------------------------------
 //
 // Firespotter uses count(limit=n). Test sum/avg with a WHERE clause, which
 // requires the SQL aggregation streaming path to apply the filter correctly.

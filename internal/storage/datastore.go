@@ -335,7 +335,7 @@ func (s *Store) DsUpsertManyTx(tx *sql.Tx, project, database string, rows []Upse
 func dsUpsertExec(exec dbExec, project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity, baseVersion int64, acc *CommitAccumulator) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
 	now := timestamppb.Now()
 
-	// Fast path: no baseVersion conflict check needed — skip the SELECT and use
+	// Fast path: no baseVersion conflict check needed - skip the SELECT and use
 	// a single INSERT ON CONFLICT DO UPDATE with RETURNING to get the new version.
 	if baseVersion == 0 {
 		e := proto.Clone(entity).(*datastorepb.Entity)
@@ -436,7 +436,7 @@ func dsDeleteExec(exec dbExec, project, database, namespace, path string, acc *C
 		now, project, database, namespace, path,
 	).Scan(&kind, &parentPath)
 	if err == sql.ErrNoRows {
-		return nil // entity absent or already deleted — no-op
+		return nil // entity absent or already deleted - no-op
 	}
 	if err != nil {
 		return err
@@ -1237,7 +1237,7 @@ func (a *CommitAccumulator) flushChanges(exec dbExec) error {
 }
 
 // dsKeyToPath builds a storage path string from a *datastorepb.Key.
-// Path format: Kind/id[/Kind/id...] — mirrors keyComponents in the datastore package.
+// Path format: Kind/id[/Kind/id...] - mirrors keyComponents in the datastore package.
 func dsKeyToPath(key *datastorepb.Key) string {
 	if key == nil {
 		return ""
@@ -1257,7 +1257,7 @@ func dsKeyToPath(key *datastorepb.Key) string {
 }
 
 // dsCollectValue extracts indexable values from a Datastore property value recursively.
-// inArray=true means we are already inside an array — nested arrays are skipped.
+// inArray=true means we are already inside an array - nested arrays are skipped.
 func dsCollectValue(fieldPath string, v *datastorepb.Value, inArray bool, rows *[]dsFiRow) {
 	if v == nil || v.GetExcludeFromIndexes() {
 		return

@@ -6,8 +6,8 @@ package tests
 // connection. The Cloud Datastore Go SDK (v1.22+) is gRPC-only and cannot be
 // used against hearthstore's HTTP REST server without a gRPC layer; these tests
 // use net/http + protojson instead, which still covers the full HTTP transport
-// path — TCP I/O, JSON serialisation, content-type negotiation, and error
-// mapping — that the in-process unit tests (httptest.Recorder) do not.
+// path - TCP I/O, JSON serialisation, content-type negotiation, and error
+// mapping - that the in-process unit tests (httptest.Recorder) do not.
 //
 // Run with:
 //
@@ -103,7 +103,7 @@ func (s *dsTestServer) errorStatus(method string, req proto.Message) string {
 	return e.Error.Status
 }
 
-// ── helpers ────────────────────────────────────────────────────────────────
+// -- helpers ----------------------------------------------------------------
 
 func dsNameKey(kind, name string) *datastorepb.Key {
 	return &datastorepb.Key{
@@ -143,7 +143,7 @@ func upsert(s *dsTestServer, key *datastorepb.Key, props map[string]*datastorepb
 	}
 }
 
-// ── basic CRUD ─────────────────────────────────────────────────────────────
+// -- basic CRUD -------------------------------------------------------------
 
 func TestDS_UpsertAndLookup(t *testing.T) {
 	s := newDSTestServer(t)
@@ -221,7 +221,7 @@ func TestDS_Insert_Conflict(t *testing.T) {
 	}
 }
 
-// ── queries ────────────────────────────────────────────────────────────────
+// -- queries ----------------------------------------------------------------
 
 func TestDS_Query_Equality(t *testing.T) {
 	s := newDSTestServer(t)
@@ -331,7 +331,7 @@ func TestDS_Query_CursorPagination(t *testing.T) {
 	}
 }
 
-// ── aggregation ────────────────────────────────────────────────────────────
+// -- aggregation ------------------------------------------------------------
 
 func TestDS_Count(t *testing.T) {
 	s := newDSTestServer(t)
@@ -398,7 +398,7 @@ func TestDS_Sum(t *testing.T) {
 	}
 }
 
-// ── transactions ───────────────────────────────────────────────────────────
+// -- transactions -----------------------------------------------------------
 
 func TestDS_Transaction_Commit(t *testing.T) {
 	s := newDSTestServer(t)
@@ -464,7 +464,7 @@ func TestDS_Transaction_Rollback(t *testing.T) {
 	}
 }
 
-// ── auto-allocated IDs ─────────────────────────────────────────────────────
+// -- auto-allocated IDs -----------------------------------------------------
 
 func TestDS_AllocateIds(t *testing.T) {
 	s := newDSTestServer(t)
@@ -508,7 +508,7 @@ func TestDS_AllocateIds_ThenInsert(t *testing.T) {
 	}
 }
 
-// ── mixed operations ───────────────────────────────────────────────────────
+// -- mixed operations -------------------------------------------------------
 
 func TestDS_MixedOps(t *testing.T) {
 	s := newDSTestServer(t)
@@ -531,7 +531,7 @@ func TestDS_MixedOps(t *testing.T) {
 		Mutations: []*datastorepb.Mutation{{Operation: &datastorepb.Mutation_Delete{Delete: keyB}}},
 	}, &datastorepb.CommitResponse{})
 
-	// Query score >= 20 → alice (50) and carol (30), ordered ascending.
+	// Query score >= 20 -> alice (50) and carol (30), ordered ascending.
 	var resp datastorepb.RunQueryResponse
 	if code := s.post("runQuery", &datastorepb.RunQueryRequest{
 		ProjectId: testProject,
@@ -563,7 +563,7 @@ func TestDS_MixedOps(t *testing.T) {
 	}
 }
 
-// ── snapshot read ─────────────────────────────────────────────────────────
+// -- snapshot read ---------------------------------------------------------
 
 func TestDS_SnapshotRead(t *testing.T) {
 	s := newDSTestServer(t)
@@ -577,7 +577,7 @@ func TestDS_SnapshotRead(t *testing.T) {
 	// Write a second entity after the snapshot.
 	upsert(s, dsNameKey("Event", "e2"), map[string]*datastorepb.Value{"v": dsIntVal(2)})
 
-	// Query at snapshot time — should only see e1.
+	// Query at snapshot time - should only see e1.
 	var resp datastorepb.RunQueryResponse
 	if code := s.post("runQuery", &datastorepb.RunQueryRequest{
 		ProjectId: testProject,
@@ -597,7 +597,7 @@ func TestDS_SnapshotRead(t *testing.T) {
 	}
 }
 
-// ── OCC concurrent transaction ────────────────────────────────────────────
+// -- OCC concurrent transaction --------------------------------------------
 
 func TestDS_OCC_ConcurrentTransaction(t *testing.T) {
 	s := newDSTestServer(t)
@@ -626,7 +626,7 @@ func TestDS_OCC_ConcurrentTransaction(t *testing.T) {
 	lookupInTx(begin1.Transaction)
 	lookupInTx(begin2.Transaction)
 
-	// tx2 commits first — succeeds.
+	// tx2 commits first - succeeds.
 	if code := s.post("commit", &datastorepb.CommitRequest{
 		ProjectId:           testProject,
 		Mode:                datastorepb.CommitRequest_TRANSACTIONAL,
@@ -640,7 +640,7 @@ func TestDS_OCC_ConcurrentTransaction(t *testing.T) {
 		t.Fatalf("tx2 commit: HTTP %d (should succeed)", code)
 	}
 
-	// tx1 commits — must fail with 409 (Aborted/OCC conflict).
+	// tx1 commits - must fail with 409 (Aborted/OCC conflict).
 	code := s.post("commit", &datastorepb.CommitRequest{
 		ProjectId:           testProject,
 		Mode:                datastorepb.CommitRequest_TRANSACTIONAL,

@@ -368,7 +368,7 @@ func TestCommit(t *testing.T) {
 				lookupInTx(tx1.Transaction)
 				lookupInTx(tx2.Transaction)
 
-				// tx2 commits first — succeeds.
+				// tx2 commits first - succeeds.
 				mustPost(t, s, "commit", &datastorepb.CommitRequest{
 					ProjectId:           testProject,
 					TransactionSelector: &datastorepb.CommitRequest_Transaction{Transaction: tx2.Transaction},
@@ -377,7 +377,7 @@ func TestCommit(t *testing.T) {
 					},
 				}, nil)
 
-				// tx1 commits after tx2 — entity version changed; must be rejected.
+				// tx1 commits after tx2 - entity version changed; must be rejected.
 				r := doPost(t, s, projectURL("commit"), &datastorepb.CommitRequest{
 					ProjectId:           testProject,
 					TransactionSelector: &datastorepb.CommitRequest_Transaction{Transaction: tx1.Transaction},
@@ -391,7 +391,7 @@ func TestCommit(t *testing.T) {
 			},
 		},
 		{
-			// Two goroutines read different entities — no OCC conflict expected.
+			// Two goroutines read different entities - no OCC conflict expected.
 			name: "occ_no_conflict",
 			run: func(t *testing.T, s *Server) {
 				k1 := dsKey("K_occ_no_conflict", "e1")

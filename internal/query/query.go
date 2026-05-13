@@ -25,7 +25,7 @@ type Result struct {
 // SELECT against the documents + field_index tables.
 //
 // allDescendants controls whether the query is a collection-group query
-// (true → omit parent_path constraint, match all subcollections with the same ID).
+// (true -> omit parent_path constraint, match all subcollections with the same ID).
 //
 // The generated SQL selects d.data as its first (and only) column.
 func Build(project, database, parentPath string, allDescendants bool, q *firestorepb.StructuredQuery) (*Result, error) {
@@ -415,9 +415,9 @@ func ParseProtoFieldPath(s string) string { return parseProtoFieldPath(s) }
 //
 // Examples:
 //
-//	"metadata.createdAt"  →  "metadata.createdAt"  (unchanged, simple path)
-//	"`field.dot`"         →  "field.dot"            (literal-dot field name)
-//	"`field\\slash`"      →  "field\slash"          (escaped backslash)
+//	"metadata.createdAt"  ->  "metadata.createdAt"  (unchanged, simple path)
+//	"`field.dot`"         ->  "field.dot"            (literal-dot field name)
+//	"`field\\slash`"      ->  "field\slash"          (escaped backslash)
 func parseProtoFieldPath(s string) string {
 	if !strings.ContainsAny(s, "`") {
 		return s // fast path: no backticks, return as-is
@@ -431,7 +431,7 @@ func parseProtoFieldPath(s string) string {
 			var seg strings.Builder
 			for i < len(s) {
 				if s[i] == '\\' && i+1 < len(s) {
-					seg.WriteByte(s[i+1]) // unescape: \\ → \, \` → `
+					seg.WriteByte(s[i+1]) // unescape: \\ -> \, \` -> `
 					i += 2
 				} else if s[i] == '`' {
 					i++ // skip closing backtick
@@ -494,7 +494,7 @@ func collectInequalityFields(f *firestorepb.StructuredQuery_Filter) []string {
 	for fp := range seen {
 		fields = append(fields, fp)
 	}
-	// Lexicographic sort — matches SDK's getInequalityFilterFields sort order.
+	// Lexicographic sort - matches SDK's getInequalityFilterFields sort order.
 	for i := 1; i < len(fields); i++ {
 		for j := i; j > 0 && fields[j] < fields[j-1]; j-- {
 			fields[j], fields[j-1] = fields[j-1], fields[j]
@@ -684,7 +684,7 @@ func buildFieldFilter(f *firestorepb.StructuredQuery_FieldFilter) (string, []any
 		return buildInFilter(fp, v, true, false)
 	}
 
-	return "", nil, true // unknown op — Go fallback
+	return "", nil, true // unknown op - Go fallback
 }
 
 // buildDocIDFilter builds a SQL clause for __name__ (document ID) field filters,
@@ -799,9 +799,9 @@ func buildInFilter(fieldPath string, v *firestorepb.Value, notIn bool, matchArra
 	av := v.GetArrayValue()
 	if av == nil || len(av.Values) == 0 {
 		if notIn {
-			return "1=1", nil, false // NOT IN empty → all match
+			return "1=1", nil, false // NOT IN empty -> all match
 		}
-		return "1=0", nil, false // IN empty → none match
+		return "1=0", nil, false // IN empty -> none match
 	}
 
 	// NOT IN [null, ...] always returns 0 results per Firestore spec.
@@ -961,7 +961,7 @@ func flipDesc(op string, desc bool) string {
 }
 
 // buildCursor generates a WHERE clause for a StartAt or EndAt cursor.
-// isStart=true → StartAt, isStart=false → EndAt.
+// isStart=true -> StartAt, isStart=false -> EndAt.
 func (b *builder) buildCursor(cursor *firestorepb.Cursor, orders []*firestorepb.StructuredQuery_Order, isStart bool) (string, []any) {
 	if len(cursor.Values) == 0 || len(orders) == 0 {
 		return "", nil
@@ -984,10 +984,10 @@ func (b *builder) singleFieldCursor(cursor *firestorepb.Cursor, o *firestorepb.S
 	desc := o.Direction == firestorepb.StructuredQuery_DESCENDING
 
 	// Map to SQL operator.
-	//   StartAt + Before=true (inclusive) + ASC → >=
-	//   StartAt + Before=false (exclusive) + ASC → >
-	//   EndAt   + Before=false (inclusive) + ASC → <=
-	//   EndAt   + Before=true  (exclusive) + ASC → <
+	//   StartAt + Before=true (inclusive) + ASC -> >=
+	//   StartAt + Before=false (exclusive) + ASC -> >
+	//   EndAt   + Before=false (inclusive) + ASC -> <=
+	//   EndAt   + Before=true  (exclusive) + ASC -> <
 	// DESCENDING flips the direction.
 	op := cursorOp(isStart, cursor.Before, false, desc)
 
@@ -1152,7 +1152,7 @@ func (b *builder) assemble(collectionID string, q *firestorepb.StructuredQuery) 
 		sb.WriteString(strings.Join(b.orderExprs, ", "))
 	}
 
-	// LIMIT / OFFSET — SQLite requires LIMIT before OFFSET.
+	// LIMIT / OFFSET - SQLite requires LIMIT before OFFSET.
 	hasLimit := q.Limit != nil && q.Limit.Value > 0
 	hasOffset := q.Offset > 0
 	if hasLimit {
@@ -1336,7 +1336,7 @@ type NumericAggResult struct {
 	// TotalSum is COALESCE(SUM(CAST(COALESCE(value_int, value_double) AS REAL)), 0).
 	TotalSum float64
 	// NumericCount is the number of documents with a numeric (int or double) value
-	// for the field. Zero means no documents matched — AVG should return null.
+	// for the field. Zero means no documents matched - AVG should return null.
 	NumericCount int64
 	// DoubleCount is the number of those documents that had a double (non-integer)
 	// value. Zero means all numeric values were integers; the SUM result is exact
@@ -1350,7 +1350,7 @@ type NumericAggResult struct {
 
 // BuildNumericAgg generates a query that returns (totalSum, numericCount, doubleCount, nanCount)
 // for fieldPath across documents matching q. Only scalar (non-array) numeric field values are
-// included — in_array=0 excludes array-element rows. ORDER BY, cursor (StartAt/EndAt), LIMIT,
+// included - in_array=0 excludes array-element rows. ORDER BY, cursor (StartAt/EndAt), LIMIT,
 // and OFFSET from q are all applied to the document filter so that cursor-based aggregations
 // like col.orderBy('n').startAfter(5).aggregate({sum:'n'}) work correctly.
 //
@@ -1374,7 +1374,7 @@ func BuildNumericAgg(project, database, parentPath string, allDescendants bool, 
 		return nil, fmt.Errorf("StructuredQuery.from[0].collection_id is empty")
 	}
 
-	// Build ORDER BY JOINs first — needed so cursor clauses can reference fi_N aliases.
+	// Build ORDER BY JOINs first - needed so cursor clauses can reference fi_N aliases.
 	b.buildOrderBy(q.OrderBy)
 
 	// Implicit field-exists filter: orderBy(field) excludes docs without that field.

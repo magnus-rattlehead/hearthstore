@@ -3,7 +3,7 @@ notes/
 
 # Compiled binaries
 hearthstore
-server
+/server
 cmd/server/server
 
 # SQLite database files

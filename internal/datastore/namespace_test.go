@@ -42,7 +42,7 @@ func TestNamespace_QueryIsolation(t *testing.T) {
 		map[string]*datastorepb.Value{"color": dsStr("red")},
 	))
 
-	// Query Widgets in "ns-b" — must return zero results.
+	// Query Widgets in "ns-b" - must return zero results.
 	respB := runQueryNs(t, s, "ns-b", &datastorepb.Query{
 		Kind: []*datastorepb.KindExpression{{Name: "Widget"}},
 	})
@@ -50,7 +50,7 @@ func TestNamespace_QueryIsolation(t *testing.T) {
 		t.Errorf("ns-b query: want 0 results, got %d", n)
 	}
 
-	// Query Widgets in default namespace ("") — must return zero results.
+	// Query Widgets in default namespace ("") - must return zero results.
 	respDefault := runQueryNs(t, s, "", &datastorepb.Query{
 		Kind: []*datastorepb.KindExpression{{Name: "Widget"}},
 	})
@@ -58,7 +58,7 @@ func TestNamespace_QueryIsolation(t *testing.T) {
 		t.Errorf("default ns query: want 0 results, got %d", n)
 	}
 
-	// Query Widgets in "ns-a" — must return the one entity.
+	// Query Widgets in "ns-a" - must return the one entity.
 	respA := runQueryNs(t, s, "ns-a", &datastorepb.Query{
 		Kind: []*datastorepb.KindExpression{{Name: "Widget"}},
 	})
@@ -77,7 +77,7 @@ func TestNamespace_LookupIsolation(t *testing.T) {
 		map[string]*datastorepb.Value{"x": dsInt(1)},
 	))
 
-	// Lookup with "ns-b" key — should be in Missing.
+	// Lookup with "ns-b" key - should be in Missing.
 	var lr datastorepb.LookupResponse
 	mustPost(t, s, "lookup", &datastorepb.LookupRequest{
 		ProjectId: testProject,
@@ -90,7 +90,7 @@ func TestNamespace_LookupIsolation(t *testing.T) {
 		t.Errorf("ns-b lookup: want 1 missing, got %d", len(lr.Missing))
 	}
 
-	// Lookup with "ns-a" key — should be found.
+	// Lookup with "ns-a" key - should be found.
 	var lr2 datastorepb.LookupResponse
 	mustPost(t, s, "lookup", &datastorepb.LookupRequest{
 		ProjectId: testProject,
@@ -138,7 +138,7 @@ func TestNamespace_SameKindMultipleNamespaces(t *testing.T) {
 }
 
 // TestNamespace_FilterIsolation verifies that filter pushdown (ds_field_index)
-// respects namespace boundaries — an equality filter in "ns-b" must not match
+// respects namespace boundaries - an equality filter in "ns-b" must not match
 // entities indexed under "ns-a".
 func TestNamespace_FilterIsolation(t *testing.T) {
 	s := newTestDsServer(t)
@@ -151,7 +151,7 @@ func TestNamespace_FilterIsolation(t *testing.T) {
 		))
 	}
 
-	// Query with equality filter in ns-b — must return 0.
+	// Query with equality filter in ns-b - must return 0.
 	resp := runQueryNs(t, s, "ns-b", &datastorepb.Query{
 		Kind: []*datastorepb.KindExpression{{Name: "Widget"}},
 		Filter: &datastorepb.Filter{
@@ -168,7 +168,7 @@ func TestNamespace_FilterIsolation(t *testing.T) {
 		t.Errorf("ns-b filter query: want 0, got %d", n)
 	}
 
-	// Same filter in ns-a — must return 2.
+	// Same filter in ns-a - must return 2.
 	resp2 := runQueryNs(t, s, "ns-a", &datastorepb.Query{
 		Kind: []*datastorepb.KindExpression{{Name: "Widget"}},
 		Filter: &datastorepb.Filter{

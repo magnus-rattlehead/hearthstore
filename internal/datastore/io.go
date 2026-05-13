@@ -42,24 +42,21 @@ func writeProtoJSON(w http.ResponseWriter, msg proto.Message) {
 	_, _ = w.Write(out)
 }
 
+var grpcHTTPStatus = map[codes.Code]int{
+	codes.NotFound:           http.StatusNotFound,
+	codes.AlreadyExists:      http.StatusConflict,
+	codes.Aborted:            http.StatusConflict,
+	codes.InvalidArgument:    http.StatusBadRequest,
+	codes.FailedPrecondition: http.StatusPreconditionFailed,
+	codes.Unimplemented:      http.StatusNotImplemented,
+}
+
 // grpcToHTTP converts a gRPC status error to an HTTP status code.
 func grpcToHTTP(err error) int {
-	switch status.Code(err) {
-	case codes.NotFound:
-		return http.StatusNotFound
-	case codes.AlreadyExists:
-		return http.StatusConflict
-	case codes.Aborted:
-		return http.StatusConflict
-	case codes.InvalidArgument:
-		return http.StatusBadRequest
-	case codes.FailedPrecondition:
-		return http.StatusPreconditionFailed
-	case codes.Unimplemented:
-		return http.StatusNotImplemented
-	default:
-		return http.StatusInternalServerError
+	if code, ok := grpcHTTPStatus[status.Code(err)]; ok {
+		return code
 	}
+	return http.StatusInternalServerError
 }
 
 // writeGrpcErr converts a gRPC error to an HTTP error response.

@@ -59,8 +59,8 @@ func readChunk(br *bufio.Reader) ([]byte, error) {
 	return buf, nil
 }
 
-// parseChunkResponses decodes a data chunk ([[seqNo, [protoJSON…]], …]) into
-// ListenResponses. The handshake chunk ([[0, ["c", SID, …]]]) is silently skipped.
+// parseChunkResponses decodes a data chunk ([[seqNo, [protoJSON...]], ...]) into
+// ListenResponses. The handshake chunk ([[0, ["c", SID, ...]]]) is silently skipped.
 func parseChunkResponses(chunk []byte) ([]*firestorepb.ListenResponse, error) {
 	var outer []json.RawMessage
 	if err := json.Unmarshal(chunk, &outer); err != nil {
@@ -219,14 +219,14 @@ func collectResponses(t *testing.T, ctx context.Context, ts *httptest.Server, si
 			// than being reset to the per-call response count.
 			*aid++
 			if len(responses) >= n {
-				// Collected enough — close the body to unblock the streaming
+				// Collected enough - close the body to unblock the streaming
 				// server-side handler (r.Context().Done() fires on close).
 				break
 			}
 		}
 		resp.Body.Close()
 		if len(responses) == before {
-			// No progress — session ended with no data.
+			// No progress - session ended with no data.
 			break
 		}
 	}
@@ -323,7 +323,7 @@ func buildSubcollectionTargetReq(db, parentDocPath, subcollection string, target
 	}
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+// -- Tests ---------------------------------------------------------------------
 
 func TestWebChannel_Handshake(t *testing.T) {
 	h, _ := newTestHandler(t)
@@ -372,7 +372,7 @@ func TestWebChannel_AddTarget_TargetChangeADD(t *testing.T) {
 	body := buildAddTargetBody(wcTestDBPath, "things", 1)
 	sid := openSession(t, ts, body)
 
-	// GET poll — empty collection: ADD + CURRENT + NO_CHANGE = 3 responses.
+	// GET poll - empty collection: ADD + CURRENT + NO_CHANGE = 3 responses.
 	aid := 0
 	responses := collectResponses(t, ctx, ts, sid, &aid, 3)
 
@@ -476,7 +476,7 @@ func TestWebChannel_SubsequentPOST_RemoveTarget(t *testing.T) {
 		t.Fatalf("subsequent POST status = %d", postResp.StatusCode)
 	}
 
-	// GET poll — the REMOVE TargetChange should arrive.
+	// GET poll - the REMOVE TargetChange should arrive.
 	moreResponses := collectResponses(t, ctx, ts, sid, &aid, 1)
 	if !hasTargetChange(moreResponses, firestorepb.TargetChange_REMOVE) {
 		t.Error("want TargetChange_REMOVE after RemoveTarget")
@@ -486,12 +486,12 @@ func TestWebChannel_SubsequentPOST_RemoveTarget(t *testing.T) {
 // TestWebChannel_InAppNavigation simulates the Firebase JS SDK flow when a user
 // navigates from a list page to a detail page within the app:
 //
-//  1. Initial POST: AddTarget(query, restaurants collection) → session created
+//  1. Initial POST: AddTarget(query, restaurants collection) -> session created
 //  2. GET poll: consume initial snapshot (restaurant + ADD/CURRENT/NO_CHANGE)
-//  3. Subsequent POST: RemoveTarget(restaurants) — list page teardown
-//  4. Subsequent POST: AddTarget(docs, restaurant doc) — detail page doc subscription
+//  3. Subsequent POST: RemoveTarget(restaurants) - list page teardown
+//  4. Subsequent POST: AddTarget(docs, restaurant doc) - detail page doc subscription
 //  5. GET poll: consume restaurant document snapshot
-//  6. Subsequent POST: AddTarget(query, ratings subcollection) — review list subscription
+//  6. Subsequent POST: AddTarget(query, ratings subcollection) - review list subscription
 //  7. GET poll: verify rating DocumentChange arrives
 func TestWebChannel_InAppNavigation(t *testing.T) {
 	h, store := newTestHandler(t)
@@ -523,13 +523,13 @@ func TestWebChannel_InAppNavigation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Step 1–2: Establish session with restaurants collection query, drain initial snapshot.
+	// Step 1-2: Establish session with restaurants collection query, drain initial snapshot.
 	body := buildAddTargetBody(wcTestDBPath, "restaurants", 1)
 	sid := openSession(t, ts, body)
 	aid := 0
 	collectResponses(t, ctx, ts, sid, &aid, 4) // ADD + DocumentChange + CURRENT + NO_CHANGE
 
-	// Step 3: Simulate list page teardown — RemoveTarget for the restaurants collection.
+	// Step 3: Simulate list page teardown - RemoveTarget for the restaurants collection.
 	removeReq := &firestorepb.ListenRequest{
 		Database: wcTestDBPath,
 		TargetChange: &firestorepb.ListenRequest_RemoveTarget{RemoveTarget: 1},
@@ -537,7 +537,7 @@ func TestWebChannel_InAppNavigation(t *testing.T) {
 	doSubsequentPOST(t, ts, sid, buildSubsequentPOSTBody(removeReq, 1))
 	collectResponses(t, ctx, ts, sid, &aid, 1) // REMOVE TargetChange
 
-	// Step 4–5: Detail page adds a Target.Documents for the specific restaurant.
+	// Step 4-5: Detail page adds a Target.Documents for the specific restaurant.
 	addDocReq := &firestorepb.ListenRequest{
 		Database: wcTestDBPath,
 		TargetChange: &firestorepb.ListenRequest_AddTarget{
@@ -566,7 +566,7 @@ func TestWebChannel_InAppNavigation(t *testing.T) {
 		t.Error("want DocumentChange for restaurants/r1 after in-app navigation")
 	}
 
-	// Step 6–7: Review list component adds a subcollection query for ratings.
+	// Step 6-7: Review list component adds a subcollection query for ratings.
 	ratingsReq := buildSubcollectionTargetReq(wcTestDBPath, "restaurants/r1", "ratings", 5)
 	doSubsequentPOST(t, ts, sid, buildSubsequentPOSTBody(ratingsReq, 3))
 	ratingResponses := collectResponses(t, ctx, ts, sid, &aid, 4) // ADD + DocumentChange + CURRENT + NO_CHANGE
@@ -584,11 +584,11 @@ func TestWebChannel_InAppNavigation(t *testing.T) {
 	}
 }
 
-// ── Write stream WebChannel helpers ──────────────────────────────────────────
+// -- Write stream WebChannel helpers ------------------------------------------
 
 // parseWriteResponses decodes a Write-channel data chunk into WriteResponses.
-// The chunk format is identical to the Listen channel: [[seqNo, [protoJSON…]], …]
-// The WebChannel handshake chunk ([[0, ["c", SID, …]]]) is silently skipped.
+// The chunk format is identical to the Listen channel: [[seqNo, [protoJSON...]], ...]
+// The WebChannel handshake chunk ([[0, ["c", SID, ...]]]) is silently skipped.
 func parseWriteResponses(chunk []byte) ([]*firestorepb.WriteResponse, error) {
 	var outer []json.RawMessage
 	if err := json.Unmarshal(chunk, &outer); err != nil {
@@ -700,7 +700,7 @@ func openWriteSession(t *testing.T, ts *httptest.Server) (sid string, lastSeqNo 
 			}
 		}
 		if lastSeqNo > 0 {
-			// Got the handshake WriteResponse — close the body to signal the
+			// Got the handshake WriteResponse - close the body to signal the
 			// server that this GET poll is done. The Write session stays alive.
 			break
 		}
@@ -784,7 +784,7 @@ func drainWriteChunks(t *testing.T, ctx context.Context, ts *httptest.Server, si
 				}
 			}
 		}
-		// Got at least one WriteResponse — close the body so the server's
+		// Got at least one WriteResponse - close the body so the server's
 		// streaming GET handler exits via r.Context().Done(). The Write session
 		// itself stays alive; the caller can open a new GET poll if needed.
 		if len(resps) > 0 {
@@ -795,7 +795,7 @@ func drainWriteChunks(t *testing.T, ctx context.Context, ts *httptest.Server, si
 	return responses, highSeq
 }
 
-// ── Write stream WebChannel tests ────────────────────────────────────────────
+// -- Write stream WebChannel tests --------------------------------------------
 
 // TestWebChannel_Write_EmptyBatch verifies that the server responds to an empty
 // WriteRequest (writes = nil) with an updated stream token. The Firebase JS SDK
@@ -810,7 +810,7 @@ func TestWebChannel_Write_EmptyBatch(t *testing.T) {
 
 	sid, lastSeq, token := openWriteSession(t, ts)
 
-	// Send an empty WriteRequest with the handshake token — no Writes field.
+	// Send an empty WriteRequest with the handshake token - no Writes field.
 	doWritePOST(t, ts, sid, &firestorepb.WriteRequest{
 		StreamToken: token,
 	}, 1)
@@ -964,7 +964,7 @@ func TestWebChannel_ListenAndWrite(t *testing.T) {
 }
 
 
-// ── WebChannel regression tests ───────────────────────────────────────────────
+// -- WebChannel regression tests -----------------------------------------------
 
 
 // TestWebChannel_Write_FailedPrecondition_CleanClose verifies that when a write
@@ -974,10 +974,10 @@ func TestWebChannel_ListenAndWrite(t *testing.T) {
 // We do NOT deliver an error chunk because the Firebase SDK's onMessage_ handler
 // calls onError_() synchronously when it sees {"error": {...}}, transitioning the
 // stream state from Open to Error/Closing while a microtask-queued sendRequest_()
-// still expects Open state — triggering "INTERNAL ASSERTION FAILED: Unexpected state".
+// still expects Open state - triggering "INTERNAL ASSERTION FAILED: Unexpected state".
 //
 // The SDK handles stream close via handleWriteStreamClose_, which calls
-// isPermanentWriteError(FAILED_PRECONDITION) → true → rejectFailedWrite, so the
+// isPermanentWriteError(FAILED_PRECONDITION) -> true -> rejectFailedWrite, so the
 // failed mutation is removed from the pipeline without infinite retry.
 func TestWebChannel_Write_FailedPrecondition_CleanClose(t *testing.T) {
 	h, store := newTestHandler(t)
@@ -1023,7 +1023,7 @@ func TestWebChannel_Write_FailedPrecondition_CleanClose(t *testing.T) {
 	// Give the GET poll goroutine time to establish.
 	time.Sleep(10 * time.Millisecond)
 
-	// Submit a write with exists:false precondition — must fail.
+	// Submit a write with exists:false precondition - must fail.
 	doWritePOST(t, ts, sid, &firestorepb.WriteRequest{
 		StreamToken: token,
 		Writes: []*firestorepb.Write{{
@@ -1101,7 +1101,7 @@ func TestWebChannel_Write_ErrorChunkDelivery(t *testing.T) {
 
 	time.Sleep(10 * time.Millisecond)
 
-	// Write with exists:true on a missing document → NOT_FOUND.
+	// Write with exists:true on a missing document -> NOT_FOUND.
 	doWritePOST(t, ts, sid, &firestorepb.WriteRequest{
 		StreamToken: token,
 		Writes: []*firestorepb.Write{{
@@ -1168,15 +1168,15 @@ func TestWebChannel_Write_ErrorChunkDelivery(t *testing.T) {
 }
 
 // TestWebChannel_Write_SingleChangeEvent_WithTransform is a regression test for
-// the double-UpsertDoc → intermediate ChangeEvent bug.
+// the double-UpsertDoc -> intermediate ChangeEvent bug.
 //
 // Before the fix, applyWrite called UpsertDoc twice for a Write_Update with
 // transforms: once for field updates (no timestamp) and once for transforms
 // (timestamp added). The Listen stream received two DocumentChange events for
 // the same doc. The SDK consumed the mutation on the intermediate event; when
-// the WriteResult arrived, the pipeline was empty → "mutations" crash.
+// the WriteResult arrived, the pipeline was empty -> "mutations" crash.
 //
-// After the fix, a single UpsertDoc fires one ChangeEvent → one DocumentChange.
+// After the fix, a single UpsertDoc fires one ChangeEvent -> one DocumentChange.
 func TestWebChannel_Write_SingleChangeEvent_WithTransform(t *testing.T) {
 	old := config.HeartbeatInterval
 	config.HeartbeatInterval = 100 * time.Millisecond
@@ -1222,7 +1222,7 @@ func TestWebChannel_Write_SingleChangeEvent_WithTransform(t *testing.T) {
 	// Wait for Write stream to acknowledge (ensures the ChangeEvent has fired).
 	drainWriteChunks(t, ctx, ts, writeSID, writeSeq)
 
-	// Collect Listen responses — use n=2 to catch any spurious second event.
+	// Collect Listen responses - use n=2 to catch any spurious second event.
 	listenResps := collectResponses(t, ctx, ts, listenSID, &listenAID, 2)
 
 	// Count DocumentChange events for sc-msgs/m1.
@@ -1248,7 +1248,7 @@ func TestWebChannel_Write_SingleChangeEvent_WithTransform(t *testing.T) {
 	}
 }
 
-// ── Session GC tests ──────────────────────────────────────────────────────────
+// -- Session GC tests ----------------------------------------------------------
 
 // TestWebChannel_SessionGC_IdleCleanup verifies that SweepIdleSessions cancels
 // a session that has not been polled since config.SessionIdleTimeout ago.

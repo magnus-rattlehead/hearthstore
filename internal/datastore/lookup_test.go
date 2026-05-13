@@ -83,7 +83,7 @@ func TestLookup(t *testing.T) {
 				var begin datastorepb.BeginTransactionResponse
 				mustPost(t, s, "beginTransaction", &datastorepb.BeginTransactionRequest{ProjectId: testProject}, &begin)
 
-				// Lookup within the transaction — records version in read set.
+				// Lookup within the transaction - records version in read set.
 				var lr datastorepb.LookupResponse
 				mustPost(t, s, "lookup", &datastorepb.LookupRequest{
 					ProjectId:   testProject,
@@ -97,7 +97,7 @@ func TestLookup(t *testing.T) {
 				// Another writer updates the entity outside this transaction.
 				upsertEntity(t, s, dsEntity(key, map[string]*datastorepb.Value{"v": dsInt(2)}))
 
-				// Now commit the original transaction — OCC must detect the conflict.
+				// Now commit the original transaction - OCC must detect the conflict.
 				r := doPost(t, s, projectURL("commit"), &datastorepb.CommitRequest{
 					ProjectId:           testProject,
 					TransactionSelector: &datastorepb.CommitRequest_Transaction{Transaction: begin.Transaction},

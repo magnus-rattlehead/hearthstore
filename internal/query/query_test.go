@@ -10,7 +10,7 @@ import (
 	"github.com/magnus-rattlehead/hearthstore/internal/query"
 )
 
-// ── value helpers ──────────────────────────────────────────────────────────
+// -- value helpers ----------------------------------------------------------
 
 func strVal(s string) *firestorepb.Value {
 	return &firestorepb.Value{ValueType: &firestorepb.Value_StringValue{StringValue: s}}
@@ -38,7 +38,7 @@ func arrayOf(vals ...*firestorepb.Value) *firestorepb.Value {
 	}}
 }
 
-// ── query helpers ─────────────────────────────────────────────────────────
+// -- query helpers ---------------------------------------------------------
 
 func fieldFilter(path string, op firestorepb.StructuredQuery_FieldFilter_Operator, val *firestorepb.Value) *firestorepb.StructuredQuery_Filter {
 	return &firestorepb.StructuredQuery_Filter{
@@ -94,7 +94,7 @@ func order(field string, dir firestorepb.StructuredQuery_Direction) *firestorepb
 	}
 }
 
-// ── build helper ──────────────────────────────────────────────────────────
+// -- build helper ----------------------------------------------------------
 
 func build(t *testing.T, q *firestorepb.StructuredQuery, allDescendants bool) *query.Result {
 	t.Helper()
@@ -124,7 +124,7 @@ func assertNotContains(t *testing.T, sql string, subs ...string) {
 	}
 }
 
-// ── tests ─────────────────────────────────────────────────────────────────
+// -- tests -----------------------------------------------------------------
 
 func TestBuild_NoFilter(t *testing.T) {
 	r := build(t, &firestorepb.StructuredQuery{
@@ -340,7 +340,7 @@ func TestBuild_StartAt_SingleField_Inclusive(t *testing.T) {
 		StartAt: &firestorepb.Cursor{Values: []*firestorepb.Value{intVal(20)}, Before: true},
 	}, false)
 
-	// StartAt inclusive (Before=true) → >=
+	// StartAt inclusive (Before=true) -> >=
 	assertContains(t, r.SQL, ">=")
 }
 
@@ -351,7 +351,7 @@ func TestBuild_StartAt_SingleField_Exclusive(t *testing.T) {
 		StartAt: &firestorepb.Cursor{Values: []*firestorepb.Value{intVal(20)}, Before: false},
 	}, false)
 
-	// StartAt exclusive (Before=false) → >
+	// StartAt exclusive (Before=false) -> >
 	assertContains(t, r.SQL, " > ?")
 	assertNotContains(t, r.SQL, ">=")
 }
@@ -373,7 +373,7 @@ func TestBuild_EndAt_SingleField_Exclusive(t *testing.T) {
 		EndAt:   &firestorepb.Cursor{Values: []*firestorepb.Value{intVal(30)}, Before: true},
 	}, false)
 
-	// EndAt exclusive (Before=true) → <
+	// EndAt exclusive (Before=true) -> <
 	assertContains(t, r.SQL, " < ?")
 	assertNotContains(t, r.SQL, "<=")
 }
@@ -396,7 +396,7 @@ func TestBuild_NameOrderBy(t *testing.T) {
 		OrderBy: []*firestorepb.StructuredQuery_Order{order("__name__", firestorepb.StructuredQuery_ASCENDING)},
 	}, false)
 
-	// __name__ → d.path, no field_index JOIN for it
+	// __name__ -> d.path, no field_index JOIN for it
 	assertContains(t, r.SQL, "d.path")
 	// Should not have a LEFT JOIN for __name__ since it's the doc path
 	if strings.Count(r.SQL, "LEFT JOIN") != 0 {

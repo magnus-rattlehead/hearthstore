@@ -126,7 +126,7 @@ func TestBoundary_StartAt_EndAt_Range(t *testing.T) {
 		t.Fatalf("query: %v", err)
 	}
 	vals := scoreValues(docs)
-	// StartAt(1).EndAt(2): inclusive on both ends → [1, 2].
+	// StartAt(1).EndAt(2): inclusive on both ends -> [1, 2].
 	if len(docs) != 2 {
 		t.Fatalf("StartAt(1).EndAt(2): want 2 docs, got %d (scores: %v)", len(docs), vals)
 	}
@@ -226,7 +226,7 @@ func TestBoundary_Aggregation_Avg_Empty(t *testing.T) {
 	// The SDK may represent this as Go nil or as a *firestorepb.Value with NullValue type.
 	switch v := result["a"].(type) {
 	case nil:
-		// OK — explicit nil means null
+		// OK - explicit nil means null
 	case *firestorepb.Value:
 		if _, isNull := v.GetValueType().(*firestorepb.Value_NullValue); !isNull {
 			t.Errorf("AVG on empty collection = %v, want null", v)

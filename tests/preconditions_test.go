@@ -22,7 +22,7 @@ import (
 	"cloud.google.com/go/firestore"
 )
 
-// ── Firestore preconditions ────────────────────────────────────────────────
+// -- Firestore preconditions ------------------------------------------------
 
 func TestPrecondition_Create_Success(t *testing.T) {
 	client := newClient(t)
@@ -78,7 +78,7 @@ func TestPrecondition_Commit_ExistsFalse_Present(t *testing.T) {
 		Document: fsDoc(docURL, map[string]*firestorepb.Value{"v": fsIntVal(1)}),
 	}, nil)
 
-	// Commit a Write with exists=false precondition — should fail because doc exists.
+	// Commit a Write with exists=false precondition - should fail because doc exists.
 	code := s.post(s.actionURL("commit"), &firestorepb.CommitRequest{
 		Database: dbPath,
 		Writes: []*firestorepb.Write{{
@@ -111,7 +111,7 @@ func TestPrecondition_Commit_UpdateTime_Match(t *testing.T) {
 	}
 	updateTime := got.UpdateTime
 
-	// Commit with the correct update_time — should succeed.
+	// Commit with the correct update_time - should succeed.
 	code := s.post(s.actionURL("commit"), &firestorepb.CommitRequest{
 		Database: dbPath,
 		Writes: []*firestorepb.Write{{
@@ -220,7 +220,7 @@ func TestPrecondition_Commit_UnknownTransaction(t *testing.T) {
 	}
 }
 
-// ── Datastore preconditions ────────────────────────────────────────────────
+// -- Datastore preconditions ------------------------------------------------
 
 // TestDSPrecondition_Transaction_ReadOnly_Write_Fails verifies the Datastore
 // server rejects writes in a read-only transaction (raw HTTP path).

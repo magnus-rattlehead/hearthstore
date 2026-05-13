@@ -13,7 +13,7 @@ import (
 	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
 )
 
-// dsChildKey builds a two-level key: parent Kind/name → child Kind/name.
+// dsChildKey builds a two-level key: parent Kind/name -> child Kind/name.
 func dsChildKey(parentKind, parentName, childKind, childName string) *datastorepb.Key {
 	return &datastorepb.Key{
 		PartitionId: &datastorepb.PartitionId{ProjectId: testProject},
@@ -97,7 +97,7 @@ func TestDSEdge_BaseVersion_Conflict(t *testing.T) {
 
 	key := dsNameKey("VerKind", "v1")
 
-	// Initial upsert — capture the version.
+	// Initial upsert - capture the version.
 	var commitResp datastorepb.CommitResponse
 	if code := s.post("commit", &datastorepb.CommitRequest{
 		ProjectId: testProject,
@@ -112,7 +112,7 @@ func TestDSEdge_BaseVersion_Conflict(t *testing.T) {
 	}
 	version := commitResp.MutationResults[0].Version
 
-	// Upsert with wrong baseVersion (current + 999) → should conflict.
+	// Upsert with wrong baseVersion (current + 999) -> should conflict.
 	var conflictResp datastorepb.CommitResponse
 	if code := s.post("commit", &datastorepb.CommitRequest{
 		ProjectId: testProject,
@@ -155,7 +155,7 @@ func TestDSEdge_BaseVersion_Match(t *testing.T) {
 	}, &resp1)
 	version := resp1.MutationResults[0].Version
 
-	// Upsert with correct baseVersion → no conflict.
+	// Upsert with correct baseVersion -> no conflict.
 	var resp2 datastorepb.CommitResponse
 	if code := s.post("commit", &datastorepb.CommitRequest{
 		ProjectId: testProject,
@@ -203,7 +203,7 @@ func TestDSEdge_CreateAfterDelete(t *testing.T) {
 		t.Fatalf("delete: HTTP %d", code)
 	}
 
-	// Insert the same key again — should succeed (not ALREADY_EXISTS).
+	// Insert the same key again - should succeed (not ALREADY_EXISTS).
 	if code := s.post("commit", &datastorepb.CommitRequest{
 		ProjectId: testProject,
 		Mode:      datastorepb.CommitRequest_NON_TRANSACTIONAL,

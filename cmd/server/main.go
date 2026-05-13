@@ -42,7 +42,49 @@ func defaultDataDir() string {
 	return "./data"
 }
 
+const logo = `
+
+              ▒▒
+              ▓▓
+              ▓▓▓▓
+              ████
+            ░░████
+            ██▓▓██
+      ░░  ████▓▓▓▓    ▒▒
+      ▓▓▒▒▓▓██▒▒▓▓  ██░░
+    ▓▓██████▒▒▓▓▒▒████  ▒▒
+    ██████▒▒▒▒▓▓▒▒██▒▒  ██
+    ██▓▓▓▓░░▒▒████▓▓░░▒▒██  ░░
+    ██▒▒▒▒░░▒▒▓▓██▓▓▓▓████▓▓░░
+    ██▒▒▒▒░░▒▒████▓▓██▓▓████░░
+    ██▒▒░░░░▒▒▓▓██▒▒██▒▒██▓▓░░  ██╗░░██╗███████╗░█████╗░██████╗░████████╗██╗░░██╗░██████╗████████╗░█████╗░██████╗░███████╗
+░░  ▒▒▒▒░░░░░░▒▒██░░▒▒▒▒▓▓██    ██║░░██║██╔════╝██╔══██╗██╔══██╗╚══██╔══╝██║░░██║██╔════╝╚══██╔══╝██╔══██╗██╔══██╗██╔════╝
+  ██▓▓▓▓░░  ░░▒▒▒▒░░░░▒▒▓▓▓▓    ███████║█████╗░░███████║██████╔╝░░░██║░░░███████║╚█████╗░░░░██║░░░██║░░██║██████╔╝█████╗░░
+  ░░██▓▓▒▒░░  ░░░░░░░░░░▓▓░░    ██╔══██║██╔══╝░░██╔══██║██╔══██╗░░░██║░░░██╔══██║░╚═══██╗░░░██║░░░██║░░██║██╔══██╗██╔══╝░░
+    ░░▓▓░░░░        ░░▒▒░░      ██║░░██║███████╗██║░░██║██║░░██║░░░██║░░░██║░░██║██████╔╝░░░██║░░░╚█████╔╝██║░░██║███████╗
+        ░░▒▒░░      ░░          ╚═╝░░╚═╝╚══════╝╚═╝░░╚═╝╚═╝░░╚═╝░░░╚═╝░░░╚═╝░░╚═╝╚═════╝░░░░╚═╝░░░░╚════╝░╚═╝░░╚═╝╚══════╝
+
+`
+
+// prefixHandler wraps an slog.Handler and prepends "[hearthstore]" to every log message.
+type prefixHandler struct{ slog.Handler }
+
+func (h prefixHandler) Handle(ctx context.Context, r slog.Record) error {
+	r.Message = "[hearthstore] " + r.Message
+	return h.Handler.Handle(ctx, r)
+}
+
+func (h prefixHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return prefixHandler{h.Handler.WithAttrs(attrs)}
+}
+
+func (h prefixHandler) WithGroup(name string) slog.Handler {
+	return prefixHandler{h.Handler.WithGroup(name)}
+}
+
 func main() {
+	fmt.Fprint(os.Stderr, logo)
+
 	port          := flag.Int("port", 8080, "gRPC listen port (Firestore Native)")
 	webPort       := flag.Int("web-port", 0, "gRPC-Web HTTP listen port (0 = disabled)")
 	datastoreAddr := flag.String("datastore-addr", ":8456", "HTTP listen address (Datastore REST API)")
@@ -57,7 +99,7 @@ func main() {
 	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {
 		log.Fatalf("invalid log level %q: %v", *logLevel, err)
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	logger := slog.New(prefixHandler{slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})})
 	slog.SetDefault(logger)
 
 	if err := os.MkdirAll(*dataDir, 0755); err != nil {

@@ -2,7 +2,8 @@ package datastore
 
 import (
 	"bytes"
-	"math"
+	"cmp"
+	"slices"
 	"strings"
 
 	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
@@ -115,20 +116,8 @@ func compareValues(a, b *datastorepb.Value) int {
 	case *datastorepb.Value_KeyValue:
 		return compareKeys(av.KeyValue, b.GetKeyValue())
 	case *datastorepb.Value_ArrayValue:
-		// Compare element-by-element.
 		ae, be := av.ArrayValue.GetValues(), b.GetArrayValue().GetValues()
-		for i := 0; i < len(ae) && i < len(be); i++ {
-			if c := compareValues(ae[i], be[i]); c != 0 {
-				return c
-			}
-		}
-		if len(ae) < len(be) {
-			return -1
-		}
-		if len(ae) > len(be) {
-			return 1
-		}
-		return 0
+		return slices.CompareFunc(ae, be, compareValues)
 	}
 	return 0
 }
@@ -177,11 +166,6 @@ func dsValueTypeRank(v *datastorepb.Value) int {
 	return -1
 }
 
-func isNaN(v *datastorepb.Value) bool {
-	dv, ok := v.ValueType.(*datastorepb.Value_DoubleValue)
-	return ok && math.IsNaN(dv.DoubleValue)
-}
-
 // compareKeys compares two Datastore keys. Within the same kind, integer IDs
 // sort before string IDs; integer IDs compare numerically, string IDs lexicographically.
 func compareKeys(a, b *datastorepb.Key) int {
@@ -202,22 +186,9 @@ func compareKeys(a, b *datastorepb.Key) int {
 		return c
 	}
 	apes, bpes := a.GetPath(), b.GetPath()
-	for i := 0; i < len(apes) && i < len(bpes); i++ {
-		ae, be := apes[i], bpes[i]
-		if c := strings.Compare(ae.GetKind(), be.GetKind()); c != 0 {
-			return c
-		}
-		if c := comparePathElementID(ae, be); c != 0 {
-			return c
-		}
-	}
-	if len(apes) < len(bpes) {
-		return -1
-	}
-	if len(apes) > len(bpes) {
-		return 1
-	}
-	return 0
+	return slices.CompareFunc(apes, bpes, func(ae, be *datastorepb.Key_PathElement) int {
+		return cmp.Or(strings.Compare(ae.GetKind(), be.GetKind()), comparePathElementID(ae, be))
+	})
 }
 
 func comparePathElementID(a, b *datastorepb.Key_PathElement) int {

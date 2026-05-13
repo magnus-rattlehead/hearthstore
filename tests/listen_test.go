@@ -4,7 +4,7 @@ package tests
 
 // Integration tests for the Listen (real-time watch) RPC using the official
 // Firestore Go SDK. These exercise CollectionRef.Snapshots() and
-// DocumentRef.Snapshots() — the Go SDK equivalents of JS onSnapshot() —
+// DocumentRef.Snapshots() - the Go SDK equivalents of JS onSnapshot() -
 // end-to-end against a live hearthstore gRPC server.
 //
 // Each test subscribes before writing so the initial snapshot is consumed

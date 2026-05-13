@@ -133,7 +133,7 @@ func TestPersistence_DsEntitySurvivesRestart(t *testing.T) {
 	_ = datastorepb
 }
 
-// ── field_index helpers ──────────────────────────────────────────────────────
+// -- field_index helpers ------------------------------------------------------
 
 func boolVal(b bool) *firestorepb.Value {
 	return &firestorepb.Value{ValueType: &firestorepb.Value_BooleanValue{BooleanValue: b}}
@@ -199,7 +199,7 @@ func fieldIndexRows(t *testing.T, db *sql.DB, project, database, docPath, fieldP
 	return result
 }
 
-// ── field_index tests ────────────────────────────────────────────────────────
+// -- field_index tests --------------------------------------------------------
 
 func TestFieldIndex_PopulatedOnInsert(t *testing.T) {
 	store, _ := New(t.TempDir())
@@ -333,7 +333,7 @@ func TestFieldIndex_NestedArraySkipped(t *testing.T) {
 	store, _ := New(t.TempDir())
 	defer store.Close()
 
-	// Array containing another array — inner arrays should not be indexed.
+	// Array containing another array - inner arrays should not be indexed.
 	_, err := store.UpsertDoc(testProject, testDB, "things", "", "things/doc1",
 		&firestorepb.Document{
 			Name: "projects/test-proj/databases/(default)/documents/things/doc1",
@@ -454,7 +454,7 @@ func TestFieldIndex_TransactionalWrite(t *testing.T) {
 }
 
 // importDsEntityForTest is a helper that exercises the datastore storage path.
-// We do this inline to avoid a circular import — storage_test is package storage.
+// We do this inline to avoid a circular import - storage_test is package storage.
 func importDsEntityForTest(t *testing.T, dir string) bool {
 	t.Helper()
 	store1, err := New(dir + "/ds")
@@ -463,7 +463,7 @@ func importDsEntityForTest(t *testing.T, dir string) bool {
 	}
 
 	// Use the Firestore doc path as a proxy (ds_documents uses a different table).
-	// Write via UpsertDoc and verify via GetDoc — same WAL/file.
+	// Write via UpsertDoc and verify via GetDoc - same WAL/file.
 	_, err = store1.UpsertDoc("proj", "(default)", "Widget", "", "Widget/w1",
 		&firestorepb.Document{
 			Name:       "projects/proj/databases/(default)/documents/Widget/w1",
@@ -492,7 +492,7 @@ func importDsEntityForTest(t *testing.T, dir string) bool {
 	return true
 }
 
-// ── Change log tests ──────────────────────────────────────────────────────────
+// -- Change log tests ----------------------------------------------------------
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
@@ -560,7 +560,7 @@ func TestGetDocChangeSince_NoChange(t *testing.T) {
 	upsertTestDoc(t, s, "things/a", "x", "1")
 	seq, _ := s.CurrentSeq(testProject, testDB)
 
-	// No further writes — should return nil.
+	// No further writes - should return nil.
 	got, err := s.GetDocChangeSince(testProject, testDB, "things/a", seq)
 	if err != nil {
 		t.Fatalf("GetDocChangeSince: %v", err)
@@ -637,7 +637,7 @@ func TestGetChangesSince_Dedup(t *testing.T) {
 	s := newTestStore(t)
 	seq0, _ := s.CurrentSeq(testProject, testDB)
 
-	// Write "a" twice — should appear once in results (latest state only).
+	// Write "a" twice - should appear once in results (latest state only).
 	upsertTestDoc(t, s, "items/a", "v", "first")
 	upsertTestDoc(t, s, "items/a", "v", "second")
 

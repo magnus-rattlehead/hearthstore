@@ -2,7 +2,7 @@
 
 // Package tests contains end-to-end tests that use the official Firestore Go client
 // against a hearthstore server started in-process. These tests exercise the full
-// gRPC transport layer — serialization, proto encoding, client middleware — exactly
+// gRPC transport layer - serialization, proto encoding, client middleware - exactly
 // as a real backend caller would experience it.
 //
 // Run with:
@@ -87,7 +87,7 @@ func newClient(t *testing.T) *firestore.Client {
 	return client
 }
 
-// ── basic CRUD ─────────────────────────────────────────────────────────────
+// -- basic CRUD -------------------------------------------------------------
 
 func TestIntegration_SetAndGet(t *testing.T) {
 	client := newClient(t)
@@ -150,7 +150,7 @@ func TestIntegration_Update(t *testing.T) {
 	}
 }
 
-// ── queries ────────────────────────────────────────────────────────────────
+// -- queries ----------------------------------------------------------------
 
 func TestIntegration_Query_Equality(t *testing.T) {
 	client := newClient(t)
@@ -254,7 +254,7 @@ func TestIntegration_Query_NestedField(t *testing.T) {
 	}
 }
 
-// ── transactions ───────────────────────────────────────────────────────────
+// -- transactions -----------------------------------------------------------
 
 func TestIntegration_Transaction_Commit(t *testing.T) {
 	client := newClient(t)
@@ -304,7 +304,7 @@ func TestIntegration_Transaction_Rollback(t *testing.T) {
 	}
 }
 
-// ── aggregation ────────────────────────────────────────────────────────────
+// -- aggregation ------------------------------------------------------------
 
 func TestIntegration_AggregationCount(t *testing.T) {
 	client := newClient(t)
@@ -345,10 +345,10 @@ func TestIntegration_AggregationAvg(t *testing.T) {
 	}
 }
 
-// ── mixed operations ───────────────────────────────────────────────────────
+// -- mixed operations -------------------------------------------------------
 
 // TestIntegration_MixedOps verifies that the state seen by a query reflects a
-// sequence of writes, updates, and deletes — the core correctness property.
+// sequence of writes, updates, and deletes - the core correctness property.
 func TestIntegration_MixedOps(t *testing.T) {
 	client := newClient(t)
 	ctx := context.Background()
@@ -363,7 +363,7 @@ func TestIntegration_MixedOps(t *testing.T) {
 	// Delete bob.
 	col.Doc("bob").Delete(ctx)
 
-	// Query: score >= 20 → expect alice (50) and carol (30) only.
+	// Query: score >= 20 -> expect alice (50) and carol (30) only.
 	docs, err := col.Where("score", ">=", 20).OrderBy("score", firestore.Asc).Documents(ctx).GetAll()
 	if err != nil {
 		t.Fatalf("query: %v", err)

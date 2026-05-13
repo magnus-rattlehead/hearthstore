@@ -20,6 +20,17 @@ type Server struct {
 	grpc *GRPCServer
 }
 
+var dsOps = map[string]func(*Server, http.ResponseWriter, *http.Request, string){
+	"lookup":               (*Server).handleLookup,
+	"runQuery":             (*Server).handleRunQuery,
+	"runAggregationQuery":  (*Server).handleRunAggregationQuery,
+	"beginTransaction":     (*Server).handleBeginTransaction,
+	"commit":               (*Server).handleCommit,
+	"rollback":             (*Server).handleRollback,
+	"allocateIds":          (*Server).handleAllocateIds,
+	"reserveIds":           (*Server).handleReserveIds,
+}
+
 type txReadKey struct {
 	project, database, namespace, path string
 }
@@ -27,7 +38,7 @@ type txReadKey struct {
 type txEntry struct {
 	readOnly bool
 	readTime *timestamppb.Timestamp // snapshot time for read-only transactions
-	reads    map[txReadKey]int64    // entity path → version at read time, for OCC
+	reads    map[txReadKey]int64    // entity path -> version at read time, for OCC
 }
 
 // checkOCCConflicts verifies that no entity in the read set has been modified
@@ -79,7 +90,7 @@ func checkOCCConflicts(tx *sql.Tx, reads map[txReadKey]int64) error {
 		if err := rows.Err(); err != nil {
 			return fmt.Errorf("occ version check: %w", err)
 		}
-		// Any path not returned by the query was deleted — treat as conflict.
+		// Any path not returned by the query was deleted - treat as conflict.
 		if len(readVers) > 0 {
 			return status.Error(codes.Aborted, "too much contention on these datastore entities. please try again.")
 		}
@@ -119,24 +130,9 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	project := path[:colon]
 	method := path[colon+1:]
 
-	switch method {
-	case "lookup":
-		s.handleLookup(w, r, project)
-	case "runQuery":
-		s.handleRunQuery(w, r, project)
-	case "runAggregationQuery":
-		s.handleRunAggregationQuery(w, r, project)
-	case "beginTransaction":
-		s.handleBeginTransaction(w, r, project)
-	case "commit":
-		s.handleCommit(w, r, project)
-	case "rollback":
-		s.handleRollback(w, r, project)
-	case "allocateIds":
-		s.handleAllocateIds(w, r, project)
-	case "reserveIds":
-		s.handleReserveIds(w, r, project)
-	default:
+	if fn, ok := dsOps[method]; ok {
+		fn(s, w, r, project)
+	} else {
 		writeErr(w, http.StatusNotFound, "unknown method: "+method)
 	}
 }
@@ -161,26 +157,18 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func writeJSON(w http.ResponseWriter, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+var httpStatusNames = map[int]string{
+	400: "INVALID_ARGUMENT",
+	404: "NOT_FOUND",
+	409: "ALREADY_EXISTS",
+	412: "FAILED_PRECONDITION",
+	500: "INTERNAL",
+	501: "UNIMPLEMENTED",
 }
 
 func httpStatusName(code int) string {
-	switch code {
-	case 400:
-		return "INVALID_ARGUMENT"
-	case 404:
-		return "NOT_FOUND"
-	case 409:
-		return "ALREADY_EXISTS"
-	case 412:
-		return "FAILED_PRECONDITION"
-	case 500:
-		return "INTERNAL"
-	case 501:
-		return "UNIMPLEMENTED"
-	default:
-		return http.StatusText(code)
+	if s, ok := httpStatusNames[code]; ok {
+		return s
 	}
+	return http.StatusText(code)
 }

@@ -424,7 +424,7 @@ func TestTransform_Increment_IntDeltaOnFloat(t *testing.T) {
 }
 
 // TestTransform_EmptyArray_IsNotNull verifies that a document with an empty array
-// field is returned by IS_NOT_NULL queries (empty array ≠ null).
+// field is returned by IS_NOT_NULL queries (empty array != null).
 func TestTransform_EmptyArray_IsNotNull(t *testing.T) {
 	client := newClient(t)
 	ctx := context.Background()
