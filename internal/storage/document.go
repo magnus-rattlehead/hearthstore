@@ -37,48 +37,126 @@ func monotonicNow() *timestamppb.Timestamp {
 	return timestamppb.New(time.UnixMilli(nowMs))
 }
 
-// ChangeEvent is emitted to all subscribers whenever a document is written or deleted.
+// ChangeEvent is emitted to subscribers whose scope matches the written document.
 type ChangeEvent struct {
-	Name    string                // full Firestore resource name
-	Doc     *firestorepb.Document // non-nil on write; nil on delete
-	Deleted bool
-	Seq     int64 // change log sequence number; always > 0
+	Name       string                // full Firestore resource name
+	Doc        *firestorepb.Document // non-nil on write; nil on delete
+	Deleted    bool
+	Seq        int64  // change log sequence number; always > 0
+	Project    string // populated by all write paths for sharded fan-out
+	Database   string
+	Collection string
+	ParentPath string
 }
 
-// Subscribe registers a new change listener. The returned channel is buffered (64).
+// SubScope describes the watch scope for a subscriber shard.
+// AllDescendants=true → collection-group listener (any parent depth).
+// AllDescendants=false → single-collection listener at ParentPath.
+type SubScope struct {
+	Project, Database, ParentPath, Collection string
+	AllDescendants                            bool
+}
+
+type subEntry struct {
+	ch     chan ChangeEvent
+	scopes []SubScope
+}
+
+type subScopeKey struct{ project, database, parentPath, collection string }
+type subCollGKey struct{ project, database, collection string }
+
+// Subscribe registers a new change listener with no initial scope filter.
+// Call UpdateScopes to route events to this subscriber.
 // The caller must call Unsubscribe(id) when done.
 func (s *Store) Subscribe() (uint64, <-chan ChangeEvent) {
 	ch := make(chan ChangeEvent, 64)
 	s.subMu.Lock()
 	s.nextID++
 	id := s.nextID
-	s.subs[id] = ch
+	s.subEntries[id] = &subEntry{ch: ch}
 	s.subMu.Unlock()
 	return id, ch
+}
+
+// UpdateScopes replaces the scope filter for subscriber id.
+// Only events whose (project, database, collection, parentPath) match one of the
+// given scopes will be delivered to this subscriber's channel.
+func (s *Store) UpdateScopes(id uint64, scopes []SubScope) {
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	entry, ok := s.subEntries[id]
+	if !ok {
+		return
+	}
+	s.removeSubFromShards(id, entry.scopes)
+	entry.scopes = scopes
+	ch := entry.ch
+	for _, sc := range scopes {
+		if sc.AllDescendants {
+			k := subCollGKey{sc.Project, sc.Database, sc.Collection}
+			if s.byCollG[k] == nil {
+				s.byCollG[k] = make(map[uint64]chan ChangeEvent)
+			}
+			s.byCollG[k][id] = ch
+		} else {
+			k := subScopeKey{sc.Project, sc.Database, sc.ParentPath, sc.Collection}
+			if s.byScope[k] == nil {
+				s.byScope[k] = make(map[uint64]chan ChangeEvent)
+			}
+			s.byScope[k][id] = ch
+		}
+	}
+}
+
+func (s *Store) removeSubFromShards(id uint64, scopes []SubScope) {
+	for _, sc := range scopes {
+		if sc.AllDescendants {
+			k := subCollGKey{sc.Project, sc.Database, sc.Collection}
+			delete(s.byCollG[k], id)
+			if len(s.byCollG[k]) == 0 {
+				delete(s.byCollG, k)
+			}
+		} else {
+			k := subScopeKey{sc.Project, sc.Database, sc.ParentPath, sc.Collection}
+			delete(s.byScope[k], id)
+			if len(s.byScope[k]) == 0 {
+				delete(s.byScope, k)
+			}
+		}
+	}
 }
 
 // Unsubscribe removes and closes the subscriber channel.
 func (s *Store) Unsubscribe(id uint64) {
 	s.subMu.Lock()
-	ch, ok := s.subs[id]
+	entry, ok := s.subEntries[id]
 	if ok {
-		delete(s.subs, id)
+		s.removeSubFromShards(id, entry.scopes)
+		delete(s.subEntries, id)
 	}
 	s.subMu.Unlock()
 	if ok {
-		close(ch)
+		close(entry.ch)
 	}
 }
 
-// notify broadcasts a ChangeEvent to all active subscribers (non-blocking; drops if full).
+// notify sends a ChangeEvent only to subscribers whose scope matches the event.
 func (s *Store) notify(ev ChangeEvent) {
-	s.subMu.Lock()
-	defer s.subMu.Unlock()
-	for _, ch := range s.subs {
-		select {
-		case ch <- ev:
-		default: // subscriber is slow; drop (they'll re-read from DB)
+	s.subMu.RLock()
+	defer s.subMu.RUnlock()
+	send := func(shard map[uint64]chan ChangeEvent) {
+		for _, ch := range shard {
+			select {
+			case ch <- ev:
+			default:
+			}
 		}
+	}
+	if shard := s.byScope[subScopeKey{ev.Project, ev.Database, ev.ParentPath, ev.Collection}]; shard != nil {
+		send(shard)
+	}
+	if shard := s.byCollG[subCollGKey{ev.Project, ev.Database, ev.Collection}]; shard != nil {
+		send(shard)
 	}
 }
 
@@ -117,7 +195,7 @@ func (s *Store) InsertDoc(project, database, collection, parentPath, path string
 	if err != nil {
 		return nil, err
 	}
-	s.notify(ChangeEvent{Name: d.Name, Doc: d, Seq: seq})
+	s.notify(ChangeEvent{Name: d.Name, Doc: d, Seq: seq, Project: project, Database: database, Collection: collection, ParentPath: parentPath})
 	return d, nil
 }
 
@@ -127,7 +205,7 @@ func (s *Store) InsertDocTx(tx *sql.Tx, project, database, collection, parentPat
 	if err != nil {
 		return nil, err
 	}
-	s.notify(ChangeEvent{Name: d.Name, Doc: d, Seq: seq})
+	s.notify(ChangeEvent{Name: d.Name, Doc: d, Seq: seq, Project: project, Database: database, Collection: collection, ParentPath: parentPath})
 	return d, nil
 }
 
@@ -163,7 +241,7 @@ func (s *Store) UpsertDoc(project, database, collection, parentPath, path string
 	if err != nil {
 		return nil, err
 	}
-	s.notify(ChangeEvent{Name: d.Name, Doc: d, Seq: seq})
+	s.notify(ChangeEvent{Name: d.Name, Doc: d, Seq: seq, Project: project, Database: database, Collection: collection, ParentPath: parentPath})
 	return d, nil
 }
 
@@ -173,7 +251,7 @@ func (s *Store) UpsertDocTx(tx *sql.Tx, project, database, collection, parentPat
 	if err != nil {
 		return nil, err
 	}
-	s.notify(ChangeEvent{Name: d.Name, Doc: d, Seq: seq})
+	s.notify(ChangeEvent{Name: d.Name, Doc: d, Seq: seq, Project: project, Database: database, Collection: collection, ParentPath: parentPath})
 	return d, nil
 }
 
@@ -232,7 +310,7 @@ func (s *Store) deleteDocWith(exec dbExec, project, database, path string) error
 	if err != nil {
 		return err
 	}
-	s.notify(ChangeEvent{Name: name, Deleted: true, Seq: seq})
+	s.notify(ChangeEvent{Name: name, Deleted: true, Seq: seq, Project: project, Database: database, Collection: coll, ParentPath: parent})
 	return nil
 }
 

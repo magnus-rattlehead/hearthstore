@@ -248,7 +248,7 @@ func (s *Store) UpsertDocsManyTx(tx *sql.Tx, project, database string, rows []Fs
 			return nil, fmt.Errorf("append change %s: %w", r.Path, err)
 		}
 
-		acc.events = append(acc.events, ChangeEvent{Name: d.Name, Doc: d, Seq: seq})
+		acc.events = append(acc.events, ChangeEvent{Name: d.Name, Doc: d, Seq: seq, Project: project, Database: database, Collection: r.Collection, ParentPath: r.ParentPath})
 		result[r.Path] = d
 	}
 

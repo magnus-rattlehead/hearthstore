@@ -225,10 +225,12 @@ type Store struct {
 	wdb *sql.DB // single write connection — serialises all mutations
 	rdb *sql.DB // read connection pool — concurrent readers, never blocks writers (WAL)
 
-	// pub/sub for real-time Listen delivery
-	subMu  sync.Mutex
-	subs   map[uint64]chan ChangeEvent
-	nextID uint64
+	// pub/sub for real-time Listen delivery — sharded by (project, database, parent, collection)
+	subMu      sync.RWMutex
+	subEntries map[uint64]*subEntry
+	byScope    map[subScopeKey]map[uint64]chan ChangeEvent
+	byCollG    map[subCollGKey]map[uint64]chan ChangeEvent
+	nextID     uint64
 
 	done chan struct{} // closed by Close to stop the background checkpoint goroutine
 }
@@ -308,10 +310,12 @@ func New(dataDir string) (*Store, error) {
 	}
 
 	s := &Store{
-		wdb:  wdb,
-		rdb:  rdb,
-		subs: make(map[uint64]chan ChangeEvent),
-		done: make(chan struct{}),
+		wdb:        wdb,
+		rdb:        rdb,
+		subEntries: make(map[uint64]*subEntry),
+		byScope:    make(map[subScopeKey]map[uint64]chan ChangeEvent),
+		byCollG:    make(map[subCollGKey]map[uint64]chan ChangeEvent),
+		done:       make(chan struct{}),
 	}
 	go s.checkpointLoop()
 	return s, nil

@@ -657,6 +657,7 @@ func TestChangeEvent_CarriesSeq(t *testing.T) {
 	s := newTestStore(t)
 	subID, ch := s.Subscribe()
 	defer s.Unsubscribe(subID)
+	s.UpdateScopes(subID, []SubScope{{Project: testProject, Database: testDB, Collection: "things"}})
 
 	upsertTestDoc(t, s, "things/a", "x", "1")
 
