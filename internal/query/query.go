@@ -109,7 +109,73 @@ func Build(project, database, parentPath string, allDescendants bool, q *firesto
 	return result, nil
 }
 
+// BuildPathOnly is like Build but generates SELECT d.path instead of SELECT d.data.
+// Use for lightweight scope repopulation (no proto unmarshal needed).
+// Falls back to Build when NeedsGoFilter is set (caller must use full docs).
+func BuildPathOnly(project, database, parentPath string, allDescendants bool, q *firestorepb.StructuredQuery) (*Result, error) {
+	if q == nil {
+		return nil, fmt.Errorf("nil StructuredQuery")
+	}
 
+	b := &builder{
+		project:        project,
+		database:       database,
+		parentPath:     parentPath,
+		allDescendants: allDescendants,
+		pathOnly:       true,
+	}
+
+	if len(q.From) == 0 {
+		return nil, fmt.Errorf("StructuredQuery.from is empty")
+	}
+	collectionID := q.From[0].CollectionId
+	if collectionID == "" && !allDescendants {
+		return nil, fmt.Errorf("StructuredQuery.from[0].collection_id is empty")
+	}
+
+	effectiveOrders := addImplicitOrderBy(q.OrderBy, q.Where)
+	b.buildOrderBy(effectiveOrders)
+
+	for _, o := range q.OrderBy {
+		fp := parseProtoFieldPath(o.Field.GetFieldPath())
+		if fp == "__name__" {
+			continue
+		}
+		b.whereClauses = append(b.whereClauses,
+			"EXISTS(SELECT 1 FROM field_index fi_ex WHERE fi_ex.doc_path=d.path AND fi_ex.project=d.project AND fi_ex.database=d.database AND fi_ex.field_path=?)",
+		)
+		b.args = append(b.args, fp)
+	}
+
+	if q.Where != nil {
+		clause, args, needsGo := b.buildFilter(q.Where)
+		if clause != "" {
+			b.whereClauses = append(b.whereClauses, clause)
+			b.args = append(b.args, args...)
+		}
+		if needsGo {
+			b.needsGoFilter = true
+		}
+	}
+
+	if q.StartAt != nil && len(q.StartAt.Values) > 0 {
+		clause, args := b.buildCursor(q.StartAt, effectiveOrders, true)
+		if clause != "" {
+			b.whereClauses = append(b.whereClauses, clause)
+			b.args = append(b.args, args...)
+		}
+	}
+	if q.EndAt != nil && len(q.EndAt.Values) > 0 {
+		clause, args := b.buildCursor(q.EndAt, effectiveOrders, false)
+		if clause != "" {
+			b.whereClauses = append(b.whereClauses, clause)
+			b.args = append(b.args, args...)
+		}
+	}
+
+	sql, finalArgs := b.assemble(collectionID, q)
+	return &Result{SQL: sql, Args: finalArgs, NeedsGoFilter: b.needsGoFilter}, nil
+}
 
 type builder struct {
 	project, database, parentPath string
@@ -123,7 +189,8 @@ type builder struct {
 	args         []any
 
 	needsGoFilter bool
-	fiCounter     int // tracks fi_N alias counter for ORDER BY joins
+	fiCounter     int  // tracks fi_N alias counter for ORDER BY joins
+	pathOnly      bool // emit SELECT d.path instead of SELECT d.data
 }
 
 // fiAlias returns the LEFT JOIN alias for the Nth ORDER BY field.
@@ -878,7 +945,11 @@ func (b *builder) assemble(collectionID string, q *firestorepb.StructuredQuery) 
 	var sb strings.Builder
 	var args []any
 
-	sb.WriteString("SELECT d.data FROM documents d")
+	if b.pathOnly {
+		sb.WriteString("SELECT d.path FROM documents d")
+	} else {
+		sb.WriteString("SELECT d.data FROM documents d")
+	}
 
 	// ORDER BY JOINs (args come first in the joins, before WHERE args)
 	for _, j := range b.joins {
