@@ -374,16 +374,8 @@ func (s *Server) sendDiffSnapshot(
 		}
 	}
 
-	// Repopulate t.sent with all currently live docs so dispatchChangeEvent can
-	// correctly detect when a doc leaves the result set after this reconnect.
-	docs, err := s.fetchTargetDocs(t)
-	if err != nil {
-		return err
-	}
-	for _, doc := range docs {
-		t.sent[doc.Name] = true
-	}
-	return nil
+	// Repopulate t.sent — path-only where possible to avoid full proto unmarshal.
+	return s.repopulateSent(t)
 }
 
 // sendDiffSnapshotByTime sends only documents changed after since (timestamp path,
@@ -419,21 +411,22 @@ func (s *Server) sendDiffSnapshotByTime(
 		}
 	}
 
-	// Repopulate t.sent with all currently live docs.
-	docs, err := s.fetchTargetDocs(t)
-	if err != nil {
-		return err
-	}
-	for _, doc := range docs {
-		if t.docNames != nil {
-			// Documents targets: re-stream docs since we have no per-doc timestamp diff.
+	// Repopulate t.sent.
+	// Documents targets must re-stream full docs; query targets use path-only.
+	if t.docNames != nil {
+		docs, err := s.fetchTargetDocs(t)
+		if err != nil {
+			return err
+		}
+		for _, doc := range docs {
 			if err := sendDocChange(stream, t.id, doc); err != nil {
 				return err
 			}
+			t.sent[doc.Name] = true
 		}
-		t.sent[doc.Name] = true
+		return nil
 	}
-	return nil
+	return s.repopulateSent(t)
 }
 
 // fetchTargetDocs returns all documents matching the target (query or explicit set).
@@ -546,6 +539,64 @@ func (s *Server) dispatchChangeEvent(
 	}
 	resumeToken := encodeResumeToken(streamID, ev.Seq)
 	return stream.Send(noChange(resumeToken, now))
+}
+
+// repopulateSent fills t.sent with all currently live document names matching t.
+// For query targets without Go-side filters: uses a path-only SELECT (no proto unmarshal).
+// For Documents targets: checks existence of each named doc individually.
+// For queries needing Go-side filter: falls back to full doc fetch.
+func (s *Server) repopulateSent(t *watchTarget) error {
+	if t.docNames != nil {
+		for name := range t.docNames {
+			_, _, path, _ := parseName(name)
+			if _, err := s.store.GetDoc(t.project, t.database, path); err == nil {
+				t.sent[name] = true
+			}
+		}
+		return nil
+	}
+	q := t.query
+	if q == nil {
+		return nil
+	}
+	for _, sel := range q.GetFrom() {
+		selQ := &firestorepb.StructuredQuery{
+			From:    []*firestorepb.StructuredQuery_CollectionSelector{sel},
+			Where:   q.Where,
+			OrderBy: q.OrderBy,
+			StartAt: q.StartAt,
+			EndAt:   q.EndAt,
+			Offset:  q.Offset,
+			Limit:   q.Limit,
+		}
+		result, err := query.BuildPathOnly(t.project, t.database, t.parent, sel.AllDescendants, selQ)
+		if err != nil {
+			return err
+		}
+		if result.NeedsGoFilter {
+			// Go-side filter required: fetch full docs to evaluate predicate.
+			fullResult, ferr := query.Build(t.project, t.database, t.parent, sel.AllDescendants, selQ)
+			if ferr != nil {
+				return ferr
+			}
+			err = s.store.QueryDocs(fullResult.SQL, fullResult.Args, func(doc *firestorepb.Document) error {
+				if !matchesFilter(doc, q.Where) {
+					return nil
+				}
+				t.sent[doc.Name] = true
+				return nil
+			})
+		} else {
+			err = s.store.QueryDocPaths(result.SQL, result.Args, func(path string) error {
+				t.sent[buildDocName(t.project, t.database, path)] = true
+				return nil
+			})
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // subScopesFromTarget extracts storage.SubScope entries from a watchTarget.
