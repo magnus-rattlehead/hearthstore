@@ -130,10 +130,11 @@ func (s *Server) applyWriteBatch(writes []*firestorepb.Write) ([]*firestorepb.Wr
 	}
 
 	// Slow path: wrap all writes in one tx for atomicity.
+	acc2 := storage.NewFsCommitAccumulator()
 	if err := s.store.RunInTx(func(tx *sql.Tx) error {
 		results = results[:0]
 		for _, w := range writes {
-			wr, err := s.applyWriteTx(tx, w)
+			wr, err := s.applyWriteTxAcc(tx, w, acc2)
 			if err != nil {
 				return err
 			}
@@ -143,6 +144,7 @@ func (s *Server) applyWriteBatch(writes []*firestorepb.Write) ([]*firestorepb.Wr
 	}); err != nil {
 		return nil, err
 	}
+	s.store.NotifyBatch(acc2.Events())
 	return results, nil
 }
 

@@ -51,7 +51,7 @@ func (s *Server) Commit(ctx context.Context, req *firestorepb.CommitRequest) (*f
 
 		// Slow path: writes with preconditions, update masks, transforms, or deletes.
 		for _, w := range req.Writes {
-			wr, err := s.applyWriteTx(tx, w)
+			wr, err := s.applyWriteTxAcc(tx, w, acc)
 			if err != nil {
 				return err
 			}
@@ -62,9 +62,7 @@ func (s *Server) Commit(ctx context.Context, req *firestorepb.CommitRequest) (*f
 		return nil, err
 	}
 
-	// Notify subscribers after the transaction has committed.
-	// On the fast path acc.Events() is populated; on the slow path events were
-	// already notified inline by the individual storage helpers.
+	// Notify subscribers after the transaction has committed (both fast and slow paths).
 	s.store.NotifyBatch(acc.Events())
 
 	return &firestorepb.CommitResponse{
