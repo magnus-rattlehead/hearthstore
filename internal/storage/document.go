@@ -921,6 +921,41 @@ func buildCollectionPath(parentPath, collection string) string {
 	return parentPath + "/" + collection
 }
 
+// ErrFsSortColumnNotDetected is returned by DetectFsSortColumn when no field_index
+// rows exist for the given sort field (empty collection or no docs with that field yet).
+var ErrFsSortColumnNotDetected = fmt.Errorf("no field_index rows for sort field")
+
+// DetectFsSortColumn probes field_index to find which value column a sort field uses.
+// Returns "value_int", "value_string", or "value_double" on success.
+func (s *Store) DetectFsSortColumn(project, database, collectionPath, fieldPath string) (string, error) {
+	var vStr *string
+	var vInt *int64
+	var vDouble *float64
+	err := s.rdb.QueryRow(
+		`SELECT value_string, value_int, value_double
+		 FROM field_index
+		 WHERE project=? AND database=? AND collection_path=? AND field_path=? AND in_array=0
+		 LIMIT 1`,
+		project, database, collectionPath, fieldPath,
+	).Scan(&vStr, &vInt, &vDouble)
+	if err == sql.ErrNoRows {
+		return "", ErrFsSortColumnNotDetected
+	}
+	if err != nil {
+		return "", fmt.Errorf("detect fs sort column: %w", err)
+	}
+	switch {
+	case vInt != nil:
+		return "value_int", nil
+	case vDouble != nil:
+		return "value_double", nil
+	case vStr != nil:
+		return "value_string", nil
+	default:
+		return "", ErrFsSortColumnNotDetected
+	}
+}
+
 // fiVals holds the typed value columns for one field_index row.
 // At most one field should be set per row.
 type fiVals struct {

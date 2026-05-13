@@ -177,6 +177,165 @@ func BuildPathOnly(project, database, parentPath string, allDescendants bool, q 
 	return &Result{SQL: sql, Args: finalArgs, NeedsGoFilter: b.needsGoFilter}, nil
 }
 
+// BuildSorted generates a SELECT d.data query driving FROM field_index INNER JOIN documents.
+// This allows SQLite to use idx_field_sort_int/str/dbl covering indexes for O(LIMIT) pagination
+// instead of scanning the entire collection for ORDER BY.
+//
+// Preconditions (caller must verify before calling):
+//   - Not allDescendants (requires exact collection_path match in field_index)
+//   - effectiveOrders has exactly 2 entries: [sortField ASC/DESC, __name__ ASC/DESC]
+//   - sortCol is the detected value column ("value_int", "value_string", "value_double")
+//   - sortField is the parsed field path (call ParseProtoFieldPath first)
+func BuildSorted(project, database, parentPath, collectionID string,
+	q *firestorepb.StructuredQuery, sortField, sortCol string) (*Result, error) {
+	if q == nil {
+		return nil, fmt.Errorf("nil StructuredQuery")
+	}
+
+	desc := len(q.OrderBy) > 0 && q.OrderBy[0].Direction == firestorepb.StructuredQuery_DESCENDING
+	effectiveOrders := addImplicitOrderBy(q.OrderBy, q.Where)
+
+	b := &builder{
+		project:    project,
+		database:   database,
+		parentPath: parentPath,
+	}
+
+	if q.Where != nil {
+		clause, args, needsGo := b.buildFilter(q.Where)
+		if clause != "" {
+			b.whereClauses = append(b.whereClauses, clause)
+			b.args = append(b.args, args...)
+		}
+		if needsGo {
+			b.needsGoFilter = true
+		}
+	}
+
+	if q.StartAt != nil && len(q.StartAt.Values) > 0 {
+		if clause, args := buildSortedCursor(q.StartAt, effectiveOrders, sortField, sortCol, true, desc); clause != "" {
+			b.whereClauses = append(b.whereClauses, clause)
+			b.args = append(b.args, args...)
+		}
+	}
+	if q.EndAt != nil && len(q.EndAt.Values) > 0 {
+		if clause, args := buildSortedCursor(q.EndAt, effectiveOrders, sortField, sortCol, false, desc); clause != "" {
+			b.whereClauses = append(b.whereClauses, clause)
+			b.args = append(b.args, args...)
+		}
+	}
+
+	collPath := collectionID
+	if parentPath != "" {
+		collPath = parentPath + "/" + collectionID
+	}
+
+	var sb strings.Builder
+	var args []any
+
+	sb.WriteString("SELECT d.data FROM field_index fi")
+	sb.WriteString("\n  INNER JOIN documents d ON d.project=fi.project AND d.database=fi.database AND d.path=fi.doc_path AND d.deleted=0")
+	sb.WriteString("\nWHERE fi.project=? AND fi.database=? AND fi.collection_path=? AND fi.field_path=? AND fi.in_array=0")
+	args = append(args, project, database, collPath, sortField)
+
+	for _, wc := range b.whereClauses {
+		sb.WriteString("\n  AND ")
+		sb.WriteString(wc)
+	}
+	args = append(args, b.args...)
+
+	dir := "ASC"
+	if desc {
+		dir = "DESC"
+	}
+	fmt.Fprintf(&sb, "\nORDER BY fi.%s %s, d.path %s", sortCol, dir, dir)
+
+	hasLimit := q.Limit != nil && q.Limit.Value > 0
+	hasOffset := q.Offset > 0
+	if hasLimit {
+		sb.WriteString("\nLIMIT ?")
+		args = append(args, int64(q.Limit.Value))
+	} else if hasOffset {
+		sb.WriteString("\nLIMIT -1")
+	}
+	if hasOffset {
+		sb.WriteString("\nOFFSET ?")
+		args = append(args, int64(q.Offset))
+	}
+
+	slog.Debug("query sorted", "sql", sb.String(), "args", args)
+	return &Result{SQL: sb.String(), Args: args, NeedsGoFilter: b.needsGoFilter}, nil
+}
+
+// buildSortedCursor generates the keyset WHERE clause for a StartAt/EndAt cursor
+// in a BuildSorted query. Uses fi.{sortCol} and d.path directly.
+func buildSortedCursor(cursor *firestorepb.Cursor, orders []*firestorepb.StructuredQuery_Order,
+	sortField, sortCol string, isStart bool, desc bool) (string, []any) {
+	if len(cursor.Values) == 0 || len(orders) == 0 {
+		return "", nil
+	}
+
+	var sortVal any
+	var docPath string
+	hasSortVal := false
+	hasDocPath := false
+
+	for i, o := range orders {
+		if i >= len(cursor.Values) {
+			break
+		}
+		fp := parseProtoFieldPath(o.Field.GetFieldPath())
+		v := cursor.Values[i]
+		if fp == sortField {
+			col, val, ok := scalarSQL(v)
+			if !ok || col != sortCol {
+				return "", nil // type mismatch; caller falls back to regular path
+			}
+			sortVal = val
+			hasSortVal = true
+		} else if fp == "__name__" {
+			if ref, ok := v.ValueType.(*firestorepb.Value_ReferenceValue); ok {
+				docPath = docPathFromRef(ref.ReferenceValue)
+				hasDocPath = true
+			}
+		}
+	}
+
+	if !hasSortVal {
+		return "", nil
+	}
+
+	// Keyset operators for ASC ordering:
+	//   StartAt before=true  (inclusive): (col > val) OR (col = val AND path >= docPath)
+	//   StartAt before=false (exclusive): (col > val) OR (col = val AND path >  docPath)
+	//   EndAt   before=false (inclusive): (col < val) OR (col = val AND path <= docPath)
+	//   EndAt   before=true  (exclusive): (col < val) OR (col = val AND path <  docPath)
+	var strictOp, pathOp string
+	if isStart {
+		if cursor.Before {
+			strictOp, pathOp = ">", ">="
+		} else {
+			strictOp, pathOp = ">", ">"
+		}
+	} else {
+		if cursor.Before {
+			strictOp, pathOp = "<", "<"
+		} else {
+			strictOp, pathOp = "<", "<="
+		}
+	}
+	if desc {
+		strictOp = flipDesc(strictOp, true)
+		pathOp = flipDesc(pathOp, true)
+	}
+
+	if !hasDocPath {
+		return fmt.Sprintf("fi.%s %s ?", sortCol, pathOp), []any{sortVal}
+	}
+	return fmt.Sprintf("(fi.%s %s ? OR (fi.%s = ? AND d.path %s ?))", sortCol, strictOp, sortCol, pathOp),
+		[]any{sortVal, sortVal, docPath}
+}
+
 type builder struct {
 	project, database, parentPath string
 	allDescendants                bool
@@ -246,6 +405,9 @@ func orderExpr(alias string, dir firestorepb.StructuredQuery_Direction) string {
 		alias, d,
 	)
 }
+
+// ParseProtoFieldPath is the exported form of parseProtoFieldPath.
+func ParseProtoFieldPath(s string) string { return parseProtoFieldPath(s) }
 
 // parseProtoFieldPath converts a Firestore proto field_path (which may contain
 // backtick-escaped segments for field names with special characters) to the

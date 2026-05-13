@@ -197,6 +197,21 @@ CREATE INDEX IF NOT EXISTS idx_field_numeric ON field_index
     (project, database, collection_path, field_path, value_int, value_double)
     WHERE in_array=0 AND (value_int IS NOT NULL OR value_double IS NOT NULL);
 
+-- Per-type sort covering indexes for INNER JOIN-driven ORDER BY queries.
+-- Driving FROM field_index INNER JOIN documents with these indexes yields
+-- O(LIMIT) scans instead of O(collection-size) for single-field ORDER BY.
+CREATE INDEX IF NOT EXISTS idx_field_sort_int ON field_index
+    (project, database, collection_path, field_path, value_int, doc_path)
+    WHERE in_array=0;
+
+CREATE INDEX IF NOT EXISTS idx_field_sort_str ON field_index
+    (project, database, collection_path, field_path, value_string, doc_path)
+    WHERE in_array=0;
+
+CREATE INDEX IF NOT EXISTS idx_field_sort_dbl ON field_index
+    (project, database, collection_path, field_path, value_double, doc_path)
+    WHERE in_array=0;
+
 -- Append-only change log for Listen resumeToken support.
 -- Every document write/delete appends a row; seq is the token value.
 CREATE TABLE IF NOT EXISTS document_changes (
@@ -250,6 +265,10 @@ var migrations = []string{
 	`CREATE INDEX IF NOT EXISTS idx_ds_field_sort_dbl ON ds_field_index (project, database, namespace, kind, field_path, value_double, doc_path) WHERE in_array = 0`,
 	// Covering index for path-cursor (no-sort) pagination.
 	`CREATE INDEX IF NOT EXISTS idx_ds_kind_path ON ds_documents (project, database, namespace, kind, path) WHERE deleted = 0`,
+	// Per-type sort covering indexes for Firestore INNER JOIN-driven ORDER BY.
+	`CREATE INDEX IF NOT EXISTS idx_field_sort_int ON field_index (project, database, collection_path, field_path, value_int, doc_path) WHERE in_array=0`,
+	`CREATE INDEX IF NOT EXISTS idx_field_sort_str ON field_index (project, database, collection_path, field_path, value_string, doc_path) WHERE in_array=0`,
+	`CREATE INDEX IF NOT EXISTS idx_field_sort_dbl ON field_index (project, database, collection_path, field_path, value_double, doc_path) WHERE in_array=0`,
 }
 
 func applyMigrations(db *sql.DB) error {
