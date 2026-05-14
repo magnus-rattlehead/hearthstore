@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/base64"
@@ -85,7 +86,7 @@ func (s *Server) Write(stream firestorepb.Firestore_WriteServer) error {
 			)
 		}
 		commitTime := timestamppb.Now()
-		writeResults, err := s.applyWriteBatch(req.Writes)
+		writeResults, err := s.applyWriteBatch(stream.Context(), req.Writes)
 		if err != nil {
 			slog.Debug("write: applyWriteBatch error", "err", err)
 			return err
@@ -105,14 +106,14 @@ func (s *Server) Write(stream firestorepb.Firestore_WriteServer) error {
 
 // applyWriteBatch applies a slice of writes atomically in one transaction.
 // Fast path if all writes are simple upserts; slow path (single tx) otherwise.
-func (s *Server) applyWriteBatch(writes []*firestorepb.Write) ([]*firestorepb.WriteResult, error) {
+func (s *Server) applyWriteBatch(ctx context.Context, writes []*firestorepb.Write) ([]*firestorepb.WriteResult, error) {
 	results := make([]*firestorepb.WriteResult, 0, len(writes))
 
 	// Fast path: all simple upserts → single tx via UpsertDocsManyTx.
 	if rows, project, database, ok := s.collectSimpleUpsertWrites(writes); ok {
 		acc := storage.NewFsCommitAccumulator()
 		var docs map[string]*firestorepb.Document
-		if err := s.store.RunInTx(func(tx *sql.Tx) error {
+		if err := s.store.RunBatchedTx(ctx, func(tx *sql.Tx) error {
 			var e error
 			docs, e = s.store.UpsertDocsManyTx(tx, project, database, rows, acc)
 			if e != nil {
@@ -131,7 +132,7 @@ func (s *Server) applyWriteBatch(writes []*firestorepb.Write) ([]*firestorepb.Wr
 
 	// Slow path: wrap all writes in one tx for atomicity.
 	acc2 := storage.NewFsCommitAccumulator()
-	if err := s.store.RunInTx(func(tx *sql.Tx) error {
+	if err := s.store.RunBatchedTx(ctx, func(tx *sql.Tx) error {
 		results = results[:0]
 		for _, w := range writes {
 			wr, err := s.applyWriteTxAcc(tx, w, acc2)

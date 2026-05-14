@@ -30,10 +30,17 @@ func (s *Server) Commit(ctx context.Context, req *firestorepb.CommitRequest) (*f
 		}
 	}
 
+	// Transactional commits use RunInTxCtx (isolated, precondition checks inside).
+	// Non-transactional commits use RunBatchedTx to coalesce concurrent RPCs.
+	runTx := s.store.RunBatchedTx
+	if len(req.Transaction) > 0 {
+		runTx = s.store.RunInTxCtx
+	}
+
 	var results []*firestorepb.WriteResult
 	acc := storage.NewFsCommitAccumulator()
 
-	if err := s.store.RunInTx(func(tx *sql.Tx) error {
+	if err := runTx(ctx, func(tx *sql.Tx) error {
 		results = make([]*firestorepb.WriteResult, 0, len(req.Writes))
 
 		// Fast path: all writes are simple full-replace upserts with no preconditions,

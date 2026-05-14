@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -235,10 +236,21 @@ CREATE INDEX IF NOT EXISTS idx_changes_doc ON document_changes
     (project, database, path, seq);
 `
 
+// batchJob is one write submitted to the group-commit loop.
+type batchJob struct {
+	ctx  context.Context
+	fn   func(*sql.Tx) error
+	done chan error // buffered(1); receives nil or error after commit
+}
+
 // Store is the disk-backed document store.
 type Store struct {
-	wdb *sql.DB // single write connection - serialises all mutations
-	rdb *sql.DB // read connection pool - concurrent readers, never blocks writers (WAL)
+	wdb  *sql.DB // single write connection - serialises all mutations
+	rdb  *sql.DB // read connection pool - concurrent readers, never blocks writers (WAL)
+	cpdb *sql.DB // dedicated checkpoint connection - never competes with wdb
+
+	batchCh    chan batchJob // group-commit queue for non-transactional writes
+	priorityCh chan batchJob // high-priority queue for isolated transactional commits
 
 	// pub/sub for real-time Listen delivery - sharded by (project, database, parent, collection)
 	subMu      sync.RWMutex
@@ -247,7 +259,8 @@ type Store struct {
 	byCollG    map[subCollGKey]map[uint64]chan ChangeEvent
 	nextID     uint64
 
-	done chan struct{} // closed by Close to stop the background checkpoint goroutine
+	done chan struct{}  // closed by Close to stop background goroutines
+	wg   sync.WaitGroup // tracks checkpointLoop + batchCommitLoop
 }
 
 // migrations holds ALTER TABLE statements that extend the schema after its
@@ -328,15 +341,29 @@ func New(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("setting mmap_size (read): %w", err)
 	}
 
+	// Dedicated checkpoint connection: keeps TRUNCATE checkpoint off wdb so the
+	// write path never stalls waiting for the checkpoint's busy-timeout (up to 5s).
+	cpdb, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("opening sqlite (checkpoint): %w", err)
+	}
+	cpdb.SetMaxOpenConns(1)
+	cpdb.SetMaxIdleConns(1)
+
 	s := &Store{
 		wdb:        wdb,
 		rdb:        rdb,
+		cpdb:       cpdb,
+		batchCh:    make(chan batchJob, 1024),
+		priorityCh: make(chan batchJob, 64),
 		subEntries: make(map[uint64]*subEntry),
 		byScope:    make(map[subScopeKey]map[uint64]chan ChangeEvent),
 		byCollG:    make(map[subCollGKey]map[uint64]chan ChangeEvent),
 		done:       make(chan struct{}),
 	}
-	go s.checkpointLoop()
+	s.wg.Add(2)
+	go func() { defer s.wg.Done(); s.checkpointLoop() }()
+	go func() { defer s.wg.Done(); s.batchCommitLoop() }()
 	return s, nil
 }
 
@@ -349,25 +376,30 @@ func (s *Store) checkpointLoop() {
 	for {
 		select {
 		case <-t.C:
-			_, _ = s.wdb.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+			_, _ = s.cpdb.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 		case <-s.done:
-			_, _ = s.wdb.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+			_, _ = s.cpdb.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 			return
 		}
 	}
 }
 
-// Close stops the background checkpoint goroutine and closes both connections.
+// Close stops background goroutines and closes all connections.
 func (s *Store) Close() error {
 	select {
 	case <-s.done:
 	default:
 		close(s.done)
 	}
+	s.wg.Wait() // ensure goroutines exit before DB connections close
 	rerr := s.rdb.Close()
+	cperr := s.cpdb.Close()
 	werr := s.wdb.Close()
 	if rerr != nil {
 		return rerr
+	}
+	if cperr != nil {
+		return cperr
 	}
 	return werr
 }
@@ -382,18 +414,27 @@ func (s *Store) DB() *sql.DB {
 // SQLite BUSY errors (database locked) are mapped to codes.Aborted so that
 // Datastore clients with retry logic will retry the transaction.
 func (s *Store) RunInTx(fn func(tx *sql.Tx) error) error {
-	tx, err := s.wdb.Begin()
-	if err != nil {
-		return wrapBusy(err)
+	return s.RunInTxCtx(context.Background(), fn)
+}
+
+// RunInTxCtx is like RunInTx but respects ctx cancellation. Sends through
+// priorityCh so the batch commit loop runs it immediately after its current
+// batch, ahead of any queued batch work.
+func (s *Store) RunInTxCtx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	job := batchJob{ctx: ctx, fn: fn, done: make(chan error, 1)}
+	select {
+	case s.priorityCh <- job:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.done:
+		return status.Error(codes.Unavailable, "store closed")
 	}
-	if err := fn(tx); err != nil {
-		tx.Rollback()
+	select {
+	case err := <-job.done:
 		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	if err := tx.Commit(); err != nil {
-		return wrapBusy(err)
-	}
-	return nil
 }
 
 // wrapBusy maps SQLite BUSY errors to codes.Aborted so clients will retry.
@@ -406,4 +447,182 @@ func wrapBusy(err error) error {
 		return status.Errorf(codes.Aborted, "database busy, retry the transaction: %v", err)
 	}
 	return err
+}
+
+const batchMaxSize = 512
+
+// batchTimeBudget caps how long one executeBatch cycle holds the write
+// connection. Self-tuning: fast fns pack many into one TX; slow fns (large
+// bulk upserts) pack fewer. Priority jobs still preempt between any two fns.
+const batchTimeBudget = 50 * time.Millisecond
+
+// RunBatchedTx submits fn to the group-commit loop. Concurrent callers are
+// merged into one SQLite transaction (up to a 50ms time budget), amortising
+// the WAL sync across all of them. Use this for
+// non-transactional writes (BulkWriter, BatchWrite, streaming Write) where
+// OCC isolation between concurrent RPCs is not required. For transactional
+// commits with OCC conflict checks, use RunInTxCtx instead.
+func (s *Store) RunBatchedTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	job := batchJob{ctx: ctx, fn: fn, done: make(chan error, 1)}
+	select {
+	case s.batchCh <- job:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case err := <-job.done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// batchCommitLoop coalesces concurrent writes into one SQLite transaction.
+// Priority jobs (RunInTxCtx) are drained before and after each batch so
+// transactional commits never wait more than one batch execution cycle.
+func (s *Store) batchCommitLoop() {
+	for {
+		// Drain any queued priority jobs before blocking on batch work.
+		s.drainPriorityCh()
+
+		var first batchJob
+		select {
+		case j := <-s.priorityCh:
+			// A priority job arrived while we were idle; run it and loop.
+			s.runPriorityJob(j)
+			continue
+		case first = <-s.batchCh:
+		case <-s.done:
+			s.drainPriorityCh()
+			s.drainBatchCh()
+			return
+		}
+
+		batch := []batchJob{first}
+	drain:
+		for len(batch) < batchMaxSize {
+			select {
+			case job := <-s.batchCh:
+				batch = append(batch, job)
+			default:
+				break drain
+			}
+		}
+
+		select {
+		case <-s.done:
+			s.executeBatch(batch)
+			s.drainPriorityCh()
+			s.drainBatchCh()
+			return
+		default:
+		}
+
+		s.executeBatch(batch)
+	}
+}
+
+func (s *Store) drainBatchCh() {
+	for {
+		select {
+		case j := <-s.batchCh:
+			j.done <- status.Error(codes.Unavailable, "store closing")
+		default:
+			return
+		}
+	}
+}
+
+// drainPriorityCh runs all currently-queued priority jobs (non-blocking).
+func (s *Store) drainPriorityCh() {
+	for {
+		select {
+		case j := <-s.priorityCh:
+			s.runPriorityJob(j)
+		default:
+			return
+		}
+	}
+}
+
+// runPriorityJob executes a single isolated transaction for a priority job.
+func (s *Store) runPriorityJob(j batchJob) {
+	if j.ctx.Err() != nil {
+		j.done <- j.ctx.Err()
+		return
+	}
+	j.done <- s.runSingleTx(j.fn)
+}
+
+// executeBatch runs jobs in one transaction. Breaks early to yield to priority
+// jobs if any arrive mid-batch, committing completed work and recursing for the
+// remainder. On commit failure falls back to per-job individual transactions.
+func (s *Store) executeBatch(batch []batchJob) {
+	// Drop jobs whose context already expired while waiting.
+	active := make([]batchJob, 0, len(batch))
+	for _, j := range batch {
+		if j.ctx.Err() != nil {
+			j.done <- j.ctx.Err()
+		} else {
+			active = append(active, j)
+		}
+	}
+	if len(active) == 0 {
+		return
+	}
+
+	tx, err := s.wdb.Begin()
+	if err != nil {
+		e := wrapBusy(err)
+		for _, j := range active {
+			j.done <- e
+		}
+		return
+	}
+
+	// Run fns until time budget exceeded or priority jobs arrive.
+	end := len(active)
+	anyErr := false
+	deadline := time.Now().Add(batchTimeBudget)
+	for i, j := range active {
+		if i > 0 && (len(s.priorityCh) > 0 || time.Now().After(deadline)) {
+			end = i
+			break
+		}
+		if err := j.fn(tx); err != nil {
+			anyErr = true
+			end = i + 1
+			break
+		}
+	}
+
+	ran, deferred := active[:end], active[end:]
+
+	if anyErr || func() bool { return wrapBusy(tx.Commit()) != nil }() {
+		tx.Rollback()
+		for _, j := range ran {
+			j.done <- s.runSingleTx(j.fn)
+		}
+	} else {
+		for _, j := range ran {
+			j.done <- nil
+		}
+	}
+
+	if len(deferred) > 0 {
+		s.drainPriorityCh()
+		s.executeBatch(deferred)
+	}
+}
+
+func (s *Store) runSingleTx(fn func(*sql.Tx) error) error {
+	tx, err := s.wdb.Begin()
+	if err != nil {
+		return wrapBusy(err)
+	}
+	if err := fn(tx); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return wrapBusy(tx.Commit())
 }

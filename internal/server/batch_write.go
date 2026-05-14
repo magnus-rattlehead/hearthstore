@@ -21,7 +21,7 @@ func (s *Server) BatchWrite(ctx context.Context, req *firestorepb.BatchWriteRequ
 	if rows, project, database, ok := s.collectSimpleUpsertWrites(req.Writes); ok {
 		acc := storage.NewFsCommitAccumulator()
 		var docs map[string]*firestorepb.Document
-		err := s.store.RunInTx(func(tx *sql.Tx) error {
+		err := s.store.RunBatchedTx(ctx, func(tx *sql.Tx) error {
 			var e error
 			docs, e = s.store.UpsertDocsManyTx(tx, project, database, rows, acc)
 			if e != nil {

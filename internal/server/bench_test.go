@@ -437,6 +437,47 @@ func BenchmarkBatchWrite_100(b *testing.B) {
 	b.ReportMetric(float64(b.N)*100/b.Elapsed().Seconds(), "writes/s")
 }
 
+// BenchmarkCommit_Concurrent measures throughput when N goroutines each commit
+// a single-write batch simultaneously. This is the workload where RunBatchedTx
+// group-commit coalescing is most beneficial: concurrent callers share one WAL sync.
+func BenchmarkCommit_Concurrent4(b *testing.B) {
+	benchConcurrentCommits(b, 4)
+}
+
+func BenchmarkCommit_Concurrent8(b *testing.B) {
+	benchConcurrentCommits(b, 8)
+}
+
+func BenchmarkCommit_Concurrent16(b *testing.B) {
+	benchConcurrentCommits(b, 16)
+}
+
+func benchConcurrentCommits(b *testing.B, concurrency int) {
+	b.Helper()
+	s := newBenchServer(b)
+	ctx := context.Background()
+	seedCommitDocs(b, s, "conc", concurrency)
+
+	b.ResetTimer()
+	b.SetParallelism(concurrency)
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			doc := fmt.Sprintf("doc%06d", i%concurrency)
+			if _, err := s.Commit(ctx, &firestorepb.CommitRequest{
+				Writes: []*firestorepb.Write{
+					benchWrite("conc", doc, map[string]*firestorepb.Value{"n": intVal(int64(i))}),
+				},
+			}); err != nil {
+				b.Errorf("Commit: %v", err)
+				return
+			}
+			i++
+		}
+	})
+	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "commits/s")
+}
+
 // ── Listen benchmarks ─────────────────────────────────────────────────────────
 
 // startListener creates a controlledListenStream, starts the Listen goroutine,

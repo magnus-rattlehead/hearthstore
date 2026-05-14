@@ -1,8 +1,11 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -651,6 +654,61 @@ func TestGetChangesSince_Dedup(t *testing.T) {
 	if results[0].Doc.Fields["v"].GetStringValue() != "second" {
 		t.Errorf("expected latest value %q, got %q", "second", results[0].Doc.Fields["v"].GetStringValue())
 	}
+}
+
+// TestRunInTxCtx_PriorityOverBatch verifies that RunInTxCtx completes promptly
+// even when the batch commit loop is saturated with slow RunBatchedTx work.
+// Without mid-batch preemption, RunInTxCtx would stall for the full duration of
+// whatever executeBatch is currently running (potentially many seconds).
+func TestRunInTxCtx_PriorityOverBatch(t *testing.T) {
+	s := newTestStore(t)
+
+	const batchWorkers = 8
+	const batchJobs = 200
+
+	// slowFn sleeps long enough that without preemption a full batch (batchMaxSize=64
+	// jobs × 20ms) would take >1s, exceeding the 500ms assertion below.
+	slowFn := func(tx *sql.Tx) error {
+		time.Sleep(20 * time.Millisecond)
+		return nil
+	}
+
+	// Flood the batch queue so executeBatch is always running a long batch.
+	var batchWg sync.WaitGroup
+	batchWg.Add(batchWorkers)
+	for i := 0; i < batchWorkers; i++ {
+		go func() {
+			defer batchWg.Done()
+			for j := 0; j < batchJobs/batchWorkers; j++ {
+				_ = s.RunBatchedTx(context.Background(), slowFn)
+			}
+		}()
+	}
+
+	// Let the flood fill the batch queue, then fire a priority TX.
+	time.Sleep(10 * time.Millisecond)
+
+	var completed atomic.Bool
+	start := time.Now()
+	err := s.RunInTxCtx(context.Background(), func(tx *sql.Tx) error {
+		completed.Store(true)
+		return nil
+	})
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("RunInTxCtx: %v", err)
+	}
+	if !completed.Load() {
+		t.Fatal("RunInTxCtx fn never ran")
+	}
+	// Mid-batch preemption means the priority job runs after at most one slowFn
+	// (20ms), not after the entire batch (>1s). Allow generous budget.
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("RunInTxCtx took %v under batch load; want < 500ms (mid-batch preemption not working)", elapsed)
+	}
+
+	batchWg.Wait()
 }
 
 func TestChangeEvent_CarriesSeq(t *testing.T) {

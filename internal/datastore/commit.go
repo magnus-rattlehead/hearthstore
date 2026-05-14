@@ -44,12 +44,16 @@ func (g *GRPCServer) Commit(ctx context.Context, req *datastorepb.CommitRequest)
 
 	commitTime := timestamppb.Now()
 
-	// Wrap all mutations in a single SQLite transaction for atomicity and
-	// performance (one WAL commit instead of two per mutation).
-	// The accumulator defers change-log and field-index writes so they can be
-	// flushed in bulk at the end, reducing SQL round-trips from O(n) to O(1).
+	// Transactional commits use RunInTxCtx (isolated, OCC conflict check inside).
+	// Non-transactional commits (BulkWriter) use RunBatchedTx so concurrent RPCs
+	// are coalesced into one SQLite transaction.
+	runTx := g.store.RunBatchedTx
+	if len(req.GetTransaction()) > 0 {
+		runTx = g.store.RunInTxCtx
+	}
+
 	var results []*datastorepb.MutationResult
-	if err := g.store.RunInTx(func(tx *sql.Tx) error {
+	if err := runTx(ctx, func(tx *sql.Tx) error {
 		if err := checkOCCConflicts(tx, entry.reads); err != nil {
 			return err
 		}
