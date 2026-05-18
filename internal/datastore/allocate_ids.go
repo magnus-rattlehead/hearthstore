@@ -48,10 +48,12 @@ func (s *Server) handleAllocateIds(w http.ResponseWriter, r *http.Request, proje
 	if req.ProjectId == "" {
 		req.ProjectId = project
 	}
+	SetHTTPDetails(r.Context(), DSAllocateIdsDetails(&req))
 	resp, err := s.grpc.AllocateIds(r.Context(), &req)
 	if err != nil {
 		writeGrpcErr(w, err)
 		return
 	}
+	MergeHTTPDetails(r.Context(), DSAllocateIdsResponseDetails(resp))
 	writeProtoJSON(w, resp)
 }

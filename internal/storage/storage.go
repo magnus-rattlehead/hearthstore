@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -27,12 +29,15 @@ type dbExec interface {
 // pragmaDSN applies these pragmas to every connection via DSN query params.
 // journal_mode=WAL is omitted - it's a file-level setting, set once on wdb.
 // wal_autocheckpoint=0 disables automatic checkpointing; a background goroutine
-// checkpoints every 30 s via PASSIVE mode so write transactions never block on it.
+// checkpoints every 30 s via TRUNCATE mode (resets WAL write position + shrinks
+// the file) so the WAL does not grow unbounded. PASSIVE-only checkpointing moves
+// frames to the DB but never resets the write pointer, so new writes always extend
+// the file - eventually filling the disk.
 // synchronous=OFF is safe for an emulator (developer tool; no crash-durability
 // requirement). It removes the checkpoint fsync entirely, the dominant cost for
 // write-heavy workloads. See: rqlite, phiresky sqlite-perf, ericdraken benchmarks.
 const pragmaDSN = "_synchronous=OFF" +
-	"&_busy_timeout=5000" +
+	"&_busy_timeout=30000" +
 	"&_cache_size=-524288" + // 512 MB - covers more B-tree hot pages
 	"&_foreign_keys=on" +
 	"&_stmt_cache_size=100" // per-connection prepared-statement LRU cache
@@ -95,7 +100,7 @@ CREATE INDEX IF NOT EXISTS idx_ds_changes_doc ON ds_document_changes
 CREATE INDEX IF NOT EXISTS idx_ds_changes_kind ON ds_document_changes
     (project, database, namespace, parent_path, kind, change_time);
 
--- Denormalized field values for Datastore entities — enables SQL filter pushdown.
+-- Denormalized field values for Datastore entities - enables SQL filter pushdown.
 -- Populated on every write; cleared on soft-delete.
 CREATE TABLE IF NOT EXISTS ds_field_index (
     project      TEXT NOT NULL,
@@ -248,6 +253,7 @@ type Store struct {
 	wdb  *sql.DB // single write connection - serialises all mutations
 	rdb  *sql.DB // read connection pool - concurrent readers, never blocks writers (WAL)
 	cpdb *sql.DB // dedicated checkpoint connection - never competes with wdb
+	dbPath string  // filesystem path for WAL stat
 
 	batchCh    chan batchJob // group-commit queue for non-transactional writes
 	priorityCh chan batchJob // high-priority queue for isolated transactional commits
@@ -259,8 +265,23 @@ type Store struct {
 	byCollG    map[subCollGKey]map[uint64]chan ChangeEvent
 	nextID     uint64
 
-	done chan struct{}  // closed by Close to stop background goroutines
+	done chan struct{}   // closed by Close to stop background goroutines
 	wg   sync.WaitGroup // tracks checkpointLoop + batchCommitLoop
+
+	// atomic counters - incremented on hot paths, read by the dashboard
+	commitTotal   atomic.Int64
+	commitErrors  atomic.Int64
+	batchJobsExec atomic.Int64
+	batchPreempt  atomic.Int64
+	occConflicts  atomic.Int64
+	listenEvents  atomic.Int64
+	rpcTotal      atomic.Int64
+	rpcErrors     atomic.Int64
+
+	// DBContentStats cache
+	dbStatsMu      sync.Mutex
+	dbStatsCached  DBContentStats
+	dbStatsExpires time.Time
 }
 
 // migrations holds ALTER TABLE statements that extend the schema after its
@@ -335,8 +356,8 @@ func New(dataDir string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening sqlite (read): %w", err)
 	}
-	rdb.SetMaxOpenConns(4)
-	rdb.SetMaxIdleConns(4)
+	rdb.SetMaxOpenConns(0) // unlimited; WAL allows arbitrary concurrent readers
+	rdb.SetMaxIdleConns(max(4, runtime.GOMAXPROCS(0)))
 	if _, err := rdb.Exec("PRAGMA mmap_size=8589934592"); err != nil {
 		return nil, fmt.Errorf("setting mmap_size (read): %w", err)
 	}
@@ -349,11 +370,17 @@ func New(dataDir string) (*Store, error) {
 	}
 	cpdb.SetMaxOpenConns(1)
 	cpdb.SetMaxIdleConns(1)
+	// Cap WAL file at 256 MB: SQLite truncates to this limit after a successful
+	// checkpoint, so the file can't grow beyond one checkpoint period's worth of writes.
+	if _, err := cpdb.Exec("PRAGMA journal_size_limit=268435456"); err != nil {
+		return nil, fmt.Errorf("setting journal_size_limit: %w", err)
+	}
 
 	s := &Store{
 		wdb:        wdb,
 		rdb:        rdb,
 		cpdb:       cpdb,
+		dbPath:     dbPath,
 		batchCh:    make(chan batchJob, 1024),
 		priorityCh: make(chan batchJob, 64),
 		subEntries: make(map[uint64]*subEntry),
@@ -367,9 +394,12 @@ func New(dataDir string) (*Store, error) {
 	return s, nil
 }
 
-// checkpointLoop runs a WAL checkpoint every 30 seconds so write transactions
-// never stall on the auto-checkpoint threshold (disabled via wal_autocheckpoint=0).
-// On Close it does a final TRUNCATE checkpoint to keep the WAL file small.
+// checkpointLoop runs a TRUNCATE WAL checkpoint every 30 seconds.
+// TRUNCATE (vs PASSIVE) resets the WAL write position and shrinks the WAL file
+// after moving frames to the main DB. Without the write-position reset, new writes
+// always extend the WAL at an ever-increasing offset - eventually filling the disk.
+// The cpdb busy_timeout (30 s) bounds how long we wait for active readers; if a
+// checkpoint times out the WAL grows by at most one interval's worth of writes.
 func (s *Store) checkpointLoop() {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
@@ -405,8 +435,139 @@ func (s *Store) Close() error {
 }
 
 // DB returns the write connection. Used only by tests that need direct DB access.
-func (s *Store) DB() *sql.DB {
-	return s.wdb
+func (s *Store) DB() *sql.DB { return s.wdb }
+
+// RDB returns the read connection pool.
+func (s *Store) RDB() *sql.DB { return s.rdb }
+
+// CPDB returns the checkpoint connection.
+func (s *Store) CPDB() *sql.DB { return s.cpdb }
+
+// BatchStats returns current group-commit queue depths.
+func (s *Store) BatchStats() (batchLen, batchCap, prioLen, prioCap int) {
+	return len(s.batchCh), cap(s.batchCh), len(s.priorityCh), cap(s.priorityCh)
+}
+
+// SubCount returns the number of active Listen subscribers.
+func (s *Store) SubCount() int {
+	s.subMu.RLock()
+	n := len(s.subEntries)
+	s.subMu.RUnlock()
+	return n
+}
+
+// ScopeCount returns the number of distinct scope shards.
+func (s *Store) ScopeCount() int {
+	s.subMu.RLock()
+	n := len(s.byScope)
+	s.subMu.RUnlock()
+	return n
+}
+
+// CollGroupCount returns the number of distinct collection-group shards.
+func (s *Store) CollGroupCount() int {
+	s.subMu.RLock()
+	n := len(s.byCollG)
+	s.subMu.RUnlock()
+	return n
+}
+
+// NextID returns the last assigned subscriber ID.
+func (s *Store) NextID() uint64 {
+	s.subMu.RLock()
+	id := s.nextID
+	s.subMu.RUnlock()
+	return id
+}
+
+// --- counter accessors ---
+
+func (s *Store) IncrCommitTotal()    { s.commitTotal.Add(1) }
+func (s *Store) IncrCommitError()    { s.commitErrors.Add(1) }
+func (s *Store) IncrBatchJob()       { s.batchJobsExec.Add(1) }
+func (s *Store) IncrBatchPreempt()   { s.batchPreempt.Add(1) }
+func (s *Store) IncrOCCConflict()    { s.occConflicts.Add(1) }
+func (s *Store) IncrListenEvent()    { s.listenEvents.Add(1) }
+func (s *Store) IncrRPC(isErr bool)  {
+	s.rpcTotal.Add(1)
+	if isErr {
+		s.rpcErrors.Add(1)
+	}
+}
+
+// CounterSnapshot holds a point-in-time read of all atomic counters.
+type CounterSnapshot struct {
+	CommitTotal   int64 `json:"commit_total"`
+	CommitErrors  int64 `json:"commit_errors"`
+	BatchJobsExec int64 `json:"batch_jobs_executed"`
+	BatchPreempt  int64 `json:"batch_preempted"`
+	OCCConflicts  int64 `json:"occ_conflicts"`
+	ListenEvents  int64 `json:"listen_events"`
+	RPCTotal      int64 `json:"rpc_total"`
+	RPCErrors     int64 `json:"rpc_errors"`
+}
+
+func (s *Store) CounterSnapshot() CounterSnapshot {
+	return CounterSnapshot{
+		CommitTotal:   s.commitTotal.Load(),
+		CommitErrors:  s.commitErrors.Load(),
+		BatchJobsExec: s.batchJobsExec.Load(),
+		BatchPreempt:  s.batchPreempt.Load(),
+		OCCConflicts:  s.occConflicts.Load(),
+		ListenEvents:  s.listenEvents.Load(),
+		RPCTotal:      s.rpcTotal.Load(),
+		RPCErrors:     s.rpcErrors.Load(),
+	}
+}
+
+// DBContentStats holds cached row counts and size info from the database.
+type DBContentStats struct {
+	Documents      int64 `json:"documents"`
+	DocChanges     int64 `json:"document_changes"`
+	FieldIndex     int64 `json:"field_index"`
+	DsDocuments    int64 `json:"ds_documents"`
+	DsDocChanges   int64 `json:"ds_document_changes"`
+	DsFieldIndex   int64 `json:"ds_field_index"`
+	DsIDSequences  int64 `json:"ds_id_sequences"`
+	DBSizeBytes    int64 `json:"db_size_bytes"`
+	WALSizeBytes   int64 `json:"wal_size_bytes"`
+	FreelistPages  int64 `json:"freelist_pages"`
+}
+
+// DBContentStats queries row counts and DB size, caching the result for 5s.
+func (s *Store) DBContentStats() DBContentStats {
+	s.dbStatsMu.Lock()
+	defer s.dbStatsMu.Unlock()
+	if time.Now().Before(s.dbStatsExpires) {
+		return s.dbStatsCached
+	}
+	var st DBContentStats
+	tables := []struct {
+		dest  *int64
+		query string
+	}{
+		{&st.Documents, `SELECT COUNT(*) FROM documents`},
+		{&st.DocChanges, `SELECT COUNT(*) FROM document_changes`},
+		{&st.FieldIndex, `SELECT COUNT(*) FROM field_index`},
+		{&st.DsDocuments, `SELECT COUNT(*) FROM ds_documents`},
+		{&st.DsDocChanges, `SELECT COUNT(*) FROM ds_document_changes`},
+		{&st.DsFieldIndex, `SELECT COUNT(*) FROM ds_field_index`},
+		{&st.DsIDSequences, `SELECT COUNT(*) FROM ds_id_sequences`},
+	}
+	for _, t := range tables {
+		_ = s.rdb.QueryRow(t.query).Scan(t.dest)
+	}
+	var pageCount, pageSize int64
+	_ = s.rdb.QueryRow(`PRAGMA page_count`).Scan(&pageCount)
+	_ = s.rdb.QueryRow(`PRAGMA page_size`).Scan(&pageSize)
+	_ = s.rdb.QueryRow(`PRAGMA freelist_count`).Scan(&st.FreelistPages)
+	st.DBSizeBytes = pageCount * pageSize
+	if fi, err := os.Stat(s.dbPath + "-wal"); err == nil {
+		st.WALSizeBytes = fi.Size()
+	}
+	s.dbStatsCached = st
+	s.dbStatsExpires = time.Now().Add(5 * time.Second)
+	return st
 }
 
 // RunInTx executes fn inside a SQLite write transaction. If fn returns an
@@ -431,6 +592,10 @@ func (s *Store) RunInTxCtx(ctx context.Context, fn func(tx *sql.Tx) error) error
 	}
 	select {
 	case err := <-job.done:
+		s.commitTotal.Add(1)
+		if err != nil {
+			s.commitErrors.Add(1)
+		}
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
@@ -482,13 +647,11 @@ func (s *Store) RunBatchedTx(ctx context.Context, fn func(*sql.Tx) error) error 
 // transactional commits never wait more than one batch execution cycle.
 func (s *Store) batchCommitLoop() {
 	for {
-		// Drain any queued priority jobs before blocking on batch work.
 		s.drainPriorityCh()
 
 		var first batchJob
 		select {
 		case j := <-s.priorityCh:
-			// A priority job arrived while we were idle; run it and loop.
 			s.runPriorityJob(j)
 			continue
 		case first = <-s.batchCh:
@@ -558,6 +721,15 @@ func (s *Store) runPriorityJob(j batchJob) {
 // jobs if any arrive mid-batch, committing completed work and recursing for the
 // remainder. On commit failure falls back to per-job individual transactions.
 func (s *Store) executeBatch(batch []batchJob) {
+	s.doExecuteBatch(batch, false)
+}
+
+// doExecuteBatch is the internal implementation of executeBatch.
+// earlyPreempt=true allows priority preemption before the first fn runs;
+// safe on recursive calls because priority was just drained by the caller.
+// The first (non-recursive) call uses earlyPreempt=false so at least one fn
+// always makes progress, preventing batch starvation under sustained priority load.
+func (s *Store) doExecuteBatch(batch []batchJob, earlyPreempt bool) {
 	// Drop jobs whose context already expired while waiting.
 	active := make([]batchJob, 0, len(batch))
 	for _, j := range batch {
@@ -580,12 +752,13 @@ func (s *Store) executeBatch(batch []batchJob) {
 		return
 	}
 
-	// Run fns until time budget exceeded or priority jobs arrive.
 	end := len(active)
 	anyErr := false
 	deadline := time.Now().Add(batchTimeBudget)
 	for i, j := range active {
-		if i > 0 && (len(s.priorityCh) > 0 || time.Now().After(deadline)) {
+		canPreempt := earlyPreempt || i > 0
+		if canPreempt && (len(s.priorityCh) > 0 || time.Now().After(deadline)) {
+			s.batchPreempt.Add(1)
 			end = i
 			break
 		}
@@ -594,6 +767,7 @@ func (s *Store) executeBatch(batch []batchJob) {
 			end = i + 1
 			break
 		}
+		s.batchJobsExec.Add(1)
 	}
 
 	ran, deferred := active[:end], active[end:]
@@ -611,7 +785,7 @@ func (s *Store) executeBatch(batch []batchJob) {
 
 	if len(deferred) > 0 {
 		s.drainPriorityCh()
-		s.executeBatch(deferred)
+		s.doExecuteBatch(deferred, true)
 	}
 }
 
@@ -622,7 +796,7 @@ func (s *Store) runSingleTx(fn func(*sql.Tx) error) error {
 	}
 	if err := fn(tx); err != nil {
 		tx.Rollback()
-		return err
+		return wrapBusy(err)
 	}
 	return wrapBusy(tx.Commit())
 }

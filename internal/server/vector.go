@@ -57,7 +57,7 @@ func cosineDist(a, b []float64) float64 {
 		magB += b[i] * b[i]
 	}
 	if magA == 0 || magB == 0 {
-		return 1.0 // undefined → maximum distance
+		return 1.0 // undefined -> maximum distance
 	}
 	sim := dot / (math.Sqrt(magA) * math.Sqrt(magB))
 	if sim > 1.0 {

@@ -430,7 +430,7 @@ func TestConcurrentReadWrite(t *testing.T) {
 	// Verify the write transaction is still open (our reads didn't wait for it).
 	select {
 	case <-writeDone:
-		t.Error("write transaction closed before we released it — test is invalid")
+		t.Error("write transaction closed before we released it - test is invalid")
 	default:
 	}
 

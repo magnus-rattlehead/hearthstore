@@ -164,7 +164,7 @@ func (s *Server) applyWriteWith(ops writeStoreOps, w *firestorepb.Write) (*fires
 					if status.Code(err) != codes.NotFound {
 						return nil, err
 					}
-					// Document doesn't exist — set({}, merge:true) should create it.
+					// Document doesn't exist - set({}, merge:true) should create it.
 					existing = &firestorepb.Document{Name: name, Fields: make(map[string]*firestorepb.Value)}
 				}
 				existing.Fields = applyUpdateMask(existing.Fields, op.Update.GetFields(), w.UpdateMask.FieldPaths)
@@ -230,7 +230,7 @@ func (s *Server) applyWriteWith(ops writeStoreOps, w *firestorepb.Write) (*fires
 		return &firestorepb.WriteResult{}, nil
 
 	case *firestorepb.Write_Transform:
-		// Legacy whole-document transform — apply field transforms to existing doc.
+		// Legacy whole-document transform - apply field transforms to existing doc.
 		dt := op.Transform
 		project, database, path, err := parseName(dt.Document)
 		if err != nil {
@@ -328,7 +328,7 @@ func splitFieldPath(path string) (head, tail string, nested bool) {
 	}
 	if path[0] == '`' {
 		// Backtick-quoted segment: scan for closing backtick, honouring \\ and \` escapes.
-		// The Firestore SDK encodes: \ → \\ and ` → \` inside backtick segments.
+		// The Firestore SDK encodes: \ -> \\ and ` -> \` inside backtick segments.
 		i := 1
 		for i < len(path) {
 			if path[i] == '\\' && i+1 < len(path) {
@@ -343,7 +343,7 @@ func splitFieldPath(path string) (head, tail string, nested bool) {
 			i++
 		}
 		rawName := path[1:i]
-		// Un-escape: process left-to-right, handling \\ → \ and \` → `
+		// Un-escape: process left-to-right, handling \\ -> \ and \` -> `
 		var unescBuf strings.Builder
 		unescBuf.Grow(len(rawName))
 		for j := 0; j < len(rawName); {

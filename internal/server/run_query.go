@@ -64,7 +64,7 @@ func compareDocNames(a, b string) int {
 	for i := 0; i < len(aSegs) && i < len(bSegs); i++ {
 		var cmp int
 		if i%2 == 1 {
-			// Document ID segment — apply virtual-ID ordering.
+			// Document ID segment - apply virtual-ID ordering.
 			aN, aVirtual := parseVirtualDocID(aSegs[i])
 			bN, bVirtual := parseVirtualDocID(bSegs[i])
 			switch {
@@ -86,7 +86,7 @@ func compareDocNames(a, b string) int {
 				}
 			}
 		} else {
-			// Collection ID or other non-document segment — regular string comparison.
+			// Collection ID or other non-document segment - regular string comparison.
 			if aSegs[i] < bSegs[i] {
 				cmp = -1
 			} else if aSegs[i] > bSegs[i] {
@@ -214,7 +214,7 @@ func (s *Server) RunQuery(req *firestorepb.RunQueryRequest, stream firestorepb.F
 				Offset:  q.Offset,
 				Limit:   q.Limit,
 			}
-			// Stage 7: INNER JOIN-driven sorted path — O(LIMIT) for single-field ORDER BY.
+			// Stage 7: INNER JOIN-driven sorted path - O(LIMIT) for single-field ORDER BY.
 			// Eligible when: non-allDescendants, exactly one non-__name__ sort field
 			// (plus implicit __name__ tiebreaker), no Go filter, no FindNearest, no explain.
 			if !analyzeExplain && !sel.AllDescendants && q.FindNearest == nil &&
@@ -504,7 +504,7 @@ func matchesFieldFilter(doc *firestorepb.Document, f *firestorepb.StructuredQuer
 		return compareValues(docVal, filterVal) == 0
 	case firestorepb.StructuredQuery_FieldFilter_NOT_EQUAL:
 		if docVal == nil {
-			return false // field absent — Firestore excludes these from NOT_EQUAL results
+			return false // field absent - Firestore excludes these from NOT_EQUAL results
 		}
 		if _, isNull := docVal.ValueType.(*firestorepb.Value_NullValue); isNull {
 			return false // null-valued field also excluded from NOT_EQUAL per Firestore semantics
@@ -612,7 +612,7 @@ func matchesUnaryFilter(doc *firestorepb.Document, f *firestorepb.StructuredQuer
 		if dv, ok := v.ValueType.(*firestorepb.Value_DoubleValue); ok {
 			return !math.IsNaN(dv.DoubleValue) // NaN double excluded
 		}
-		return true // int, string, bool, array, map — all pass IS_NOT_NAN
+		return true // int, string, bool, array, map - all pass IS_NOT_NAN
 	}
 	return true
 }
@@ -661,7 +661,7 @@ func compareValues(a, b *firestorepb.Value) int {
 		return 1
 	}
 
-	// Same non-numeric type — full per-type comparison.
+	// Same non-numeric type - full per-type comparison.
 	switch av := a.ValueType.(type) {
 	case *firestorepb.Value_BooleanValue:
 		bv := b.GetBooleanValue()
@@ -768,7 +768,7 @@ func numericFloat(v *firestorepb.Value) float64 {
 	return 0
 }
 
-// isVector returns true if v is a Firestore VectorValue — a MapValue whose
+// isVector returns true if v is a Firestore VectorValue - a MapValue whose
 // __type__ field equals "__vector__". Vectors sort between arrays (rank 8) and
 // plain maps (rank 10), and are compared by dimension then element values.
 func isVector(v *firestorepb.Value) bool {

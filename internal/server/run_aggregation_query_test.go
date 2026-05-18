@@ -333,7 +333,7 @@ func TestRunAggregationQuery_SumMixedIntDouble(t *testing.T) {
 		t.Fatal("expected aggregation result")
 	}
 	v := results[0].Result.AggregateFields["total"]
-	// Mixed int+double → result must be a double value.
+	// Mixed int+double -> result must be a double value.
 	dv, ok := v.ValueType.(*firestorepb.Value_DoubleValue)
 	if !ok {
 		t.Fatalf("mixed int+double sum should be DoubleValue, got %T", v.ValueType)

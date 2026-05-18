@@ -200,7 +200,7 @@ func TestPerf_BulkVsSequential(t *testing.T) {
 
 	// Bulk must not be more than 2x slower per entity than sequential.
 	if bulkElapsed > seqElapsed*2 {
-		t.Errorf("bulk commit (%v) is more than 2× slower than sequential (%v) — unexpected regression",
+		t.Errorf("bulk commit (%v) is more than 2x slower than sequential (%v) - unexpected regression",
 			bulkElapsed.Round(time.Millisecond), seqElapsed.Round(time.Millisecond))
 	}
 }

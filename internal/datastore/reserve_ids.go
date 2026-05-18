@@ -17,6 +17,7 @@ func (s *Server) handleReserveIds(w http.ResponseWriter, r *http.Request, projec
 	if !readProtoJSON(w, r.Body, &req) {
 		return
 	}
+	SetHTTPDetails(r.Context(), DSReserveIdsDetails(&req))
 	resp, err := s.grpc.ReserveIds(r.Context(), &req)
 	if err != nil {
 		writeGrpcErr(w, err)

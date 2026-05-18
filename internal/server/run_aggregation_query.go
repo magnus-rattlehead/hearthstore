@@ -111,7 +111,7 @@ func (s *Server) sqlAggregation(project, database, parentPath string, q *firesto
 
 	// Collect all field paths referenced by sum/avg aggregations. Firestore requires
 	// every document in a multi-aggregation query to have numeric values for ALL such
-	// fields — count() and other aggregations use the same filtered document set.
+	// fields - count() and other aggregations use the same filtered document set.
 	var requiredFields []string
 	seen := make(map[string]bool)
 	for _, agg := range aggs {
@@ -215,7 +215,7 @@ func (s *Server) sqlAggregation(project, database, parentPath string, q *firesto
 				}
 				// For AVG across multiple selectors we accumulate sum+count.
 				if existing, ok := fields[alias]; ok {
-					// fields[alias] is a MapValue encoding {sum, count} — but since we
+					// fields[alias] is a MapValue encoding {sum, count} - but since we
 					// can't store intermediate state in a *Value cleanly, re-query is
 					// simpler. In practice From always has one entry.
 					_ = existing

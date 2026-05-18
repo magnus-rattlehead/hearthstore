@@ -270,10 +270,13 @@ func (s *Server) handleRunAggregationQuery(w http.ResponseWriter, r *http.Reques
 	if req.ProjectId == "" {
 		req.ProjectId = project
 	}
+	start := time.Now()
+	SetHTTPDetails(r.Context(), DSAggregationQueryDetails(&req))
 	resp, err := s.grpc.RunAggregationQuery(r.Context(), &req)
 	if err != nil {
 		writeGrpcErr(w, err)
 		return
 	}
+	MergeHTTPDetails(r.Context(), DSAggregationResponseDetails(resp, time.Since(start)))
 	writeProtoJSON(w, resp)
 }

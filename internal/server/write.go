@@ -26,7 +26,7 @@ import (
 //  2. Server responds: WriteResponse{StreamId, StreamToken, CommitTime}
 //  3. Client sends batches: WriteRequest{StreamToken: prev, Writes: [...]}
 //  4. Server applies writes, responds: WriteResponse{StreamToken: new, WriteResults, CommitTime}
-//  5. Client closes → server returns nil
+//  5. Client closes -> server returns nil
 func (s *Server) Write(stream firestorepb.Firestore_WriteServer) error {
 	// Step 1: read handshake.
 	first, err := stream.Recv()
@@ -109,7 +109,7 @@ func (s *Server) Write(stream firestorepb.Firestore_WriteServer) error {
 func (s *Server) applyWriteBatch(ctx context.Context, writes []*firestorepb.Write) ([]*firestorepb.WriteResult, error) {
 	results := make([]*firestorepb.WriteResult, 0, len(writes))
 
-	// Fast path: all simple upserts → single tx via UpsertDocsManyTx.
+	// Fast path: all simple upserts -> single tx via UpsertDocsManyTx.
 	if rows, project, database, ok := s.collectSimpleUpsertWrites(writes); ok {
 		acc := storage.NewFsCommitAccumulator()
 		var docs map[string]*firestorepb.Document

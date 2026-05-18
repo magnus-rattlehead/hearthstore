@@ -104,7 +104,7 @@ func TestBatchWrite_PartialFailureReportedPerWrite(t *testing.T) {
 					},
 				},
 			},
-			// Update with must-exist precondition on a nonexistent doc — should fail.
+			// Update with must-exist precondition on a nonexistent doc - should fail.
 			{
 				CurrentDocument: &firestorepb.Precondition{
 					ConditionType: &firestorepb.Precondition_Exists{Exists: true},

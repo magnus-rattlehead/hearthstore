@@ -445,8 +445,6 @@ func TestRunQuery_StartAtEndAt_Range(t *testing.T) {
 // Ensure wrapperspb import is used (it's already imported in this file).
 var _ = wrapperspb.Int32(0)
 
-// ── additional filter tests ────────────────────────────────────────────────
-
 func nullVal() *firestorepb.Value {
 	return &firestorepb.Value{ValueType: &firestorepb.Value_NullValue{}}
 }
@@ -629,7 +627,7 @@ func TestRunQuery_AllDescendants(t *testing.T) {
 		}
 	}
 
-	// Collection group query — allDescendants=true.
+	// Collection group query - allDescendants=true.
 	stream := &fakeRunQueryStream{fakeServerStream: newFakeStream()}
 	err := s.RunQuery(&firestorepb.RunQueryRequest{
 		Parent: collectionParent(),
@@ -689,7 +687,7 @@ func TestRunQuery_NotEqual_MissingFieldExcluded(t *testing.T) {
 	seedDocs(t, s, "items", map[string]map[string]*firestorepb.Value{
 		"has-x-42":   {"x": intVal(42)},
 		"has-x-99":   {"x": intVal(99)},
-		"missing-x":  {"y": intVal(1)}, // no "x" field — must be excluded
+		"missing-x":  {"y": intVal(1)}, // no "x" field - must be excluded
 	})
 
 	docs := runQuery(t, s, &firestorepb.StructuredQuery{
@@ -716,7 +714,7 @@ func TestRunQuery_IsNotNull_MissingFieldExcluded(t *testing.T) {
 	}{
 		{"has-null", map[string]*firestorepb.Value{"x": nullVal()}},
 		{"has-int", map[string]*firestorepb.Value{"x": intVal(5)}},
-		{"missing", map[string]*firestorepb.Value{"y": intVal(1)}}, // no "x" — must be excluded
+		{"missing", map[string]*firestorepb.Value{"y": intVal(1)}}, // no "x" - must be excluded
 	} {
 		if _, err := s.CreateDocument(ctx, &firestorepb.CreateDocumentRequest{
 			Parent:       collectionParent(),
@@ -859,7 +857,7 @@ func TestRunQuery_MixedOps(t *testing.T) {
 		t.Fatalf("delete bob: %v", err)
 	}
 
-	// Query all players with score >= 20 — should return only carol (score=30) and alice (score=50).
+	// Query all players with score >= 20 - should return only carol (score=30) and alice (score=50).
 	docs := runQuery(t, s, &firestorepb.StructuredQuery{
 		From:  []*firestorepb.StructuredQuery_CollectionSelector{{CollectionId: "players"}},
 		Where: fieldFilter("score", firestorepb.StructuredQuery_FieldFilter_GREATER_THAN_OR_EQUAL, intVal(20)),
@@ -878,8 +876,6 @@ func TestRunQuery_MixedOps(t *testing.T) {
 		t.Error("alice's updated score=50 should appear in results")
 	}
 }
-
-// ── compareValues unit tests ───────────────────────────────────────────────
 
 func nanVal() *firestorepb.Value {
 	return &firestorepb.Value{ValueType: &firestorepb.Value_DoubleValue{DoubleValue: math.NaN()}}
@@ -1128,7 +1124,7 @@ func TestRunQuery_SnapshotReadAtTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create 'before': %v", err)
 	}
-	// Use "before"'s update_time as the snapshot — "after" will be created strictly later.
+	// Use "before"'s update_time as the snapshot - "after" will be created strictly later.
 	snapTime := beforeDoc.UpdateTime
 
 	// Create "after" at a later time.
@@ -1139,7 +1135,7 @@ func TestRunQuery_SnapshotReadAtTime(t *testing.T) {
 		t.Fatalf("create 'after': %v", err)
 	}
 
-	// Query at snapshot time — should only see "before".
+	// Query at snapshot time - should only see "before".
 	stream := &fakeRunQueryStream{fakeServerStream: newFakeStream()}
 	if err := s.RunQuery(&firestorepb.RunQueryRequest{
 		Parent: collectionParent(),

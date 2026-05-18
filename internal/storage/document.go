@@ -142,6 +142,7 @@ func (s *Store) Unsubscribe(id uint64) {
 
 // notify sends a ChangeEvent only to subscribers whose scope matches the event.
 func (s *Store) notify(ev ChangeEvent) {
+	s.listenEvents.Add(1)
 	s.subMu.RLock()
 	defer s.subMu.RUnlock()
 	send := func(shard map[uint64]chan ChangeEvent) {

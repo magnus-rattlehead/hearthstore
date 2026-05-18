@@ -17,7 +17,7 @@ func (s *Server) BatchWrite(ctx context.Context, req *firestorepb.BatchWriteRequ
 	writeResults := make([]*firestorepb.WriteResult, len(req.Writes))
 	writeStatus := make([]*statuspb.Status, len(req.Writes))
 
-	// Fast path: all simple upserts → single tx, one WAL sync instead of N.
+	// Fast path: all simple upserts -> single tx, one WAL sync instead of N.
 	if rows, project, database, ok := s.collectSimpleUpsertWrites(req.Writes); ok {
 		acc := storage.NewFsCommitAccumulator()
 		var docs map[string]*firestorepb.Document

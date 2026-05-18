@@ -44,10 +44,10 @@ func decodeResumeToken(token []byte) (streamID string, seq int64, ok bool) {
 type tokenState int
 
 const (
-	tokenNone      tokenState = iota // no ResumeType → full initial snapshot
-	tokenValidSeq                    // same stream, seq-based → delta via change log
-	tokenValidTime                   // read_time → delta via timestamp (GetDocsSince)
-	tokenStale                       // different stream or undecodable → full snapshot
+	tokenNone      tokenState = iota // no ResumeType -> full initial snapshot
+	tokenValidSeq                    // same stream, seq-based -> delta via change log
+	tokenValidTime                   // read_time -> delta via timestamp (GetDocsSince)
+	tokenStale                       // different stream or undecodable -> full snapshot
 )
 
 // tokenStateForTarget classifies the resume type of an AddTarget request.
@@ -85,8 +85,8 @@ type watchTarget struct {
 // Listen implements the bidi streaming real-time watch protocol.
 //
 // Protocol per message received:
-//   - AddTarget   → send ADD ack, stream initial snapshot, send CURRENT + NO_CHANGE
-//   - RemoveTarget → send REMOVE ack, clean up target
+//   - AddTarget   -> send ADD ack, stream initial snapshot, send CURRENT + NO_CHANGE
+//   - RemoveTarget -> send REMOVE ack, clean up target
 //
 // Change events from the store trigger DocumentChange / DocumentDelete / DocumentRemove
 // for each registered target, followed by a NO_CHANGE heartbeat.
@@ -200,7 +200,7 @@ func (s *Server) handleListenRequest(
 		case tokenStale:
 			// Different stream: full snapshot + forward any supplementary targets the
 			// SDK sent to the old session concurrently with creating this new session.
-			slog.Debug("listen: stale token → full snapshot", "stream", streamID, "target", t.id, "project", t.project, "db", t.database, "parent", t.parent)
+			slog.Debug("listen: stale token -> full snapshot", "stream", streamID, "target", t.id, "project", t.project, "db", t.database, "parent", t.parent)
 			if err := s.sendInitialSnapshot(stream, t); err != nil {
 				return err
 			}
@@ -208,17 +208,17 @@ func (s *Server) handleListenRequest(
 				return err
 			}
 		case tokenValidSeq:
-			slog.Debug("listen: seq token → diff snapshot", "stream", streamID, "target", t.id, "since_seq", sinceSeq)
+			slog.Debug("listen: seq token -> diff snapshot", "stream", streamID, "target", t.id, "since_seq", sinceSeq)
 			if err := s.sendDiffSnapshot(stream, t, sinceSeq); err != nil {
 				return err
 			}
 		case tokenValidTime:
-			slog.Debug("listen: read_time token → diff snapshot by time", "stream", streamID, "target", t.id)
+			slog.Debug("listen: read_time token -> diff snapshot by time", "stream", streamID, "target", t.id)
 			if err := s.sendDiffSnapshotByTime(stream, t, sinceTime); err != nil {
 				return err
 			}
 		default: // tokenNone
-			slog.Debug("listen: no token → initial snapshot", "stream", streamID, "target", t.id, "project", t.project, "db", t.database, "parent", t.parent)
+			slog.Debug("listen: no token -> initial snapshot", "stream", streamID, "target", t.id, "project", t.project, "db", t.database, "parent", t.parent)
 			if err := s.sendInitialSnapshot(stream, t); err != nil {
 				return err
 			}
@@ -374,7 +374,7 @@ func (s *Server) sendDiffSnapshot(
 		}
 	}
 
-	// Repopulate t.sent — path-only where possible to avoid full proto unmarshal.
+	// Repopulate t.sent - path-only where possible to avoid full proto unmarshal.
 	return s.repopulateSent(t)
 }
 
@@ -441,7 +441,7 @@ func (s *Server) fetchTargetDocs(t *watchTarget) ([]*firestorepb.Document, error
 			}
 			doc, err := s.store.GetDoc(t.project, t.database, path)
 			if err != nil {
-				continue // missing → not included in snapshot
+				continue // missing -> not included in snapshot
 			}
 			docs = append(docs, doc)
 		}

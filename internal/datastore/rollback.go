@@ -31,6 +31,7 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request, project 
 	if !readProtoJSON(w, r.Body, &req) {
 		return
 	}
+	SetHTTPDetails(r.Context(), DSRollbackDetails(&req))
 	resp, err := s.grpc.Rollback(r.Context(), &req)
 	if err != nil {
 		writeGrpcErr(w, err)

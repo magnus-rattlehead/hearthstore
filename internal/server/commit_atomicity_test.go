@@ -15,14 +15,14 @@ import (
 func TestCommitAtomic_RollsBackOnFailure(t *testing.T) {
 	s := newTestServer(t)
 
-	// Seed doc1 — will be deleted by write #1.
+	// Seed doc1 - will be deleted by write #1.
 	name1 := docName("things", "atomic1")
 	name2 := docName("things", "atomic2")
 	seedDoc(t, s, name1, map[string]*firestorepb.Value{"x": intVal(1)})
-	// name2 does NOT exist — write #2 will fail with exists=false precondition.
+	// name2 does NOT exist - write #2 will fail with exists=false precondition.
 
 	// Write #1: delete name1 (succeeds on its own)
-	// Write #2: update name2 with precondition exists=true (fails — doc missing)
+	// Write #2: update name2 with precondition exists=true (fails - doc missing)
 	_, err := s.Commit(context.Background(), &firestorepb.CommitRequest{
 		Database: "projects/" + testProject + "/databases/" + testDB,
 		Writes: []*firestorepb.Write{
@@ -49,7 +49,7 @@ func TestCommitAtomic_RollsBackOnFailure(t *testing.T) {
 		t.Errorf("want NotFound, got %v", got)
 	}
 
-	// Write #1 (delete name1) must have been rolled back — name1 should still exist.
+	// Write #1 (delete name1) must have been rolled back - name1 should still exist.
 	_, getErr := s.GetDocument(context.Background(), &firestorepb.GetDocumentRequest{Name: name1})
 	if getErr != nil {
 		t.Errorf("name1 should still exist after rollback, got: %v", getErr)

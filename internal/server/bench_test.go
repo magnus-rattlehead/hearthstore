@@ -69,8 +69,6 @@ func runBenchAggregation(b *testing.B, s *Server, q *firestorepb.StructuredAggre
 
 const benchN = 1000
 
-// ── Query benchmarks ──────────────────────────────────────────────────────────
-
 // BenchmarkQuery_SimpleEquality measures an equality filter over 1 000 docs.
 // Half the docs have score=1, the other half have score=0; query matches ~500.
 func BenchmarkQuery_SimpleEquality(b *testing.B) {
@@ -131,7 +129,7 @@ func BenchmarkQuery_CursorPagination(b *testing.B) {
 		OrderBy: orderBy,
 		Limit:   limit,
 	}
-	// Page 2: n in [10, 19] — StartAt exclusive after n=9
+	// Page 2: n in [10, 19] - StartAt exclusive after n=9
 	page2 := &firestorepb.StructuredQuery{
 		From:    []*firestorepb.StructuredQuery_CollectionSelector{{CollectionId: "bench"}},
 		OrderBy: orderBy,
@@ -141,7 +139,7 @@ func BenchmarkQuery_CursorPagination(b *testing.B) {
 			Before: false, // exclusive: start AFTER n=9
 		},
 	}
-	// Page 3: n in [20, 29] — StartAt exclusive after n=19
+	// Page 3: n in [20, 29] - StartAt exclusive after n=19
 	page3 := &firestorepb.StructuredQuery{
 		From:    []*firestorepb.StructuredQuery_CollectionSelector{{CollectionId: "bench"}},
 		OrderBy: orderBy,
@@ -193,8 +191,6 @@ func BenchmarkQuery_CompoundFilter(b *testing.B) {
 		runBenchQuery(b, s, q)
 	}
 }
-
-// ── Aggregation benchmarks ────────────────────────────────────────────────────
 
 // BenchmarkQuery_AggregationCount measures COUNT(*) over 1 000 docs.
 func BenchmarkQuery_AggregationCount(b *testing.B) {
@@ -255,8 +251,6 @@ func BenchmarkQuery_AggregationSum(b *testing.B) {
 		runBenchAggregation(b, s, q)
 	}
 }
-
-// ── Write benchmarks ──────────────────────────────────────────────────────────
 
 // BenchmarkWrite_UpsertSimple measures writing a 3-field document.
 func BenchmarkWrite_UpsertSimple(b *testing.B) {
@@ -325,8 +319,6 @@ func BenchmarkWrite_UpsertLargeArray(b *testing.B) {
 		}
 	}
 }
-
-// ── Commit RPC benchmarks ─────────────────────────────────────────────────────
 
 // benchDB returns the Firestore database resource path used by bench helpers.
 func benchDB() string {
@@ -478,8 +470,6 @@ func benchConcurrentCommits(b *testing.B, concurrency int) {
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "commits/s")
 }
 
-// ── Listen benchmarks ─────────────────────────────────────────────────────────
-
 // startListener creates a controlledListenStream, starts the Listen goroutine,
 // sends an AddTarget for the given collection (no token), and waits for the
 // initial snapshot to complete (ADD + docs + CURRENT + NO_CHANGE).
@@ -502,7 +492,7 @@ func BenchmarkListen_Notify100Subs_1Write(b *testing.B) {
 	ctx := context.Background()
 	db := benchDB()
 
-	// 100 listeners on disjoint empty collections (bench-N). Empty → 3 initial responses each.
+	// 100 listeners on disjoint empty collections (bench-N). Empty -> 3 initial responses each.
 	streams := make([]*controlledListenStream, 100)
 	for i := 0; i < 100; i++ {
 		streams[i] = startListener(b, s, db, fmt.Sprintf("notify100-%d", i), 1, 3)
@@ -551,7 +541,7 @@ func BenchmarkListen_Notify1Sub_100Writes(b *testing.B) {
 				b.Fatalf("Commit: %v", err)
 			}
 		}
-		// 100 writes × (DocumentChange + NO_CHANGE) = 200 new responses.
+		// 100 writes x (DocumentChange + NO_CHANGE) = 200 new responses.
 		if !st.waitForNResponses(base+200, 10*time.Second) {
 			b.Fatal("timeout waiting for 100 notifications")
 		}
@@ -624,7 +614,7 @@ func BenchmarkListen_DiffSnapshot_100Changes(b *testing.B) {
 			defer close(done)
 			_ = s.Listen(st)
 		}()
-		// read_time token → sendDiffSnapshotByTime, which calls fetchTargetDocs for t.sent.
+		// read_time token -> sendDiffSnapshotByTime, which calls fetchTargetDocs for t.sent.
 		st.sendReq(makeAddTargetReqWithReadTime(db, "diff10k", 1, readTime))
 		if !st.waitForNResponses(wantResponses, 60*time.Second) {
 			b.Fatal("timeout waiting for diff snapshot")

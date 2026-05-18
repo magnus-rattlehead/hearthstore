@@ -37,10 +37,12 @@ func (s *Server) handleBeginTransaction(w http.ResponseWriter, r *http.Request, 
 	if !readProtoJSON(w, r.Body, &req) {
 		return
 	}
+	SetHTTPDetails(r.Context(), DSBeginTxDetails(&req))
 	resp, err := s.grpc.BeginTransaction(r.Context(), &req)
 	if err != nil {
 		writeGrpcErr(w, err)
 		return
 	}
+	MergeHTTPDetails(r.Context(), DSBeginTxResponseDetails(resp))
 	writeProtoJSON(w, resp)
 }

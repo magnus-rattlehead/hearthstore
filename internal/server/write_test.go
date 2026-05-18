@@ -186,7 +186,7 @@ func TestWrite_SetMerge_NonExistentDoc(t *testing.T) {
 							},
 						},
 						UpdateMask: &firestorepb.DocumentMask{FieldPaths: []string{"version"}},
-						// No CurrentDocument precondition → set with merge, must create if absent.
+						// No CurrentDocument precondition -> set with merge, must create if absent.
 					},
 				},
 			},

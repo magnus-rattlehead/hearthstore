@@ -66,7 +66,6 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 
 	readAt, activeTxID, newTxIDForResp := g.resolveReadOptions(req.GetReadOptions())
 
-	// Build SQL filter clause for pushdown into DsQueryKind.
 	var filterSQL string
 	var filterArgs []any
 	var needsGoFilter bool
@@ -316,11 +315,14 @@ func (s *Server) handleRunQuery(w http.ResponseWriter, r *http.Request, project 
 	if req.ProjectId == "" {
 		req.ProjectId = project
 	}
+	start := time.Now()
+	SetHTTPDetails(r.Context(), DSQueryDetails(&req))
 	resp, err := s.grpc.RunQuery(r.Context(), &req)
 	if err != nil {
 		writeGrpcErr(w, err)
 		return
 	}
+	MergeHTTPDetails(r.Context(), DSQueryResponseDetails(resp, time.Since(start)))
 	writeProtoJSON(w, resp)
 }
 
@@ -586,7 +588,6 @@ func expandProjection(entity *datastorepb.Entity, fields []string) []*datastorep
 		if !ok || av.ArrayValue == nil || len(av.ArrayValue.Values) == 0 {
 			continue
 		}
-		// Expand: one row per array element.
 		var result []*datastorepb.Entity
 		for _, elem := range av.ArrayValue.Values {
 			props := make(map[string]*datastorepb.Value, len(fields))
@@ -601,7 +602,6 @@ func expandProjection(entity *datastorepb.Entity, fields []string) []*datastorep
 		}
 		return result
 	}
-	// No array expansion needed: return a single projected entity.
 	return []*datastorepb.Entity{projectEntity(entity, fields)}
 }
 

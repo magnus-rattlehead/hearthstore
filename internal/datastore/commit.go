@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"net/http"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -52,17 +53,60 @@ func (g *GRPCServer) Commit(ctx context.Context, req *datastorepb.CommitRequest)
 		runTx = g.store.RunInTxCtx
 	}
 
+	// Fast path: all mutations are simple upserts (complete key, baseVersion=0,
+	// no property mask, no transforms). Pre-compute outside the transaction since
+	// collectSimpleUpserts is pure computation.
+	bulkRows, isBulk := g.collectSimpleUpserts(req.ProjectId, database, req.Mutations)
+
 	var results []*datastorepb.MutationResult
+
+	// Non-transactional bulk upserts: split into small jobs so batchCommitLoop can
+	// preempt between chunks for transactional commits queued in priorityCh.
+	// A single 500-entity job can otherwise hold the write lock for several seconds.
+	if isBulk && len(req.GetTransaction()) == 0 {
+		const chunkSize = 10
+		results = make([]*datastorepb.MutationResult, 0, len(bulkRows))
+		for start := 0; start < len(bulkRows); start += chunkSize {
+			end := start + chunkSize
+			if end > len(bulkRows) {
+				end = len(bulkRows)
+			}
+			chunk := bulkRows[start:end]
+			var chunkResults []*datastorepb.MutationResult
+			if err := runTx(ctx, func(tx *sql.Tx) error {
+				acc := storage.NewCommitAccumulator()
+				versions, err := g.store.DsUpsertManyTx(tx, req.ProjectId, database, chunk, commitTime, acc)
+				if err != nil {
+					return err
+				}
+				chunkResults = make([]*datastorepb.MutationResult, 0, len(chunk))
+				for _, r := range chunk {
+					chunkResults = append(chunkResults, &datastorepb.MutationResult{
+						Version:    versions[r.Path],
+						UpdateTime: commitTime,
+					})
+				}
+				return acc.Flush(tx)
+			}); err != nil {
+				return nil, err
+			}
+			results = append(results, chunkResults...)
+		}
+		return &datastorepb.CommitResponse{
+			MutationResults: results,
+			CommitTime:      commitTime,
+		}, nil
+	}
+
 	if err := runTx(ctx, func(tx *sql.Tx) error {
 		if err := checkOCCConflicts(tx, entry.reads); err != nil {
+			g.store.IncrOCCConflict()
 			return err
 		}
 		acc := storage.NewCommitAccumulator()
 		results = make([]*datastorepb.MutationResult, 0, len(req.Mutations))
 
-		// Fast path: all mutations are simple upserts (complete key, baseVersion=0,
-		// no property mask, no transforms) - execute as one batch INSERT.
-		if bulkRows, ok := g.collectSimpleUpserts(req.ProjectId, database, req.Mutations); ok {
+		if isBulk {
 			versions, err := g.store.DsUpsertManyTx(tx, req.ProjectId, database, bulkRows, commitTime, acc)
 			if err != nil {
 				return err
@@ -102,11 +146,14 @@ func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, project st
 	if req.ProjectId == "" {
 		req.ProjectId = project
 	}
+	start := time.Now()
+	SetHTTPDetails(r.Context(), DSMutationDetails(&req))
 	resp, err := s.grpc.Commit(r.Context(), &req)
 	if err != nil {
 		writeGrpcErr(w, err)
 		return
 	}
+	MergeHTTPDetails(r.Context(), DSCommitResponseDetails(resp, time.Since(start)))
 	writeProtoJSON(w, resp)
 }
 

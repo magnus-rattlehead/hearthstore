@@ -70,7 +70,7 @@ var restOps = map[string]restOpEntry{
 }
 
 func (h *RESTHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// CORS — browser SDK calls are cross-origin (localhost:3000 → localhost:8081).
+	// CORS: browser SDK calls are cross-origin.
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		origin = "*"
@@ -94,7 +94,7 @@ func (h *RESTHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	colonIdx := strings.LastIndex(p, ":")
 	if colonIdx < 0 {
-		// No colon suffix → document CRUD (GET / PATCH / DELETE) or CreateDocument (POST).
+		// No colon suffix -> document CRUD (GET / PATCH / DELETE) or CreateDocument (POST).
 		h.handleCRUD(w, r, p, ctx)
 		return
 	}
@@ -130,7 +130,7 @@ func (h *RESTHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ── per-operation handlers ────────────────────────────────────────────────
+
 
 func (h *RESTHandler) handleCommit(ctx context.Context, w http.ResponseWriter, database string, body []byte) {
 	var req firestorepb.CommitRequest
@@ -252,7 +252,7 @@ func (h *RESTHandler) handleListCollectionIds(ctx context.Context, w http.Respon
 	restJSON(w, resp)
 }
 
-// ── document CRUD ─────────────────────────────────────────────────────────
+
 
 // handleCRUD handles GET / PATCH / DELETE / POST on document/collection paths.
 // p is the path after stripping the leading "/v1/" (no colon suffix).
@@ -421,7 +421,6 @@ func (h *RESTHandler) handleListDocuments(ctx context.Context, w http.ResponseWr
 	restJSON(w, resp)
 }
 
-// ── streaming collectors ──────────────────────────────────────────────────
 //
 // These implement the gRPC server-stream interfaces (Send + grpc.ServerStream)
 // so streaming RPCs can be called from an HTTP handler. Responses are collected
@@ -468,7 +467,7 @@ func (c *runAggregationQueryCollector) Send(r *firestorepb.RunAggregationQueryRe
 	return nil
 }
 
-// ── response helpers ──────────────────────────────────────────────────────
+
 
 func restJSON(w http.ResponseWriter, msg proto.Message) {
 	b, err := restMarshal.Marshal(msg)

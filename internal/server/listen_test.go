@@ -324,7 +324,7 @@ func TestListen_RealTimeDocumentChange(t *testing.T) {
 	}
 	baseline := len(stream.sent)
 
-	// Now write a new document — should trigger a DocumentChange.
+	// Now write a new document - should trigger a DocumentChange.
 	_, err := s.store.UpsertDoc(testProject, testDB, "things", "", "things/live1",
 		&firestorepb.Document{
 			Name:   docName("things", "live1"),
@@ -520,7 +520,7 @@ func TestListen_ResumeToken_DeltaOnly(t *testing.T) {
 		t.Fatalf("InsertDoc: %v", err)
 	}
 
-	// Single stream for both AddTargets (same streamID → delta path).
+	// Single stream for both AddTargets (same streamID -> delta path).
 	stream := newControlledListenStream()
 	done := make(chan error, 1)
 	go func() { done <- s.Listen(stream) }()
@@ -728,7 +728,7 @@ func TestListen_Query_StaleToken_FullSnapshot(t *testing.T) {
 	stream1.close()
 	<-done1
 
-	// Stream 2 (different streamID): reconnect with stream1's token → full snapshot, no RESET.
+	// Stream 2 (different streamID): reconnect with stream1's token -> full snapshot, no RESET.
 	stream2 := newControlledListenStream()
 	done2 := make(chan error, 1)
 	go func() { done2 <- s.Listen(stream2) }()
@@ -1041,7 +1041,7 @@ func TestListen_Documents_DiffToken_DocDeleted(t *testing.T) {
 
 // TestListen_Documents_StaleToken_FullSnapshot verifies that a resume token from a
 // different Listen stream triggers a full snapshot (without RESET) for a Documents target.
-// RESET is intentionally not sent — see TestListen_Query_StaleToken_FullSnapshot for rationale.
+// RESET is intentionally not sent - see TestListen_Query_StaleToken_FullSnapshot for rationale.
 // TestListen_Documents_StaleToken_FullSnapshot verifies that a resume token from a
 // different Listen stream triggers a full snapshot (without RESET) for a Documents target.
 func TestListen_Documents_StaleToken_FullSnapshot(t *testing.T) {
@@ -1071,7 +1071,7 @@ func TestListen_Documents_StaleToken_FullSnapshot(t *testing.T) {
 	stream1.close()
 	<-done1
 
-	// Stream 2 (different streamID): reconnect with stream1's token → full snapshot, no RESET.
+	// Stream 2 (different streamID): reconnect with stream1's token -> full snapshot, no RESET.
 	stream2 := newControlledListenStream()
 	done2 := make(chan error, 1)
 	go func() { done2 <- s.Listen(stream2) }()

@@ -256,7 +256,6 @@ func (s *Store) DsUpsertManyTx(tx *sql.Tx, project, database string, rows []Upse
 			deleted     = 0
 		RETURNING path, version`
 
-	// Marshal all entities up front.
 	type marshaledRow struct {
 		UpsertManyRow
 		data []byte
@@ -312,7 +311,6 @@ func (s *Store) DsUpsertManyTx(tx *sql.Tx, project, database string, rows []Upse
 		}
 	}
 
-	// Accumulate change-log and field-index operations for bulk flush.
 	for _, r := range mRows {
 		acc.changes = append(acc.changes, changeRow{
 			project: project, database: database, namespace: r.Namespace,
@@ -452,7 +450,6 @@ func dsDeleteExec(exec dbExec, project, database, namespace, path string, acc *C
 		return nil
 	}
 
-	// Immediate mode (non-transactional call): run SQL directly.
 	if _, err := exec.Exec(
 		`DELETE FROM ds_field_index WHERE project=? AND database=? AND namespace=? AND doc_path=?`,
 		project, database, namespace, path,
@@ -692,7 +689,6 @@ func (s *Store) runSingleSortQuery(
 	if cursor != nil && len(cursor.S) > 0 {
 		kv := cursor.S[0]
 		if kv.Null {
-			// Cursor landed on a null-valued entity.
 			if sort.Desc {
 				// Null comes last in DESC; remaining nulls are after cursor path.
 				fmt.Fprintf(&sb, ` AND (fi.%s IS NULL AND d.path > ?)`, sort.Col)

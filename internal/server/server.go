@@ -22,7 +22,7 @@ type Server struct {
 	// new WebChannel session that the SDK creates concurrently with sending those targets
 	// to the old session.
 	streamsMu sync.Mutex
-	streams   map[string]map[int32]*watchTarget // streamID → targetID → watchTarget
+	streams   map[string]map[int32]*watchTarget // streamID -> targetID -> watchTarget
 }
 
 type txEntry struct {

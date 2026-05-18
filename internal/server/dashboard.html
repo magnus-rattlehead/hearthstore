@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>hearthstore dashboard</title>
+  <style>
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+    }
+
+    :root {
+      --bg: #0d0d0d;
+      --bg2: #161616;
+      --bg3: #1e1e1e;
+      --border: #2a2a2a;
+      --text: #c9c9c9;
+      --muted: #555;
+      --accent: #f90;
+      --blue: #4a9eff;
+      --green: #3dba6e;
+      --red: #e05555;
+      --yellow: #e0a020;
+      --purple: #a07be0;
+      --teal: #3db8b8;
+    }
+
+    [data-theme="light"] {
+      --bg: #f4f4f4;
+      --bg2: #ffffff;
+      --bg3: #eaeaea;
+      --border: #d0d0d0;
+      --text: #1a1a1a;
+      --muted: #888;
+      --accent: #c97000;
+      --blue: #1a6fd4;
+      --green: #1e8c4a;
+      --red: #c0392b;
+      --yellow: #b07800;
+      --purple: #6b3fbf;
+      --teal: #1a8c8c;
+    }
+
+    body {
+      font-family: monospace;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 16px 20px;
+      font-size: 12px;
+    }
+
+    /* header */
+    .header {
+      display: flex;
+      align-items: baseline;
+      gap: 16px;
+      margin-bottom: 20px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .header h1 {
+      margin: 0;
+      color: var(--accent);
+      font-weight: 600;
+      letter-spacing: .5px;
+    }
+
+    .meta {
+      color: var(--muted);
+    }
+
+    /* stat row */
+    .stat-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .stat-card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 14px;
+    }
+
+    .stat-card .label {
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .8px;
+      margin-bottom: 4px;
+    }
+
+    .stat-card .value {
+      font-weight: 700;
+      line-height: 1.1;
+      margin-bottom: 3px;
+    }
+
+    .stat-card .sub {
+      color: var(--muted);
+      margin-bottom: 8px;
+      min-height: 1em;
+    }
+
+    /* grid */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 14px;
+    }
+
+    .card h2 {
+      margin: 0 0 10px;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      font-weight: 600;
+    }
+
+    /* kv table */
+    .kv {
+      border-collapse: collapse;
+      width: 100%;
+    }
+
+    .kv td {
+      padding: 3px 0;
+      vertical-align: middle;
+    }
+
+    .kv td:first-child {
+      color: var(--muted);
+      white-space: nowrap;
+      width: 55%;
+    }
+
+    .kv td:last-child {
+      color: var(--text);
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      white-space: normal;
+    }
+
+    .kv tr:hover td {
+      color: #eee;
+    }
+
+    /* bar */
+    .bar-bg {
+      height: 3px;
+      background: var(--border);
+      border-radius: 2px;
+      margin-top: 4px;
+    }
+
+    .bar-fill {
+      height: 3px;
+      border-radius: 2px;
+      transition: width .3s;
+    }
+
+    /* recent */
+    .recent {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .recent th {
+      color: var(--muted);
+      text-align: left;
+      padding: 3px 8px 6px 0;
+      border-bottom: 1px solid var(--border);
+      font-weight: normal;
+      white-space: nowrap;
+    }
+
+    .recent td {
+      padding: 2px 8px 2px 0;
+      white-space: nowrap;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .recent td.path {
+      max-width: 260px;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .recent tr.ok td {
+      color: var(--text);
+    }
+
+    .recent tr.warn td {
+      color: var(--yellow);
+    }
+
+    .recent tr.err td {
+      color: var(--red);
+    }
+
+    .recent tr:hover td {
+      background: var(--bg3);
+    }
+
+    /* theme toggle */
+    .theme-btn {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--muted);
+      cursor: pointer;
+      font: inherit;
+      padding: 2px 8px;
+      margin-left: auto;
+      transition: color .15s, border-color .15s;
+    }
+
+    .theme-btn:hover {
+      color: var(--text);
+      border-color: var(--muted);
+    }
+
+    /* rpc detail panel */
+    .rpc-panel {
+      position: fixed;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      width: 33vw;
+      min-width: 340px;
+      background: var(--bg2);
+      border-left: 1px solid var(--border);
+      padding: 16px;
+      transform: translateX(100%);
+      transition: transform .2s ease;
+      overflow-y: auto;
+      z-index: 100;
+    }
+
+    .rpc-panel.open {
+      transform: translateX(0);
+    }
+
+    .rpc-panel-close {
+      background: none;
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      font: inherit;
+      float: right;
+      padding: 0;
+      line-height: 1;
+    }
+
+    .rpc-panel-close:hover {
+      color: var(--text);
+    }
+
+    .rpc-panel h3 {
+      margin: 0 0 14px;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    .rpc-panel .err-block {
+      margin-top: 10px;
+      padding: 8px 10px;
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--red);
+      word-break: break-all;
+      white-space: pre-wrap;
+    }
+
+    .recent tr[data-idx] {
+      cursor: pointer;
+    }
+
+    .recent tr.selected td {
+      background: var(--bg3);
+    }
+
+    /* detail sections */
+    .rpc-section {
+      margin-top: 8px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+
+    .rpc-section>summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 5px 8px;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      cursor: pointer;
+      user-select: none;
+      list-style: none;
+      background: var(--bg3);
+    }
+
+    .rpc-section>summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .rpc-section-title {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .rpc-section-title::before {
+      content: '▸';
+      color: var(--muted);
+    }
+
+    details[open].rpc-section>summary .rpc-section-title::before {
+      content: '▾';
+    }
+
+    .rpc-section-body {
+      padding: 6px 8px;
+    }
+
+    .rpc-copy {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      color: var(--muted);
+      cursor: pointer;
+      font: inherit;
+      padding: 0 5px;
+      line-height: 1.4;
+    }
+
+    .rpc-copy:hover {
+      color: var(--text);
+      border-color: var(--muted);
+    }
+
+    .val-str {
+      color: var(--blue);
+    }
+
+    .val-num {
+      color: var(--green);
+    }
+
+    .val-bool {
+      color: var(--yellow);
+    }
+
+    .val-null {
+      color: var(--muted);
+      font-style: italic;
+    }
+
+    .val-arr {
+      color: var(--purple);
+    }
+
+  </style>
+</head>
+
+<body>
+
+  <div class="header">
+    <h1>hearthstore</h1>
+    <span id="uptime" style="color:var(--muted)"></span>
+    <span class="meta" id="ts" style="margin-left:auto"></span>
+    <button class="theme-btn" id="theme-toggle" onclick="toggleTheme()">light</button>
+  </div>
+
+  <div class="stat-row" id="stats"></div>
+
+
+  <div class="grid" id="detail"></div>
+
+  <div class="card" id="recent-card" style="margin-bottom:14px">
+    <h2>Recent RPCs <span style="color:var(--muted);font-weight:normal">(newest first)</span></h2>
+    <div id="recent-wrap"></div>
+  </div>
+
+  <div class="rpc-panel" id="rpc-panel">
+    <button class="rpc-panel-close" id="rpc-panel-close">×</button>
+    <h3>RPC Detail</h3>
+    <div id="rpc-panel-body"></div>
+  </div>
+
+  <script>
+    (function () {
+      const stored = localStorage.getItem('hs-theme');
+      const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+      const useDark = stored ? stored === 'dark' : prefersDark;
+      if (!useDark) {
+        document.documentElement.setAttribute('data-theme', 'light');
+        document.getElementById('theme-toggle').textContent = 'dark';
+      }
+    })();
+    function toggleTheme() {
+      const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+      if (isLight) {
+        document.documentElement.removeAttribute('data-theme');
+        localStorage.setItem('hs-theme', 'dark');
+        document.getElementById('theme-toggle').textContent = 'light';
+      } else {
+        document.documentElement.setAttribute('data-theme', 'light');
+        localStorage.setItem('hs-theme', 'light');
+        document.getElementById('theme-toggle').textContent = 'dark';
+      }
+    }
+
+    let recentEntries = [];
+    let selectedIdx = -1;
+    let _copySlots = {};
+
+    function esc(s) {
+      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    // --- detail panel helpers ---
+
+    const DETAIL_KEY_ORDER = [
+      // request
+      'kind', 'kinds', 'namespace', 'database', 'keys', 'paths', 'mutations', 'inserts',
+      'updates', 'upserts', 'deletes', 'mode', 'aggregations', 'aggregation_count',
+      'filter', 'order_by', 'limit', 'offset', 'start_cursor', 'keys_only', 'projection',
+      'distinct_on', 'transforms', 'transform_ops', 'property_masks', 'property_mask',
+      'read_time_at', 'request_txn', 'new_transaction', 'txn_id_prefix', 'previous_transaction',
+      'analyze', 'gql', 'parent_paths', 'transaction', 'collection', 'parent', 'group',
+      'page_size', 'doc', 'docs', 'mask', 'sets', 'merges', 'xforms', 'writes', 'collections',
+      // response
+      'found', 'missing', 'deferred', 'results', 'skipped_results', 'more_results',
+      'end_cursor', 'conflicts', 'allocated_keys', 'allocated_paths', 'allocated',
+      'allocated_ids', 'txn_returned', 'read_time', 'commit_time', 'elapsed_ms',
+      'write_results', 'successes', 'failures', 'field_count', 'update_time', 'create_time',
+      'scanned', 'execution_duration_ms', 'name',
+    ];
+
+    const RESPONSE_KEYS = new Set([
+      'found', 'missing', 'deferred', 'results', 'skipped_results', 'more_results',
+      'end_cursor', 'conflicts', 'allocated_keys', 'allocated_paths', 'allocated',
+      'allocated_ids', 'txn_returned', 'read_time', 'commit_time', 'elapsed_ms',
+      'write_results', 'successes', 'failures', 'field_count', 'update_time', 'create_time',
+      'scanned', 'execution_duration_ms', 'name', 'docs',
+    ]);
+
+    function isResponseKey(k) {
+      return RESPONSE_KEYS.has(k) || k.startsWith('agg_');
+    }
+
+    function valSpan(v) {
+      if (v === null || v === undefined) {
+        return '<span class="val-null">null</span>';
+      }
+      if (typeof v === 'boolean') {
+        return `<span class="val-bool">${v}</span>`;
+      }
+      if (typeof v === 'number') {
+        return `<span class="val-num">${v}</span>`;
+      }
+      if (Array.isArray(v)) {
+        const full = v.join(', ');
+        const display = v.length > 5
+          ? v.slice(0, 5).join(', ') + ' … +' + (v.length - 5) + ' more'
+          : full;
+        return `<span class="val-arr" title="${esc(full)}">${esc(display)}</span>`;
+      }
+      const s = String(v);
+      const display = s.length > 160 ? s.slice(0, 157) + '…' : s;
+      return `<span class="val-str" title="${esc(s)}">${esc(display)}</span>`;
+    }
+
+    function renderKV(entries) {
+      if (!entries.length) return '';
+      return '<table class="kv">' +
+        entries.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${valSpan(v)}</td></tr>`).join('') +
+        '</table>';
+    }
+
+    function orderedEntries(obj, filter) {
+      const done = new Set();
+      const out = [];
+      for (const k of DETAIL_KEY_ORDER) {
+        if (k in obj && (!filter || filter(k))) {out.push([k, obj[k]]); done.add(k);}
+      }
+      Object.keys(obj).filter(k => !done.has(k) && (!filter || filter(k))).sort()
+        .forEach(k => out.push([k, obj[k]]));
+      return out;
+    }
+
+    function panelCopy(slot, ev) {
+      ev.stopPropagation();
+      const text = _copySlots[slot];
+      if (text && navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+    }
+
+    function makeSection(title, entries, slot) {
+      if (!entries.length) return '';
+      _copySlots[slot] = JSON.stringify(Object.fromEntries(entries), null, 2);
+      return `<details open class="rpc-section">
+        <summary><span class="rpc-section-title">${esc(title)}</span>
+          <button class="rpc-copy" onclick="panelCopy('${slot}',event)">[copy]</button></summary>
+        <div class="rpc-section-body">${renderKV(entries)}</div>
+      </details>`;
+    }
+
+    function makeSummarySection(e) {
+      const statusColor = e.status >= 500 ? 'var(--red)' : e.status >= 400 ? 'var(--yellow)' : 'var(--green)';
+      const rows = [
+        ['time', e.t],
+        ['method', e.method || '—'],
+        ['path', e.path || '—'],
+        ['latency', e.latency_ms + ' ms'],
+        ['status', e.status || '—'],
+      ];
+      const tableRows = rows.map(([k, v]) => {
+        if (k === 'status') {
+          return `<tr><td>${esc(k)}</td><td style="color:${statusColor}">${esc(String(v))}</td></tr>`;
+        }
+        if (k === 'path') {
+          return `<tr><td>${esc(k)}</td><td style="word-break:break-all;color:var(--muted)">${esc(String(v))}</td></tr>`;
+        }
+        return `<tr><td>${esc(k)}</td><td>${esc(String(v))}</td></tr>`;
+      }).join('');
+      const slotData = JSON.stringify(Object.fromEntries(rows), null, 2);
+      _copySlots['summary'] = slotData;
+      return `<details open class="rpc-section">
+        <summary><span class="rpc-section-title">Summary</span>
+          <button class="rpc-copy" onclick="panelCopy('summary',event)">[copy]</button></summary>
+        <div class="rpc-section-body"><table class="kv">${tableRows}</table></div>
+      </details>`;
+    }
+
+    // --- end helpers ---
+
+    function openPanel(idx) {
+      const e = recentEntries[idx];
+      if (!e) return;
+      selectedIdx = idx;
+      document.querySelectorAll('.recent tbody tr').forEach(tr => tr.classList.remove('selected'));
+      const tr = document.querySelector(`.recent tbody tr[data-idx="${idx}"]`);
+      if (tr) tr.classList.add('selected');
+
+      _copySlots = {};
+      const details = e.details || {};
+      const reqEntries = orderedEntries(details, k => !isResponseKey(k));
+      const respEntries = orderedEntries(details, k => isResponseKey(k));
+
+      const errSection = e.err
+        ? `<div class="rpc-section" style="margin-top:8px;border-color:var(--red)">
+            <div class="rpc-section-body" style="color:var(--red);word-break:break-all;white-space:pre-wrap">${esc(e.err)}</div>
+          </div>`
+        : '';
+
+      document.getElementById('rpc-panel-body').innerHTML =
+        makeSummarySection(e) +
+        makeSection('Request', reqEntries, 'req') +
+        makeSection('Response', respEntries, 'resp') +
+        errSection;
+
+      document.getElementById('rpc-panel').classList.add('open');
+    }
+
+    function closePanel() {
+      selectedIdx = -1;
+      document.getElementById('rpc-panel').classList.remove('open');
+      document.querySelectorAll('.recent tbody tr').forEach(tr => tr.classList.remove('selected'));
+    }
+
+    const MAX_HIST = 90;
+    const history = [];
+
+    function pushHist(d) {
+      const c = d.counters, rt = d.runtime, s = d.storage;
+      const p = history[history.length - 1];
+      history.push({
+        commits: p ? c.commit_total - p._ca : 0,
+        rpcs: p ? c.rpc_total - p._ra : 0,
+        listen: p ? c.listen_events - p._la : 0,
+        heap_mb: rt.heap_inuse_mb,
+        goroutines: rt.goroutines,
+        _ca: c.commit_total, _ra: c.rpc_total, _la: c.listen_events,
+      });
+      if (history.length > MAX_HIST) history.shift();
+    }
+
+    function fmt(n, d) {
+      d = d || 0;
+      if (n == null) return '—';
+      if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+      if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+      return Number(n).toFixed(d);
+    }
+    function fmtBytes(b) {
+      if (b >= 1 << 30) return (b / (1 << 30)).toFixed(2) + ' GB';
+      if (b >= 1 << 20) return (b / (1 << 20)).toFixed(1) + ' MB';
+      if (b >= 1 << 10) return (b / (1 << 10)).toFixed(0) + ' KB';
+      return b + ' B';
+    }
+    function fmtUptime(sec) {
+      const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
+      return [h, m, s].map(x => String(x).padStart(2, '0')).join(':');
+    }
+
+    function sparkline(values, color) {
+      const W = 200, H = 36;
+      if (values.length < 2) return `<svg viewBox="0 0 ${W} ${H}" style="display:block;width:100%;height:${H}px"></svg>`;
+      const max = Math.max(...values, 1);
+      const pts = values.map((v, i) => {
+        const x = (i / (values.length - 1)) * W;
+        const y = H - (v / max) * (H - 3) - 1;
+        return `${x.toFixed(1)},${y.toFixed(1)}`;
+      }).join(' ');
+      const area = `M0,${H} L${pts} L${W},${H} Z`;
+      const line = `M${pts}`;
+      const gid = 'sp' + color.replace(/[^a-z0-9]/gi, '');
+      return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;width:100%;height:${H}px">
+    <defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="${color}" stop-opacity=".45"/>
+      <stop offset="100%" stop-color="${color}" stop-opacity=".03"/>
+    </linearGradient></defs>
+    <path d="${area}" fill="url(#${gid})"/>
+    <path d="${line}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
+  </svg>`;
+    }
+
+    function bar(val, cap, color) {
+      const pct = cap > 0 ? Math.min(100, (val / cap) * 100) : 0;
+      const c = pct > 80 ? 'var(--red)' : pct > 50 ? 'var(--yellow)' : (color || 'var(--green)');
+      return `<div class="bar-bg"><div class="bar-fill" style="width:${pct.toFixed(1)}%;background:${c}"></div></div>`;
+    }
+
+    function kv(pairs) {
+      return `<table class="kv">${pairs.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('')}</table>`;
+    }
+
+    function statCard(label, value, sub, sparkVals, color) {
+      const sp = sparkVals && sparkVals.length > 1 ? sparkline(sparkVals, color) : `<div style="height:36px"></div>`;
+      return `<div class="stat-card">
+    <div class="label">${label}</div>
+    <div class="value" style="color:${color}">${value}</div>
+    <div class="sub">${sub || ''}</div>
+    ${sp}
+  </div>`;
+    }
+
+    function render(d) {
+      pushHist(d);
+      const c = d.counters, s = d.storage, rt = d.runtime, db = d.db;
+
+      const hC = history.map(h => h.commits);
+      const hR = history.map(h => h.rpcs);
+      const hL = history.map(h => h.listen);
+      const hH = history.map(h => h.heap_mb);
+      const hG = history.map(h => h.goroutines);
+
+      const last = history[history.length - 1];
+      const cRate = last ? (last.commits / 2).toFixed(1) : '—';
+      const rRate = last ? (last.rpcs / 2).toFixed(1) : '—';
+      const lRate = last ? (last.listen / 2).toFixed(1) : '—';
+
+      document.getElementById('uptime').textContent = 'up ' + fmtUptime(d.uptime_sec);
+
+      document.getElementById('stats').innerHTML = [
+        statCard('commits/s', cRate, `total ${fmt(c.commit_total)}  err ${fmt(c.commit_errors)}`, hC, 'var(--green)'),
+        statCard('rpcs/s', rRate, `total ${fmt(c.rpc_total)}  err ${fmt(c.rpc_errors)}`, hR, 'var(--blue)'),
+        statCard('listen/s', lRate, `events ${fmt(c.listen_events)}  subs ${s.sub_entries}`, hL, 'var(--purple)'),
+        statCard('heap', rt.heap_inuse_mb.toFixed(1) + ' MB', `sys ${rt.sys_mb.toFixed(0)} MB  gc×${rt.num_gc}`, hH, 'var(--teal)'),
+        statCard('goroutines', rt.goroutines, `GOMAXPROCS ${rt.gomaxprocs}`, hG, 'var(--yellow)'),
+        statCard('occ conflicts', fmt(c.occ_conflicts), `batch preemptions ${fmt(c.batch_preempted)}`, null, c.occ_conflicts > 0 ? 'var(--red)' : 'var(--muted)'),
+      ].join('');
+
+      document.getElementById('detail').innerHTML = [
+        `<div class="card"><h2>Storage</h2>
+      ${kv([
+          ['batch_ch', `${s.batch_ch.len} / ${s.batch_ch.cap}`],
+          ['priority_ch', `${s.priority_ch.len} / ${s.priority_ch.cap}`],
+          ['subscribers', s.sub_entries],
+          ['scopes', s.by_scope],
+          ['coll groups', s.by_coll_g],
+          ['wdb open/use/idle', `${s.wdb.open}/${s.wdb.in_use}/${s.wdb.idle}`],
+          ['rdb open/use/idle', `${s.rdb.open}/${s.rdb.in_use}/${s.rdb.idle}`],
+          ['cpdb open/use/idle', `${s.cpdb.open}/${s.cpdb.in_use}/${s.cpdb.idle}`],
+          ['wdb waits', `${fmt(s.wdb.wait_count)} × ${fmt(s.wdb.wait_duration_ms, 1)} ms`],
+        ])}
+      ${bar(s.batch_ch.len, s.batch_ch.cap)}
+    </div>`,
+
+        `<div class="card"><h2>Database</h2>
+      ${kv([
+          ['documents', fmt(db.documents)],
+          ['doc_changes', fmt(db.document_changes)],
+          ['field_index', fmt(db.field_index)],
+          ['ds_documents', fmt(db.ds_documents)],
+          ['ds_doc_changes', fmt(db.ds_document_changes)],
+          ['ds_field_index', fmt(db.ds_field_index)],
+          ['ds_id_sequences', fmt(db.ds_id_sequences)],
+          ['db_size', fmtBytes(db.db_size_bytes)],
+          ['wal_size', fmtBytes(db.wal_size_bytes)],
+          ['freelist_pages', fmt(db.freelist_pages)],
+        ])}
+    </div>`,
+
+        `<div class="card"><h2>Runtime</h2>
+      ${kv([
+          ['goroutines', rt.goroutines],
+          ['rss', rt.rss_mb > 0 ? rt.rss_mb.toFixed(1) + ' MB' : '—'],
+          ['alloc', rt.alloc_mb.toFixed(1) + ' MB'],
+          ['heap_inuse', rt.heap_inuse_mb.toFixed(1) + ' MB'],
+          ['sys', rt.sys_mb.toFixed(1) + ' MB'],
+          ['heap_objects', fmt(rt.heap_objects)],
+          ['gc_cycles', rt.num_gc],
+          ['gc_pause_total', rt.pause_total_ms.toFixed(1) + ' ms'],
+          ['GOMAXPROCS', rt.gomaxprocs],
+        ])}
+    </div>`,
+      ].join('');
+
+      recentEntries = (d.recent || []).slice(-60).reverse();
+      const rows = recentEntries.map((e, i) => {
+        const cls = e.status >= 500 ? 'err' : e.status >= 400 ? 'warn' : 'ok';
+        const path = e.path || '';
+        const shortPath = path.length > 60 ? '…' + path.slice(-59) : path;
+        return `<tr class="${cls}" data-idx="${i}">
+      <td style="color:var(--muted)">${esc(e.t)}</td>
+      <td style="color:var(--muted);width:52px">${esc(e.method || '')}</td>
+      <td class="path" title="${esc(path)}">${esc(shortPath)}</td>
+      <td style="text-align:right;width:60px">${e.latency_ms}ms</td>
+      <td style="text-align:right;width:48px">${e.status || ''}</td>
+    </tr>`;
+      }).join('');
+      document.getElementById('recent-wrap').innerHTML =
+        `<table class="recent"><thead><tr>
+      <th>time</th><th>method</th><th>path</th>
+      <th style="text-align:right">lat</th><th style="text-align:right">status</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+      if (selectedIdx >= 0) {
+        const sel = document.querySelector(`.recent tbody tr[data-idx="${selectedIdx}"]`);
+        if (sel) sel.classList.add('selected');
+      }
+    }
+
+    async function poll() {
+      try {
+        const r = await fetch('/_/metrics');
+        if (r.ok) render(await r.json());
+      } catch (e) {console.error(e);}
+      setTimeout(poll, 2000);
+    }
+    poll();
+
+    document.getElementById('recent-wrap').addEventListener('click', function (ev) {
+      const tr = ev.target.closest('tr[data-idx]');
+      if (!tr) return;
+      const idx = parseInt(tr.dataset.idx, 10);
+      if (idx === selectedIdx) {closePanel(); return;}
+      openPanel(idx);
+    });
+    document.getElementById('rpc-panel-close').addEventListener('click', closePanel);
+    document.addEventListener('keydown', function (ev) {if (ev.key === 'Escape') closePanel();});
+  </script>
+</body>
+
+</html>

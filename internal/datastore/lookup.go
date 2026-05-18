@@ -3,6 +3,7 @@ package datastore
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -138,10 +139,13 @@ func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request, project st
 	if req.ProjectId == "" {
 		req.ProjectId = project
 	}
+	start := time.Now()
+	SetHTTPDetails(r.Context(), DSLookupDetails(&req))
 	resp, err := s.grpc.Lookup(r.Context(), &req)
 	if err != nil {
 		writeGrpcErr(w, err)
 		return
 	}
+	MergeHTTPDetails(r.Context(), DSLookupResponseDetails(resp, time.Since(start)))
 	writeProtoJSON(w, resp)
 }

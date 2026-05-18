@@ -207,7 +207,7 @@ func TestUpdateMask_NestedFieldPath(t *testing.T) {
 	// Seed with address.city="NYC", address.zip="10001"
 	seedDoc(t, s, name, map[string]*firestorepb.Value{"address": mapVal("NYC", "10001")})
 
-	// Update only address.city → "LA", leaving address.zip intact.
+	// Update only address.city -> "LA", leaving address.zip intact.
 	commit(t, s, &firestorepb.Write{
 		Operation: &firestorepb.Write_Update{
 			Update: &firestorepb.Document{

@@ -42,8 +42,8 @@ func buildDocName(project, database, path string) string {
 
 // splitDocPath extracts (collection, parentPath, docID) from a document path.
 //
-//	"users/u1"         → collection="users", parentPath="",          docID="u1"
-//	"a/b/users/u1"    → collection="users", parentPath="a/b",       docID="u1"
+//	"users/u1"        -> collection="users", parentPath="",    docID="u1"
+//	"a/b/users/u1"   -> collection="users", parentPath="a/b", docID="u1"
 func splitDocPath(path string) (collection, parentPath, docID string) {
 	parts := strings.Split(path, "/")
 	docID = parts[len(parts)-1]

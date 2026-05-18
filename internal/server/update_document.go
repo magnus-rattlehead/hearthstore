@@ -45,7 +45,7 @@ func (s *Server) UpdateDocument(ctx context.Context, req *firestorepb.UpdateDocu
 		return s.store.UpsertDoc(project, database, collection, parentPath, path, existing)
 	}
 
-	// Without an update mask: full replace (upsert — creates if document does not exist).
+	// Without an update mask: full replace (upsert - creates if document does not exist).
 	stub := &firestorepb.Document{Name: name, Fields: req.Document.GetFields()}
 	return s.store.UpsertDoc(project, database, collection, parentPath, path, stub)
 }

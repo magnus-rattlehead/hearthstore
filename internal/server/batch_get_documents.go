@@ -16,7 +16,7 @@ func (s *Server) BatchGetDocuments(req *firestorepb.BatchGetDocumentsRequest, st
 
 	// Handle inline transaction selector.
 	var txID []byte
-	var snapReadTime *timestamppb.Timestamp // non-nil → read as of this time
+	var snapReadTime *timestamppb.Timestamp // non-nil -> read as of this time
 	switch cs := req.ConsistencySelector.(type) {
 	case *firestorepb.BatchGetDocumentsRequest_NewTransaction:
 		id := newAutoID()

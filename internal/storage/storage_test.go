@@ -554,7 +554,7 @@ func TestCurrentSeq_IncrementsOnWrite(t *testing.T) {
 	upsertTestDoc(t, s, "things/b", "x", "2")
 	seq2, _ := s.CurrentSeq(testProject, testDB)
 	if seq2 <= seq1 {
-		t.Errorf("CurrentSeq did not increment: %d → %d", seq1, seq2)
+		t.Errorf("CurrentSeq did not increment: %d -> %d", seq1, seq2)
 	}
 }
 
@@ -667,7 +667,7 @@ func TestRunInTxCtx_PriorityOverBatch(t *testing.T) {
 	const batchJobs = 200
 
 	// slowFn sleeps long enough that without preemption a full batch (batchMaxSize=64
-	// jobs × 20ms) would take >1s, exceeding the 500ms assertion below.
+	// jobs x 20ms) would take >1s, exceeding the 500ms assertion below.
 	slowFn := func(tx *sql.Tx) error {
 		time.Sleep(20 * time.Millisecond)
 		return nil
