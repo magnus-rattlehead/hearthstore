@@ -85,8 +85,10 @@ func (s *Server) Write(stream firestorepb.Firestore_WriteServer) error {
 				"precondition", w.CurrentDocument,
 			)
 		}
+		opStart := time.Now()
 		commitTime := timestamppb.Now()
 		writeResults, err := s.applyWriteBatch(stream.Context(), req.Writes)
+		s.recordWriteBatch(req, opStart, err)
 		if err != nil {
 			slog.Debug("write: applyWriteBatch error", "err", err)
 			return err

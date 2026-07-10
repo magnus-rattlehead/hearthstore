@@ -13,6 +13,7 @@ import (
 type Server struct {
 	firestorepb.UnimplementedFirestoreServer
 	store *storage.Store
+	ops   *OperationLog
 
 	txMu sync.Mutex
 	txns map[string]txEntry // active transaction IDs
@@ -36,4 +37,9 @@ func New(store *storage.Store) *Server {
 		txns:    make(map[string]txEntry),
 		streams: make(map[string]map[int32]*watchTarget),
 	}
+}
+
+// SetOperationLog enables dashboard operation recording for logical stream events.
+func (s *Server) SetOperationLog(ops *OperationLog) {
+	s.ops = ops
 }

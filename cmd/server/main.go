@@ -67,8 +67,6 @@ const logo = `
 
 `
 
-// prefixWriter prepends "[hearthstore] " to each log line, so the tag appears
-// before the structured fields rather than inside msg=.
 type prefixWriter struct{ w io.Writer }
 
 func (pw prefixWriter) Write(p []byte) (int, error) {
@@ -84,14 +82,14 @@ func main() {
 	startTime := time.Now()
 	fmt.Fprint(os.Stderr, logo)
 
-	port          := flag.Int("port", 8080, "gRPC listen port (Firestore Native)")
-	webPort       := flag.Int("web-port", 0, "gRPC-Web HTTP listen port (0 = disabled)")
+	port := flag.Int("port", 8080, "gRPC listen port (Firestore Native)")
+	webPort := flag.Int("web-port", 0, "gRPC-Web HTTP listen port (0 = disabled)")
 	datastoreAddr := flag.String("datastore-addr", ":8456", "HTTP listen address (Datastore REST API)")
-	dataDir       := flag.String("data-dir", defaultDataDir(), "Directory for SQLite database files (default: $HEARTHSTORE_DATA_DIR or ~/.hearthstore)")
-	mode          := flag.String("mode", "both", "Server mode: firestore | datastore | both")
-	logLevel      := flag.String("log-level", "info", "Log level: debug | info | warn | error")
-	indexConfig   := flag.String("index-config", "", "Path to index.yaml for Datastore composite index configuration")
-	reindexDS     := flag.Bool("reindex-ds", false, "Rebuild ds_field_index from ds_documents then serve normally")
+	dataDir := flag.String("data-dir", defaultDataDir(), "Directory for SQLite database files (default: $HEARTHSTORE_DATA_DIR or ~/.hearthstore)")
+	mode := flag.String("mode", "both", "Server mode: firestore | datastore | both")
+	logLevel := flag.String("log-level", "info", "Log level: debug | info | warn | error")
+	indexConfig := flag.String("index-config", "", "Path to index.yaml for Datastore composite index configuration")
+	reindexDS := flag.Bool("reindex-ds", false, "Rebuild ds_field_index from ds_documents then serve normally")
 	flag.Parse()
 
 	var level slog.Level
@@ -119,24 +117,24 @@ func main() {
 		slog.Info("ds_field_index rebuild complete")
 	}
 
-	ring := server.NewRecentRing(200)
-	dash := server.NewDashboard(store, ring, startTime)
-	unary, streaming := makeGRPCInterceptors(store, ring)
+	ops := server.NewOperationLog(startTime.Format("20060102T150405.000000000Z0700"))
+	dash := server.NewDashboard(store, ops, startTime)
+	unary, streaming := makeGRPCInterceptors(store, ops)
 
 	switch *mode {
 	case "firestore":
-		serveFirestore(*port, *webPort, store, ring, dash, unary, streaming)
+		serveFirestore(*port, *webPort, store, ops, dash, unary, streaming)
 	case "datastore":
-		serveDatastore(*datastoreAddr, store, *indexConfig, ring, dash, unary)
+		serveDatastore(*datastoreAddr, store, *indexConfig, ops, dash, unary)
 	case "both":
-		go serveFirestore(*port, *webPort, store, ring, dash, unary, streaming)
-		serveDatastore(*datastoreAddr, store, *indexConfig, ring, dash, unary)
+		go serveFirestore(*port, *webPort, store, ops, dash, unary, streaming)
+		serveDatastore(*datastoreAddr, store, *indexConfig, ops, dash, unary)
 	default:
 		log.Fatalf("unknown mode %q: use firestore, datastore, or both", *mode)
 	}
 }
 
-func serveFirestore(port, webPort int, store *storage.Store, ring *server.RecentRing, dash http.Handler, unary grpc.UnaryServerInterceptor, streaming grpc.StreamServerInterceptor) {
+func serveFirestore(port, webPort int, store *storage.Store, ops *server.OperationLog, dash http.Handler, unary grpc.UnaryServerInterceptor, streaming grpc.StreamServerInterceptor) {
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		log.Fatalf("firestore: failed to listen: %v", err)
@@ -146,13 +144,14 @@ func serveFirestore(port, webPort int, store *storage.Store, ring *server.Recent
 		grpc.ChainStreamInterceptor(streaming),
 	)
 	fsServer := server.New(store)
+	fsServer.SetOperationLog(ops)
 	firestorepb.RegisterFirestoreServer(grpcServer, fsServer)
 	reflection.Register(grpcServer)
 	slog.Info("hearthstore listening", "protocol", "grpc+rest", "port", port)
 	slog.Info("set env var", "FIRESTORE_EMULATOR_HOST", fmt.Sprintf("localhost:%d", port))
 
 	if webPort > 0 {
-		go serveGRPCWeb(webPort, grpcServer, fsServer)
+		go serveGRPCWeb(webPort, grpcServer, fsServer, store, ops)
 	}
 
 	// Single port: gRPC, WebChannel (/channel paths), REST, and dashboard.
@@ -185,7 +184,7 @@ func serveFirestore(port, webPort int, store *storage.Store, ring *server.Recent
 			wcHandler.ServeHTTP(w, r)
 			return
 		}
-		restHandler.ServeHTTP(w, r)
+		loggingFirestoreRESTMiddleware(restHandler, store, ops).ServeHTTP(w, r)
 	})
 	httpSrv := &http.Server{Handler: h2c.NewHandler(mixed, &http2.Server{})}
 	if err := httpSrv.Serve(lis); err != nil {
@@ -194,7 +193,7 @@ func serveFirestore(port, webPort int, store *storage.Store, ring *server.Recent
 }
 
 // serveGRPCWeb serves WebChannel, REST, and gRPC-Web on a separate port.
-func serveGRPCWeb(port int, grpcServer *grpc.Server, fsServer *server.Server) {
+func serveGRPCWeb(port int, grpcServer *grpc.Server, fsServer *server.Server, store *storage.Store, ops *server.OperationLog) {
 	wrapped := grpcweb.WrapServer(grpcServer,
 		grpcweb.WithOriginFunc(func(origin string) bool { return true }),
 		grpcweb.WithWebsockets(true),
@@ -225,7 +224,7 @@ func serveGRPCWeb(port int, grpcServer *grpc.Server, fsServer *server.Server) {
 				return
 			}
 			if strings.HasPrefix(r.URL.Path, "/v1/") {
-				restHandler.ServeHTTP(w, r)
+				loggingFirestoreRESTMiddleware(restHandler, store, ops).ServeHTTP(w, r)
 				return
 			}
 			if wrapped.IsGrpcWebRequest(r) || wrapped.IsAcceptableGrpcCorsRequest(r) || wrapped.IsGrpcWebSocketRequest(r) {
@@ -241,7 +240,7 @@ func serveGRPCWeb(port int, grpcServer *grpc.Server, fsServer *server.Server) {
 	}
 }
 
-func makeGRPCInterceptors(store *storage.Store, ring *server.RecentRing) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
+func makeGRPCInterceptors(store *storage.Store, ops *server.OperationLog) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
 	unary := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		start := time.Now()
 		resp, err := handler(ctx, req)
@@ -252,7 +251,7 @@ func makeGRPCInterceptors(store *storage.Store, ring *server.RecentRing) (grpc.U
 		} else {
 			details = requestDetails(req)
 		}
-		logRPC(store, ring, shortMethod(info.FullMethod), requestAttrs(req), details, 0, dur, err)
+		logRPC(store, ops, "grpc", shortMethod(info.FullMethod), "", requestAttrs(req), details, 0, dur, err)
 		return resp, err
 	}
 	streaming := func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
@@ -267,7 +266,7 @@ func makeGRPCInterceptors(store *storage.Store, ring *server.RecentRing) (grpc.U
 			}
 			d["docs"] = cs.sent
 		}
-		logRPC(store, ring, shortMethod(info.FullMethod), requestAttrs(cs.firstReq), d, cs.sent, dur, err)
+		logRPC(store, ops, "grpc", shortMethod(info.FullMethod), "", requestAttrs(cs.firstReq), d, cs.sent, dur, err)
 		return err
 	}
 	return unary, streaming
@@ -297,22 +296,24 @@ func (s *countingStream) SendMsg(m any) error {
 }
 
 // logRPC emits a structured log line and records metrics.
-func logRPC(store *storage.Store, ring *server.RecentRing, method string, attrs []any, details map[string]any, sent int, dur time.Duration, err error) {
+func logRPC(store *storage.Store, ops *server.OperationLog, source, method, path string, attrs []any, details map[string]any, sent int, dur time.Duration, err error) {
 	isErr := err != nil
 	if store != nil {
 		store.IncrRPC(isErr)
 	}
-	if ring != nil && !strings.HasPrefix(method, "_/") {
-		e := server.RecentEntry{
-			T:         time.Now(),
+	if ops != nil && !strings.HasPrefix(method, "_/") && method != "Write" && method != "Listen" {
+		e := server.OperationEntry{
+			T:         time.Now().Add(-dur),
+			Source:    source,
 			Method:    method,
+			Path:      path,
 			LatencyMs: dur.Milliseconds(),
 			Details:   details,
 		}
 		if err != nil {
 			e.Err = grpcstatus.Convert(err).Message()
 		}
-		ring.Add(e)
+		ops.Add(e)
 	}
 
 	base := []any{"method", method}
@@ -911,7 +912,7 @@ func queryAttrs(parent string, q *firestorepb.StructuredQuery) []any {
 	return attrs
 }
 
-func serveDatastore(addr string, store *storage.Store, indexConfig string, ring *server.RecentRing, dash http.Handler, unary grpc.UnaryServerInterceptor) {
+func serveDatastore(addr string, store *storage.Store, indexConfig string, ops *server.OperationLog, dash http.Handler, unary grpc.UnaryServerInterceptor) {
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatalf("datastore: failed to listen: %v", err)
@@ -939,7 +940,7 @@ func serveDatastore(addr string, store *storage.Store, indexConfig string, ring 
 			grpcServer.ServeHTTP(w, r)
 			return
 		}
-		loggingHTTPMiddleware(ds.Handler(), store, ring).ServeHTTP(w, r)
+		loggingHTTPMiddleware(ds.Handler(), store, ops).ServeHTTP(w, r)
 	})
 	httpSrv := &http.Server{Handler: h2c.NewHandler(mixed, &http2.Server{})}
 	if err := httpSrv.Serve(lis); err != nil {
@@ -958,7 +959,67 @@ func (w *loggingResponseWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
-func loggingHTTPMiddleware(next http.Handler, store *storage.Store, ring *server.RecentRing) http.Handler {
+func loggingFirestoreRESTMiddleware(next http.Handler, store *storage.Store, ops *server.OperationLog) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+		start := time.Now()
+		lw := &loggingResponseWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(lw, r)
+		dur := time.Since(start).Round(time.Microsecond)
+
+		method := firestoreRESTMethod(r)
+		isErr := lw.status >= 500
+		if store != nil {
+			store.IncrRPC(isErr)
+		}
+		if ops != nil && !strings.HasPrefix(r.URL.Path, "/_/") {
+			e := server.OperationEntry{
+				T:         start,
+				Source:    "firestore_rest",
+				Method:    method,
+				Path:      r.URL.Path,
+				LatencyMs: dur.Milliseconds(),
+				Status:    lw.status,
+			}
+			if lw.status >= 400 {
+				e.Err = http.StatusText(lw.status)
+			}
+			ops.Add(e)
+		}
+
+		attrs := []any{"method", method, "status", lw.status, "duration", dur}
+		if lw.status >= 500 {
+			slog.Error("http", attrs...)
+		} else if lw.status >= 400 {
+			slog.Warn("http", attrs...)
+		} else {
+			slog.Info("http", attrs...)
+		}
+	})
+}
+
+func firestoreRESTMethod(r *http.Request) string {
+	if i := strings.LastIndex(r.URL.Path, ":"); i >= 0 {
+		return r.URL.Path[i+1:]
+	}
+	switch r.Method {
+	case http.MethodGet:
+		return "GetDocument"
+	case http.MethodPost:
+		return "CreateDocument"
+	case http.MethodPatch:
+		return "UpdateDocument"
+	case http.MethodDelete:
+		return "DeleteDocument"
+	default:
+		return r.Method
+	}
+}
+
+func loggingHTTPMiddleware(next http.Handler, store *storage.Store, ops *server.OperationLog) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		lw := &loggingResponseWriter{ResponseWriter: w, status: http.StatusOK}
@@ -976,15 +1037,20 @@ func loggingHTTPMiddleware(next http.Handler, store *storage.Store, ring *server
 		if store != nil {
 			store.IncrRPC(isErr)
 		}
-		if ring != nil && !strings.HasPrefix(r.URL.Path, "/_/") {
-			ring.Add(server.RecentEntry{
+		if ops != nil && !strings.HasPrefix(r.URL.Path, "/_/") {
+			e := server.OperationEntry{
 				T:         start,
+				Source:    "datastore_http",
 				Method:    method,
 				Path:      r.URL.Path,
 				LatencyMs: dur.Milliseconds(),
 				Status:    lw.status,
 				Details:   detailSlot.V,
-			})
+			}
+			if lw.status >= 400 {
+				e.Err = http.StatusText(lw.status)
+			}
+			ops.Add(e)
 		}
 
 		attrs := []any{"method", method, "status", lw.status, "duration", dur}

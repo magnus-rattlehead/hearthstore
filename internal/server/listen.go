@@ -75,11 +75,11 @@ type watchTarget struct {
 	id       int32
 	project  string
 	database string
-	parent   string // collection parent path (empty = root)
+	parent   string                       // collection parent path (empty = root)
 	query    *firestorepb.StructuredQuery // nil = documents target
-	docNames map[string]bool             // set for documents targets
-	sent     map[string]bool             // doc names already sent to client
-	once     bool                        // auto-remove after initial snapshot
+	docNames map[string]bool              // set for documents targets
+	sent     map[string]bool              // doc names already sent to client
+	once     bool                         // auto-remove after initial snapshot
 }
 
 // Listen implements the bidi streaming real-time watch protocol.
@@ -137,9 +137,12 @@ func (s *Server) Listen(stream firestorepb.Firestore_ListenServer) error {
 			if rr.err != nil {
 				return rr.err
 			}
+			opStart := time.Now()
 			if err := s.handleListenRequest(stream, targets, rr.req, streamID, subID); err != nil {
+				s.recordListenOperation(rr.req, opStart, err)
 				return err
 			}
+			s.recordListenOperation(rr.req, opStart, nil)
 
 		case ev, ok := <-events:
 			if !ok {

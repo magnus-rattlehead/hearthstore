@@ -52,7 +52,6 @@
       font-size: 12px;
     }
 
-    /* header */
     .header {
       display: flex;
       align-items: baseline;
@@ -73,7 +72,6 @@
       color: var(--muted);
     }
 
-    /* stat row */
     .stat-row {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -107,7 +105,6 @@
       min-height: 1em;
     }
 
-    /* grid */
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
@@ -130,7 +127,6 @@
       font-weight: 600;
     }
 
-    /* kv table */
     .kv {
       border-collapse: collapse;
       width: 100%;
@@ -160,7 +156,6 @@
       color: #eee;
     }
 
-    /* bar */
     .bar-bg {
       height: 3px;
       background: var(--border);
@@ -174,7 +169,6 @@
       transition: width .3s;
     }
 
-    /* recent */
     .recent {
       width: 100%;
       border-collapse: collapse;
@@ -218,7 +212,6 @@
       background: var(--bg3);
     }
 
-    /* theme toggle */
     .theme-btn {
       background: none;
       border: 1px solid var(--border);
@@ -236,7 +229,6 @@
       border-color: var(--muted);
     }
 
-    /* rpc detail panel */
     .rpc-panel {
       position: fixed;
       top: 0;
@@ -296,6 +288,60 @@
 
     .recent tr.selected td {
       background: var(--bg3);
+    }
+
+    .ops-toolbar {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 8px;
+      margin-bottom: 10px;
+      align-items: end;
+    }
+
+    .ops-toolbar label {
+      display: grid;
+      gap: 3px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .6px;
+      min-width: 0;
+    }
+
+    .ops-toolbar input,
+    .ops-toolbar select {
+      width: 100%;
+      min-width: 0;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text);
+      font: inherit;
+      padding: 4px 6px;
+    }
+
+    .ops-toolbar .ops-actions {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+
+    .ops-btn {
+      background: var(--bg3);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text);
+      cursor: pointer;
+      font: inherit;
+      padding: 4px 8px;
+    }
+
+    .ops-btn:hover {
+      border-color: var(--muted);
+    }
+
+    .ops-count {
+      color: var(--muted);
+      margin-bottom: 8px;
     }
 
     /* detail sections */
@@ -379,7 +425,6 @@
     .val-arr {
       color: var(--purple);
     }
-
   </style>
 </head>
 
@@ -398,7 +443,37 @@
   <div class="grid" id="detail"></div>
 
   <div class="card" id="recent-card" style="margin-bottom:14px">
-    <h2>Recent RPCs <span style="color:var(--muted);font-weight:normal">(newest first)</span></h2>
+    <h2>Operations <span style="color:var(--muted);font-weight:normal">(queryable session log)</span></h2>
+    <div class="ops-toolbar" id="ops-filters">
+      <label>method <input id="f-method" autocomplete="off"></label>
+      <label>source <input id="f-source" autocomplete="off"></label>
+      <label>status
+        <select id="f-status">
+          <option value="">all</option>
+          <option value="2">2xx</option>
+          <option value="3">3xx</option>
+          <option value="4">4xx</option>
+          <option value="5">5xx</option>
+        </select>
+      </label>
+      <label>error
+        <select id="f-error">
+          <option value="">all</option>
+          <option value="true">errors</option>
+        </select>
+      </label>
+      <label>search <input id="f-q" autocomplete="off"></label>
+      <label>path <input id="f-path" autocomplete="off"></label>
+      <label>collection <input id="f-collection" autocomplete="off"></label>
+      <label>detail <input id="f-detail" autocomplete="off"></label>
+      <label>min ms <input id="f-min-latency" type="number" min="0"></label>
+      <label>limit <input id="f-limit" type="number" min="1" max="1000" value="100"></label>
+      <div class="ops-actions">
+        <button class="ops-btn" id="ops-apply" type="button">apply</button>
+        <button class="ops-btn" id="ops-clear" type="button">clear</button>
+      </div>
+    </div>
+    <div class="ops-count" id="ops-count"></div>
     <div id="recent-wrap"></div>
   </div>
 
@@ -431,7 +506,7 @@
       }
     }
 
-    let recentEntries = [];
+    let operationEntries = [];
     let selectedIdx = -1;
     let _copySlots = {};
 
@@ -513,7 +588,7 @@
     function panelCopy(slot, ev) {
       ev.stopPropagation();
       const text = _copySlots[slot];
-      if (text && navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+      if (text && navigator.clipboard) navigator.clipboard.writeText(text).catch(() => { });
     }
 
     function makeSection(title, entries, slot) {
@@ -556,7 +631,7 @@
     // --- end helpers ---
 
     function openPanel(idx) {
-      const e = recentEntries[idx];
+      const e = operationEntries[idx];
       if (!e) return;
       selectedIdx = idx;
       document.querySelectorAll('.recent tbody tr').forEach(tr => tr.classList.remove('selected'));
@@ -678,9 +753,9 @@
       const hG = history.map(h => h.goroutines);
 
       const last = history[history.length - 1];
-      const cRate = last ? (last.commits / 2).toFixed(1) : '—';
-      const rRate = last ? (last.rpcs / 2).toFixed(1) : '—';
-      const lRate = last ? (last.listen / 2).toFixed(1) : '—';
+      const cRate = last ? (last.commits / 2).toFixed(1) : '-';
+      const rRate = last ? (last.rpcs / 2).toFixed(1) : '-';
+      const lRate = last ? (last.listen / 2).toFixed(1) : '-';
 
       document.getElementById('uptime').textContent = 'up ' + fmtUptime(d.uptime_sec);
 
@@ -739,22 +814,54 @@
     </div>`,
       ].join('');
 
-      recentEntries = (d.recent || []).slice(-60).reverse();
-      const rows = recentEntries.map((e, i) => {
-        const cls = e.status >= 500 ? 'err' : e.status >= 400 ? 'warn' : 'ok';
+    }
+
+    function filterVal(id) {
+      return document.getElementById(id).value.trim();
+    }
+
+    function operationParams() {
+      const params = new URLSearchParams();
+      const fields = [
+        ['f-method', 'method'],
+        ['f-source', 'source'],
+        ['f-status', 'status_class'],
+        ['f-error', 'error'],
+        ['f-q', 'q'],
+        ['f-path', 'path'],
+        ['f-collection', 'collection'],
+        ['f-detail', 'detail'],
+        ['f-min-latency', 'min_latency_ms'],
+        ['f-limit', 'limit'],
+      ];
+      for (const [id, key] of fields) {
+        const v = filterVal(id);
+        if (v) params.set(key, v);
+      }
+      params.set('order', 'desc');
+      return params;
+    }
+
+    function renderOperations(result) {
+      operationEntries = result.entries || [];
+      const rows = operationEntries.map((e, i) => {
+        const cls = e.err || e.status >= 500 ? 'err' : e.status >= 400 ? 'warn' : 'ok';
         const path = e.path || '';
         const shortPath = path.length > 60 ? '…' + path.slice(-59) : path;
         return `<tr class="${cls}" data-idx="${i}">
       <td style="color:var(--muted)">${esc(e.t)}</td>
-      <td style="color:var(--muted);width:52px">${esc(e.method || '')}</td>
+      <td style="color:var(--muted);width:92px">${esc(e.source || '')}</td>
+      <td style="color:var(--muted);width:120px">${esc(e.method || '')}</td>
       <td class="path" title="${esc(path)}">${esc(shortPath)}</td>
       <td style="text-align:right;width:60px">${e.latency_ms}ms</td>
       <td style="text-align:right;width:48px">${e.status || ''}</td>
     </tr>`;
       }).join('');
+      document.getElementById('ops-count').textContent =
+        `${fmt(result.matched)} matched / ${fmt(result.total)} total  session ${result.session_id || '—'}`;
       document.getElementById('recent-wrap').innerHTML =
         `<table class="recent"><thead><tr>
-      <th>time</th><th>method</th><th>path</th>
+      <th>time</th><th>source</th><th>method</th><th>path</th>
       <th style="text-align:right">lat</th><th style="text-align:right">status</th>
     </tr></thead><tbody>${rows}</tbody></table>`;
       if (selectedIdx >= 0) {
@@ -763,10 +870,18 @@
       }
     }
 
+    async function refreshOperations() {
+      try {
+        const r = await fetch('/_/operations?' + operationParams().toString());
+        if (r.ok) renderOperations(await r.json());
+      } catch (e) {console.error(e);}
+    }
+
     async function poll() {
       try {
         const r = await fetch('/_/metrics');
         if (r.ok) render(await r.json());
+        await refreshOperations();
       } catch (e) {console.error(e);}
       setTimeout(poll, 2000);
     }
@@ -778,6 +893,24 @@
       const idx = parseInt(tr.dataset.idx, 10);
       if (idx === selectedIdx) {closePanel(); return;}
       openPanel(idx);
+    });
+    document.getElementById('ops-apply').addEventListener('click', function () {
+      closePanel();
+      refreshOperations();
+    });
+    document.getElementById('ops-clear').addEventListener('click', function () {
+      document.querySelectorAll('#ops-filters input').forEach(el => {
+        el.value = el.id === 'f-limit' ? '100' : '';
+      });
+      document.querySelectorAll('#ops-filters select').forEach(el => {el.value = '';});
+      closePanel();
+      refreshOperations();
+    });
+    document.getElementById('ops-filters').addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') {
+        closePanel();
+        refreshOperations();
+      }
     });
     document.getElementById('rpc-panel-close').addEventListener('click', closePanel);
     document.addEventListener('keydown', function (ev) {if (ev.key === 'Escape') closePanel();});
