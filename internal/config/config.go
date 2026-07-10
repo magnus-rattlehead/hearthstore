@@ -1,4 +1,3 @@
-// Package config holds shared configuration defaults for hearthstore.
 package config
 
 import "time"

@@ -17,8 +17,6 @@ import (
 	"github.com/magnus-rattlehead/hearthstore/internal/storage"
 )
 
-// -- benchmark helpers ---------------------------------------------------------
-
 func newBenchDsServer(b *testing.B) *Server {
 	b.Helper()
 	dir := b.TempDir()
@@ -54,7 +52,6 @@ func bPost(b *testing.B, s *Server, method string, req proto.Message, resp proto
 	}
 }
 
-// tierFor returns "rare" for 10% of entities (i%10==0), "common" otherwise.
 func tierFor(i int) string {
 	if i%10 == 0 {
 		return "rare"
@@ -93,7 +90,6 @@ func bulkSeed(tb testing.TB, s *Server, n int) {
 	}
 }
 
-// -- performance assertions ----------------------------------------------------
 // These run with go test ./... and catch catastrophic regressions.
 // Thresholds are extremely conservative (100-1000x below real hardware performance)
 // so the tests are never flaky; they only trip on O(n^2) bugs or broken WAL mode.
@@ -117,7 +113,7 @@ func TestPerf_SequentialCommits(t *testing.T) {
 	rate := float64(n) / elapsed.Seconds()
 	t.Logf("%d sequential commits: %v (%.0f commits/sec)", n, elapsed.Round(time.Millisecond), rate)
 
-	const floor = 10.0 // commits/sec - real hardware typically does 500-5000+
+	const floor = 10.0 // commits/sec
 	if rate < floor {
 		t.Errorf("sequential commit rate %.1f/sec is below floor %.0f/sec", rate, floor)
 	}
@@ -198,7 +194,6 @@ func TestPerf_BulkVsSequential(t *testing.T) {
 	t.Logf("bulk:       %v (%.0f mutations/sec)", bulkElapsed.Round(time.Millisecond), bulkRate)
 	t.Logf("sequential: %v (%.0f mutations/sec)", seqElapsed.Round(time.Millisecond), seqRate)
 
-	// Bulk must not be more than 2x slower per entity than sequential.
 	if bulkElapsed > seqElapsed*2 {
 		t.Errorf("bulk commit (%v) is more than 2x slower than sequential (%v) - unexpected regression",
 			bulkElapsed.Round(time.Millisecond), seqElapsed.Round(time.Millisecond))
@@ -315,7 +310,6 @@ func TestPerf_CursorPagination(t *testing.T) {
 	}
 }
 
-// -- benchmarks ----------------------------------------------------------------
 
 // BenchmarkDs_CommitSingle measures a single-mutation commit.
 func BenchmarkDs_CommitSingle(b *testing.B) {
