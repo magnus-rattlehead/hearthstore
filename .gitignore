@@ -1,16 +1,7 @@
 hearthstore
 /server
 cmd/server/server
-
-*.db
-*.db-shm
-*.db-wal
-*.sqlite
-*.sqlite-shm
-*.sqlite-wal
-
-data/
-
+*.test
 *.un~
 
 .DS_Store

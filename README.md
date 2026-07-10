@@ -68,4 +68,4 @@ The data directory is resolved in this order:
 
 ## Status
 
-The Firestore Native and Cloud Datastore APIs are substantially complete. The full `googleapis/nodejs-firestore` system test suite passes. See `TODO.md` for remaining gaps and planned work.
+The Firestore Native and Cloud Datastore APIs are substantially complete. The full `googleapis/nodejs-firestore` system test suite passes.
