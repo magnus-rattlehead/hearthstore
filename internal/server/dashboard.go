@@ -61,15 +61,16 @@ func dbStats(s sql.DBStats) dbPoolJSON {
 }
 
 type storageSnapshot struct {
-	BatchCh    map[string]int `json:"batch_ch"`
-	PriorityCh map[string]int `json:"priority_ch"`
-	SubEntries int            `json:"sub_entries"`
-	ByScope    int            `json:"by_scope"`
-	ByCollG    int            `json:"by_coll_g"`
-	NextID     uint64         `json:"next_id"`
-	WDB        dbPoolJSON     `json:"wdb"`
-	RDB        dbPoolJSON     `json:"rdb"`
-	CPDB       dbPoolJSON     `json:"cpdb"`
+	BatchCh     map[string]int           `json:"batch_ch"`
+	PriorityCh  map[string]int           `json:"priority_ch"`
+	SubEntries  int                      `json:"sub_entries"`
+	ByScope     int                      `json:"by_scope"`
+	ByCollG     int                      `json:"by_coll_g"`
+	NextID      uint64                   `json:"next_id"`
+	WDB         dbPoolJSON               `json:"wdb"`
+	RDB         dbPoolJSON               `json:"rdb"`
+	CPDB        dbPoolJSON               `json:"cpdb"`
+	Performance storage.PerformanceStats `json:"performance"`
 }
 
 type runtimeSnapshot struct {
@@ -98,12 +99,13 @@ type recentJSON struct {
 }
 
 type metricsSnapshot struct {
-	UptimeSec float64                 `json:"uptime_sec"`
-	Counters  storage.CounterSnapshot `json:"counters"`
-	Storage   storageSnapshot         `json:"storage"`
-	DB        storage.DBContentStats  `json:"db"`
-	Runtime   runtimeSnapshot         `json:"runtime"`
-	Recent    []recentJSON            `json:"recent"`
+	UptimeSec float64                    `json:"uptime_sec"`
+	Counters  storage.CounterSnapshot    `json:"counters"`
+	Storage   storageSnapshot            `json:"storage"`
+	DB        storage.DBContentStats     `json:"db"`
+	Runtime   runtimeSnapshot            `json:"runtime"`
+	Indexes   []storage.DsCompositeIndex `json:"indexes"`
+	Recent    []recentJSON               `json:"recent"`
 }
 
 func buildSnapshot(store *storage.Store, ops *OperationLog, startTime time.Time) metricsSnapshot {
@@ -113,6 +115,7 @@ func buildSnapshot(store *storage.Store, ops *OperationLog, startTime time.Time)
 	runtime.ReadMemStats(&mem)
 
 	entries := ops.Recent(60)
+	indexes, _ := store.ListDsCompositeIndexes("")
 	recent := make([]recentJSON, len(entries))
 	for i, e := range entries {
 		recent[i] = recentJSON{
@@ -133,15 +136,16 @@ func buildSnapshot(store *storage.Store, ops *OperationLog, startTime time.Time)
 		UptimeSec: time.Since(startTime).Seconds(),
 		Counters:  store.CounterSnapshot(),
 		Storage: storageSnapshot{
-			BatchCh:    map[string]int{"len": batchLen, "cap": batchCap},
-			PriorityCh: map[string]int{"len": prioLen, "cap": prioCap},
-			SubEntries: store.SubCount(),
-			ByScope:    store.ScopeCount(),
-			ByCollG:    store.CollGroupCount(),
-			NextID:     store.NextID(),
-			WDB:        dbStats(store.DB().Stats()),
-			RDB:        dbStats(store.RDB().Stats()),
-			CPDB:       dbStats(store.CPDB().Stats()),
+			BatchCh:     map[string]int{"len": batchLen, "cap": batchCap},
+			PriorityCh:  map[string]int{"len": prioLen, "cap": prioCap},
+			SubEntries:  store.SubCount(),
+			ByScope:     store.ScopeCount(),
+			ByCollG:     store.CollGroupCount(),
+			NextID:      store.NextID(),
+			WDB:         dbStats(store.DB().Stats()),
+			RDB:         dbStats(store.RDB().Stats()),
+			CPDB:        dbStats(store.CPDB().Stats()),
+			Performance: store.PerformanceSnapshot(),
 		},
 		DB: store.DBContentStats(),
 		Runtime: runtimeSnapshot{
@@ -155,7 +159,8 @@ func buildSnapshot(store *storage.Store, ops *OperationLog, startTime time.Time)
 			PauseTotalMs: float64(mem.PauseTotalNs) / 1e6,
 			GOMAXPROCS:   runtime.GOMAXPROCS(0),
 		},
-		Recent: recent,
+		Indexes: indexes,
+		Recent:  recent,
 	}
 }
 

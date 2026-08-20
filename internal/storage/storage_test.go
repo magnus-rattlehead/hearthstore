@@ -136,6 +136,40 @@ func TestPersistence_DsEntitySurvivesRestart(t *testing.T) {
 	_ = datastorepb
 }
 
+func TestSchema_DsFilterIndexes(t *testing.T) {
+	store, err := New(t.TempDir())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer store.Close()
+
+	tests := []struct {
+		name  string
+		index string
+		where string
+	}{
+		{name: "string", index: "idx_ds_field_filter_str", where: "value_string='JPY'"},
+		{name: "boolean", index: "idx_ds_field_filter_bool", where: "value_bool=1"},
+		{name: "reference", index: "idx_ds_field_filter_ref", where: "value_ref='Company/377007'"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			row := store.DB().QueryRow(`EXPLAIN QUERY PLAN
+				SELECT doc_path FROM ds_field_index
+				WHERE project='p' AND database='(default)' AND namespace=''
+				AND kind='K' AND field_path='field' AND ` + tc.where)
+			var id, parent, unused int
+			var detail string
+			if err := row.Scan(&id, &parent, &unused, &detail); err != nil {
+				t.Fatalf("explain filter query: %v", err)
+			}
+			if !strings.Contains(detail, tc.index) {
+				t.Errorf("query plan = %q, want index %q", detail, tc.index)
+			}
+		})
+	}
+}
+
 // -- field_index helpers ------------------------------------------------------
 
 func boolVal(b bool) *firestorepb.Value {
@@ -497,6 +531,54 @@ func importDsEntityForTest(t *testing.T, dir string) bool {
 
 // -- Change log tests ----------------------------------------------------------
 
+func TestPeriodicCheckpoint_DoesNotWaitForActiveReader(t *testing.T) {
+	store := newTestStore(t)
+
+	if _, err := store.UpsertDoc(testProject, testDB, "things", "", "things/before",
+		&firestorepb.Document{Name: "projects/test-proj/databases/(default)/documents/things/before"}); err != nil {
+		t.Fatalf("UpsertDoc before reader: %v", err)
+	}
+
+	readTx, err := store.rdb.Begin()
+	if err != nil {
+		t.Fatalf("begin read transaction: %v", err)
+	}
+	var count int
+	if err := readTx.QueryRow("SELECT COUNT(*) FROM documents").Scan(&count); err != nil {
+		readTx.Rollback()
+		t.Fatalf("establish read snapshot: %v", err)
+	}
+
+	if _, err := store.UpsertDoc(testProject, testDB, "things", "", "things/after",
+		&firestorepb.Document{Name: "projects/test-proj/databases/(default)/documents/things/after"}); err != nil {
+		readTx.Rollback()
+		t.Fatalf("UpsertDoc after reader: %v", err)
+	}
+	if _, err := store.cpdb.Exec("PRAGMA busy_timeout=1"); err != nil {
+		readTx.Rollback()
+		t.Fatalf("set checkpoint busy timeout: %v", err)
+	}
+
+	busy, err := store.runPeriodicCheckpoint()
+	if rollbackErr := readTx.Rollback(); rollbackErr != nil {
+		t.Fatalf("rollback read transaction: %v", rollbackErr)
+	}
+	if err != nil {
+		t.Fatalf("periodic checkpoint: %v", err)
+	}
+	if busy {
+		t.Fatal("periodic checkpoint waited for an active reader")
+	}
+	performance := store.PerformanceSnapshot()
+	if performance.CheckpointCount == 0 {
+		t.Fatal("checkpoint count = 0, want checkpoint recorded")
+	}
+	if performance.CheckpointLogFrames < performance.CheckpointedFrames {
+		t.Fatalf("checkpoint frames = %d/%d, checkpointed exceeds WAL frames",
+			performance.CheckpointedFrames, performance.CheckpointLogFrames)
+	}
+}
+
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	s, err := New(t.TempDir())
@@ -709,6 +791,13 @@ func TestRunInTxCtx_PriorityOverBatch(t *testing.T) {
 	}
 
 	batchWg.Wait()
+	performance := s.PerformanceSnapshot()
+	if performance.LastBatchExecutionMs <= 0 {
+		t.Fatalf("last batch execution = %v ms, want timing", performance.LastBatchExecutionMs)
+	}
+	if performance.MaxBatchQueueWaitMs <= 0 {
+		t.Fatalf("max batch queue wait = %v ms, want timing", performance.MaxBatchQueueWaitMs)
+	}
 }
 
 func TestChangeEvent_CarriesSeq(t *testing.T) {

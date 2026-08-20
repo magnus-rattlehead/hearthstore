@@ -21,14 +21,14 @@ type Server struct {
 }
 
 var dsOps = map[string]func(*Server, http.ResponseWriter, *http.Request, string){
-	"lookup":               (*Server).handleLookup,
-	"runQuery":             (*Server).handleRunQuery,
-	"runAggregationQuery":  (*Server).handleRunAggregationQuery,
-	"beginTransaction":     (*Server).handleBeginTransaction,
-	"commit":               (*Server).handleCommit,
-	"rollback":             (*Server).handleRollback,
-	"allocateIds":          (*Server).handleAllocateIds,
-	"reserveIds":           (*Server).handleReserveIds,
+	"lookup":              (*Server).handleLookup,
+	"runQuery":            (*Server).handleRunQuery,
+	"runAggregationQuery": (*Server).handleRunAggregationQuery,
+	"beginTransaction":    (*Server).handleBeginTransaction,
+	"commit":              (*Server).handleCommit,
+	"rollback":            (*Server).handleRollback,
+	"allocateIds":         (*Server).handleAllocateIds,
+	"reserveIds":          (*Server).handleReserveIds,
 }
 
 type txReadKey struct {
@@ -51,7 +51,10 @@ func checkOCCConflicts(tx *sql.Tx, reads map[txReadKey]int64) error {
 
 	// Group reads by (project, database, namespace) to allow per-namespace IN queries.
 	type nsKey struct{ project, database, namespace string }
-	type pathVer struct{ path string; ver int64 }
+	type pathVer struct {
+		path string
+		ver  int64
+	}
 	groups := make(map[nsKey][]pathVer, len(reads))
 	for k, v := range reads {
 		nk := nsKey{k.project, k.database, k.namespace}
@@ -100,7 +103,12 @@ func checkOCCConflicts(tx *sql.Tx, reads map[txReadKey]int64) error {
 
 // New returns a ready Server.
 func New(store *storage.Store) *Server {
-	return &Server{grpc: newGRPCServer(store)}
+	return &Server{grpc: newGRPCServer(store, nil)}
+}
+
+// NewWithIndexManager returns a Server using the shared query/admin index manager.
+func NewWithIndexManager(store *storage.Store, indexes *IndexManager) *Server {
+	return &Server{grpc: newGRPCServer(store, indexes)}
 }
 
 // NewGRPCServer returns the underlying GRPCServer for direct gRPC registration.

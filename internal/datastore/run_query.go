@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
@@ -38,6 +39,19 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 	q := sq.Query
 	if q == nil {
 		return nil, status.Error(codes.InvalidArgument, "query is required")
+	}
+	var startCursor *storage.CursorPayload
+	if len(q.StartCursor) > 0 {
+		decoded, ok := decodeCursorFull(q.StartCursor)
+		if !ok {
+			return nil, status.Error(codes.InvalidArgument, "invalid cursor")
+		}
+		startCursor = &decoded
+	}
+	if len(q.EndCursor) > 0 {
+		if _, ok := decodeCursorFull(q.EndCursor); !ok {
+			return nil, status.Error(codes.InvalidArgument, "invalid cursor")
+		}
 	}
 
 	// Handle ExplainOptions: analyze=false (or unset) -> plan only, no execution.
@@ -92,14 +106,52 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 	start := time.Now()
 	var rows []*storage.DsEntityRow
 	var filledSorts []storage.DsSortSpec
+	usedComposite := false
+	var compositeIndexID string
+	var compositeGeneration int64
+	var compositeEntriesScanned int64
 
+	if readAt == nil && g.indexes != nil {
+		idx, indexErr := g.indexes.PrepareQuery(ctx, req.ProjectId, q, ancestorPath != "")
+		if indexErr != nil {
+			return nil, indexErr
+		}
+		if idx == nil && startCursor != nil && startCursor.I != "" {
+			return nil, status.Error(codes.InvalidArgument, "invalid cursor")
+		}
+		if idx != nil && (startCursor == nil || startCursor.I != "") {
+			if startCursor != nil && (startCursor.I != idx.ID || startCursor.G != idx.ActiveGeneration || len(startCursor.K) == 0) {
+				return nil, status.Error(codes.InvalidArgument, "invalid cursor")
+			}
+			equality, allEquality := equalityFilterValues(q.Filter)
+			prefix := storage.DsCompositePrefix(*idx, equality)
+			candidateLimit := 0
+			if allEquality && hasLimit && limit > 0 {
+				candidateLimit = limit + int(q.Offset) + 1
+			}
+			var scanned int64
+			rows, scanned, indexErr = g.store.DsQueryComposite(req.ProjectId, database, namespace, idx.ID, ancestorPath, prefix, startCursor, candidateLimit)
+			if indexErr != nil {
+				return nil, indexErr
+			}
+			compositeIndexID = idx.ID
+			compositeGeneration = idx.ActiveGeneration
+			compositeEntriesScanned = scanned
+			MergeHTTPDetails(ctx, map[string]any{"index_id": idx.ID, "index_entries_scanned": scanned})
+			slog.Debug("Datastore composite index scan", "project", req.ProjectId, "kind", kind, "index", idx.ID, "entries_scanned", scanned, "candidates", len(rows))
+			usedComposite = true
+		}
+	}
+
+	useSQL = useSQL && !usedComposite
 	if useSQL {
-		sortSpecs := buildSortSpecs(q.Order)
-		cp := decodeCursorPayload(q.StartCursor)
+		sortSpecs := buildSortSpecs(q.Order, q.Filter)
+		cp := startCursor
+		fetchLimit := limit + 1
 		var sqlErr error
 		filledSorts, rows, sqlErr = g.store.DsQueryKindLimited(
 			req.ProjectId, database, namespace, kind, ancestorPath,
-			filterSQL, filterArgs, sortSpecs, cp, limit,
+			filterSQL, filterArgs, sortSpecs, cp, fetchLimit,
 		)
 		if errors.Is(sqlErr, storage.ErrColumnNotDetected) {
 			useSQL = false // fall through to Go-side path
@@ -107,8 +159,13 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 			return nil, sqlErr
 		}
 	}
+	moreResultsAfterLimit := false
+	if useSQL && len(rows) > limit {
+		moreResultsAfterLimit = true
+		rows = rows[:limit]
+	}
 
-	if !useSQL {
+	if !useSQL && !usedComposite {
 		var fetchErr error
 		if readAt != nil {
 			rows, fetchErr = g.store.DsQueryKindAsOf(req.ProjectId, database, namespace, kind, ancestorPath, *readAt)
@@ -121,7 +178,7 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 	}
 
 	// Apply Go-side filter when: snapshot read (no pushdown), or pushdown was partial/absent.
-	if q.Filter != nil && (readAt != nil || needsGoFilter) {
+	if q.Filter != nil && (readAt != nil || needsGoFilter || usedComposite) {
 		var filtered []*storage.DsEntityRow
 		for _, row := range rows {
 			if matchesFilter(row.Entity, q.Filter) {
@@ -190,7 +247,7 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 			rows = distinct
 		}
 
-		if len(q.StartCursor) > 0 {
+		if !usedComposite && len(q.StartCursor) > 0 {
 			startPath := decodeCursor(q.StartCursor)
 			if startPath != "" {
 				// Find the cursor entity in the sorted result set and return everything after it.
@@ -220,6 +277,7 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 		if hasLimit && limit == 0 {
 			rows = nil
 		} else if limit > 0 && limit < len(rows) {
+			moreResultsAfterLimit = true
 			rows = rows[:limit]
 		}
 	}
@@ -231,7 +289,9 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 	var endCursor []byte
 	for _, row := range rows {
 		var rowCursor []byte
-		if useSQL {
+		if usedComposite {
+			rowCursor = encodeCursorFull(storage.CursorPayload{V: 2, P: row.Path, I: compositeIndexID, G: compositeGeneration, K: row.IndexKey})
+		} else if useSQL {
 			rowCursor = buildCursor(row.Path, filledSorts, row)
 		} else {
 			rowCursor = encodeCursor(row.Path)
@@ -269,11 +329,7 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 	}
 
 	moreResults := datastorepb.QueryResultBatch_NO_MORE_RESULTS
-	if limit > 0 && len(rows) == limit {
-		// MORE_RESULTS_AFTER_LIMIT tells the client that the limit was reached
-		// and there may be additional results, but the client should stop here.
-		// The nodejs-datastore client (and other SDKs) treat this as a terminal
-		// signal for the current page; use a start_cursor on a new query to paginate.
+	if moreResultsAfterLimit {
 		moreResults = datastorepb.QueryResultBatch_MORE_RESULTS_AFTER_LIMIT
 	}
 
@@ -299,9 +355,15 @@ func (g *GRPCServer) RunQuery(ctx context.Context, req *datastorepb.RunQueryRequ
 	}
 	// analyze=true: include plan summary + execution stats.
 	if explainOpts != nil && explainOpts.Analyze {
+		plan := buildRunQueryPlan(q)
+		stats := buildRunQueryExecutionStats(len(results), time.Since(start))
+		if compositeIndexID != "" {
+			plan = buildCompositeRunQueryPlan(q, compositeIndexID)
+			stats = buildRunQueryExecutionStatsWithScans(len(results), len(rows), compositeEntriesScanned, time.Since(start))
+		}
 		resp.ExplainMetrics = &datastorepb.ExplainMetrics{
-			PlanSummary:    buildRunQueryPlan(q),
-			ExecutionStats: buildRunQueryExecutionStats(len(results), time.Since(start)),
+			PlanSummary:    plan,
+			ExecutionStats: stats,
 		}
 	}
 	return resp, nil
@@ -325,7 +387,6 @@ func (s *Server) handleRunQuery(w http.ResponseWriter, r *http.Request, project 
 	MergeHTTPDetails(r.Context(), DSQueryResponseDetails(resp, time.Since(start)))
 	writeProtoJSON(w, resp)
 }
-
 
 func matchesFilter(entity *datastorepb.Entity, f *datastorepb.Filter) bool {
 	if f == nil {
@@ -635,8 +696,6 @@ func hasKeyFilter(f *datastorepb.Filter) bool {
 	return false
 }
 
-
-
 // dsTimeLayout must match storage.timeLayout for lexicographic timestamp comparisons.
 const dsTimeLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
@@ -646,13 +705,13 @@ const dsTimeLayout = "2006-01-02T15:04:05.000000000Z07:00"
 // prefix ends just before the closing ')'; callers append the value condition and ')'.
 func dsInSubquery(project, database, namespace, kind string) (prefix string, baseArgs []any) {
 	return `d.path IN (SELECT doc_path FROM ds_field_index ` +
-		`WHERE project=? AND database=? AND namespace=? AND kind=? AND field_path=?`,
+			`WHERE project=? AND database=? AND namespace=? AND kind=? AND field_path=?`,
 		[]any{project, database, namespace, kind}
 }
 
 func dsNotInSubquery(project, database, namespace, kind string) (prefix string, baseArgs []any) {
 	return `d.path NOT IN (SELECT doc_path FROM ds_field_index ` +
-		`WHERE project=? AND database=? AND namespace=? AND kind=? AND field_path=?`,
+			`WHERE project=? AND database=? AND namespace=? AND kind=? AND field_path=?`,
 		[]any{project, database, namespace, kind}
 }
 
@@ -918,7 +977,7 @@ func buildDsInNotInClause(project, database, namespace, kind, prop string, filte
 // buildSortSpecs converts q.Order into DsSortSpec entries for SQL ORDER BY.
 // Returns nil when there are no explicit sort orders (uses SQL default d.path ASC).
 // __key__ gets Col="__path__" so it is handled via d.path without a field index join.
-func buildSortSpecs(orders []*datastorepb.PropertyOrder) []storage.DsSortSpec {
+func buildSortSpecs(orders []*datastorepb.PropertyOrder, filter *datastorepb.Filter) []storage.DsSortSpec {
 	if len(orders) == 0 {
 		return nil
 	}
@@ -928,26 +987,64 @@ func buildSortSpecs(orders []*datastorepb.PropertyOrder) []storage.DsSortSpec {
 		if ord.Property.GetName() == "__key__" {
 			col = "__path__"
 		}
+		filterSQL, filterArgs := buildDsSortFilterClause(ord.Property.GetName(), filter)
 		specs[i] = storage.DsSortSpec{
-			FieldPath: ord.Property.GetName(),
-			Col:       col,
-			Desc:      ord.Direction == datastorepb.PropertyOrder_DESCENDING,
+			FieldPath:  ord.Property.GetName(),
+			Col:        col,
+			Desc:       ord.Direction == datastorepb.PropertyOrder_DESCENDING,
+			FilterSQL:  filterSQL,
+			FilterArgs: filterArgs,
 		}
 	}
 	return specs
 }
 
-// decodeCursorPayload decodes a start-cursor byte slice to a *CursorPayload.
-// Returns nil when the cursor is empty or cannot be decoded.
-func decodeCursorPayload(b []byte) *storage.CursorPayload {
-	if len(b) == 0 {
-		return nil
+func buildDsSortFilterClause(prop string, f *datastorepb.Filter) (string, []any) {
+	if f == nil || prop == "__key__" {
+		return "", nil
 	}
-	cp, ok := decodeCursorFull(b)
-	if !ok {
-		return nil
+	switch ft := f.FilterType.(type) {
+	case *datastorepb.Filter_PropertyFilter:
+		pf := ft.PropertyFilter
+		if pf.Property.GetName() != prop {
+			return "", nil
+		}
+		col, value, ok := dsValueColumn(pf.Value)
+		if !ok {
+			return "", nil
+		}
+		var op string
+		switch pf.Op {
+		case datastorepb.PropertyFilter_EQUAL:
+			op = "="
+		case datastorepb.PropertyFilter_LESS_THAN:
+			op = "<"
+		case datastorepb.PropertyFilter_LESS_THAN_OR_EQUAL:
+			op = "<="
+		case datastorepb.PropertyFilter_GREATER_THAN:
+			op = ">"
+		case datastorepb.PropertyFilter_GREATER_THAN_OR_EQUAL:
+			op = ">="
+		default:
+			return "", nil
+		}
+		return fmt.Sprintf("fi.%s%s?", col, op), []any{value}
+	case *datastorepb.Filter_CompositeFilter:
+		if ft.CompositeFilter.Op != datastorepb.CompositeFilter_AND {
+			return "", nil
+		}
+		var clauses []string
+		var args []any
+		for _, sub := range ft.CompositeFilter.Filters {
+			clause, subArgs := buildDsSortFilterClause(prop, sub)
+			if clause != "" {
+				clauses = append(clauses, clause)
+				args = append(args, subArgs...)
+			}
+		}
+		return strings.Join(clauses, " AND "), args
 	}
-	return &cp
+	return "", nil
 }
 
 // distinctKey returns a string key representing the distinct_on field values of an entity.

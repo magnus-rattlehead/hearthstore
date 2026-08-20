@@ -35,6 +35,14 @@ func buildRunQueryPlan(q *datastorepb.Query) *datastorepb.PlanSummary {
 	return &datastorepb.PlanSummary{IndexesUsed: []*structpb.Struct{entry}}
 }
 
+func buildCompositeRunQueryPlan(q *datastorepb.Query, indexID string) *datastorepb.PlanSummary {
+	plan := buildRunQueryPlan(q)
+	if len(plan.IndexesUsed) > 0 {
+		plan.IndexesUsed[0].Fields["index_id"] = structpb.NewStringValue(indexID)
+	}
+	return plan
+}
+
 // buildAggregationQueryPlan builds a PlanSummary for a RunAggregationQuery request.
 // Derives index from aggregation field names; scope is 'Includes ancestors' if there
 // is a HAS_ANCESTOR filter in the nested query.
@@ -86,17 +94,23 @@ func hasAncestorFilter(f *datastorepb.Filter) bool {
 
 // buildRunQueryExecutionStats builds execution stats for an analyzed RunQuery.
 func buildRunQueryExecutionStats(n int, elapsed time.Duration) *datastorepb.ExecutionStats {
+	return buildRunQueryExecutionStatsWithScans(n, n, int64(n), elapsed)
+}
+
+func buildRunQueryExecutionStatsWithScans(n, documentsScanned int, indexEntriesScanned int64, elapsed time.Duration) *datastorepb.ExecutionStats {
 	ns := int32(elapsed.Nanoseconds() % 1e9)
 	secs := int64(elapsed.Seconds())
 	nStr := fmt.Sprintf("%d", n)
+	documentsScannedStr := fmt.Sprintf("%d", documentsScanned)
+	indexEntriesScannedStr := fmt.Sprintf("%d", indexEntriesScanned)
 	debugStats, _ := structpb.NewStruct(map[string]interface{}{
-		"documents_scanned":    nStr,
-		"index_entries_scanned": nStr,
+		"documents_scanned":     documentsScannedStr,
+		"index_entries_scanned": indexEntriesScannedStr,
 		"billing_details": map[string]interface{}{
-			"documents_billable":    nStr,
+			"documents_billable":     nStr,
 			"index_entries_billable": "0",
-			"min_query_cost":        "0",
-			"small_ops":             "0",
+			"min_query_cost":         "0",
+			"small_ops":              "0",
 		},
 	})
 	return &datastorepb.ExecutionStats{
@@ -115,13 +129,13 @@ func buildAggregationQueryExecutionStats(rowCount int, elapsed time.Duration) *d
 	secs := int64(elapsed.Seconds())
 	rowStr := fmt.Sprintf("%d", rowCount)
 	debugStats, _ := structpb.NewStruct(map[string]interface{}{
-		"documents_scanned":    "0",
+		"documents_scanned":     "0",
 		"index_entries_scanned": rowStr,
 		"billing_details": map[string]interface{}{
-			"documents_billable":    "0",
+			"documents_billable":     "0",
 			"index_entries_billable": rowStr,
-			"min_query_cost":        "0",
-			"small_ops":             "0",
+			"min_query_cost":         "0",
+			"small_ops":              "0",
 		},
 	})
 	return &datastorepb.ExecutionStats{

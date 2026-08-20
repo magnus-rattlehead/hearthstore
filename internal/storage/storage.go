@@ -29,10 +29,9 @@ type dbExec interface {
 // pragmaDSN applies these pragmas to every connection via DSN query params.
 // journal_mode=WAL is omitted - it's a file-level setting, set once on wdb.
 // wal_autocheckpoint=0 disables automatic checkpointing; a background goroutine
-// checkpoints every 30 s via TRUNCATE mode (resets WAL write position + shrinks
-// the file) so the WAL does not grow unbounded. PASSIVE-only checkpointing moves
-// frames to the DB but never resets the write pointer, so new writes always extend
-// the file - eventually filling the disk.
+// runs a non-blocking PASSIVE checkpoint every 30 s. SQLite reuses the WAL once
+// checkpointing catches up and no reader still needs it. Clean shutdown uses
+// TRUNCATE to reclaim the WAL file without delaying live writes.
 // synchronous=OFF is safe for an emulator (developer tool; no crash-durability
 // requirement). It removes the checkpoint fsync entirely, the dominant cost for
 // write-heavy workloads. See: rqlite, phiresky sqlite-perf, ericdraken benchmarks.
@@ -127,6 +126,18 @@ CREATE INDEX IF NOT EXISTS idx_ds_field ON ds_field_index (
     value_string, value_int, value_double
 );
 
+CREATE INDEX IF NOT EXISTS idx_ds_field_filter_str ON ds_field_index (
+    project, database, namespace, kind, field_path, value_string, doc_path
+);
+
+CREATE INDEX IF NOT EXISTS idx_ds_field_filter_bool ON ds_field_index (
+    project, database, namespace, kind, field_path, value_bool, doc_path
+);
+
+CREATE INDEX IF NOT EXISTS idx_ds_field_filter_ref ON ds_field_index (
+    project, database, namespace, kind, field_path, value_ref, doc_path
+);
+
 -- Per-document cleanup on re-index and soft-delete.
 CREATE INDEX IF NOT EXISTS idx_ds_doc_fields ON ds_field_index
     (project, database, namespace, doc_path);
@@ -150,6 +161,42 @@ CREATE INDEX IF NOT EXISTS idx_ds_field_sort_dbl ON ds_field_index
 CREATE INDEX IF NOT EXISTS idx_ds_kind_path ON ds_documents
     (project, database, namespace, kind, path)
     WHERE deleted = 0;
+
+-- Project-defined Datastore composite indexes. Definitions are project scoped;
+-- entries remain isolated by database and namespace.
+CREATE TABLE IF NOT EXISTS ds_composite_indexes (
+    project             TEXT NOT NULL,
+    index_id            TEXT NOT NULL,
+    kind                TEXT NOT NULL,
+    ancestor            INTEGER NOT NULL DEFAULT 0,
+    properties          BLOB NOT NULL,
+    state               TEXT NOT NULL,
+    source              TEXT NOT NULL,
+    active_generation   INTEGER NOT NULL DEFAULT 0,
+    building_generation INTEGER NOT NULL DEFAULT 0,
+    processed_entities  INTEGER NOT NULL DEFAULT 0,
+    total_entities      INTEGER NOT NULL DEFAULT 0,
+    error               TEXT NOT NULL DEFAULT '',
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    PRIMARY KEY (project, index_id)
+);
+
+CREATE TABLE IF NOT EXISTS ds_composite_index_entries (
+    project       TEXT NOT NULL,
+    database      TEXT NOT NULL,
+    namespace     TEXT NOT NULL,
+    index_id      TEXT NOT NULL,
+    generation    INTEGER NOT NULL,
+    ancestor_path TEXT NOT NULL DEFAULT '',
+    index_key     BLOB NOT NULL,
+    doc_path      TEXT NOT NULL,
+    PRIMARY KEY (project, database, namespace, index_id, generation,
+                 ancestor_path, index_key, doc_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ds_composite_doc ON ds_composite_index_entries
+    (project, database, namespace, doc_path, index_id, generation);
 
 -- Monotonic ID sequences for AllocateIds
 CREATE TABLE IF NOT EXISTS ds_id_sequences (
@@ -243,17 +290,19 @@ CREATE INDEX IF NOT EXISTS idx_changes_doc ON document_changes
 
 // batchJob is one write submitted to the group-commit loop.
 type batchJob struct {
-	ctx  context.Context
-	fn   func(*sql.Tx) error
-	done chan error // buffered(1); receives nil or error after commit
+	ctx        context.Context
+	fn         func(*sql.Tx) error
+	done       chan error // buffered(1); receives nil or error after commit
+	enqueuedAt time.Time
 }
 
 // Store is the disk-backed document store.
 type Store struct {
-	wdb  *sql.DB // single write connection - serialises all mutations
-	rdb  *sql.DB // read connection pool - concurrent readers, never blocks writers (WAL)
-	cpdb *sql.DB // dedicated checkpoint connection - never competes with wdb
-	dbPath string  // filesystem path for WAL stat
+	wdb     *sql.DB // single write connection - serialises all mutations
+	rdb     *sql.DB // read connection pool - concurrent readers, never blocks writers (WAL)
+	cpdb    *sql.DB // dedicated checkpoint connection - never competes with wdb
+	dbPath  string  // filesystem path for WAL stat
+	dataDir string
 
 	batchCh    chan batchJob // group-commit queue for non-transactional writes
 	priorityCh chan batchJob // high-priority queue for isolated transactional commits
@@ -265,7 +314,7 @@ type Store struct {
 	byCollG    map[subCollGKey]map[uint64]chan ChangeEvent
 	nextID     uint64
 
-	done chan struct{}   // closed by Close to stop background goroutines
+	done chan struct{}  // closed by Close to stop background goroutines
 	wg   sync.WaitGroup // tracks checkpointLoop + batchCommitLoop
 
 	// atomic counters - incremented on hot paths, read by the dashboard
@@ -277,6 +326,18 @@ type Store struct {
 	listenEvents  atomic.Int64
 	rpcTotal      atomic.Int64
 	rpcErrors     atomic.Int64
+
+	batchLastQueueWaitNs   atomic.Int64
+	batchMaxQueueWaitNs    atomic.Int64
+	batchLastExecutionNs   atomic.Int64
+	batchMaxExecutionNs    atomic.Int64
+	batchLastJobs          atomic.Int64
+	checkpointCount        atomic.Int64
+	checkpointErrors       atomic.Int64
+	checkpointLastDuration atomic.Int64
+	checkpointLogFrames    atomic.Int64
+	checkpointedFrames     atomic.Int64
+	checkpointBusy         atomic.Bool
 
 	// DBContentStats cache
 	dbStatsMu      sync.Mutex
@@ -297,6 +358,11 @@ var migrations = []string{
 	`CREATE INDEX IF NOT EXISTS idx_ds_field_sort_int ON ds_field_index (project, database, namespace, kind, field_path, value_int, doc_path) WHERE in_array = 0`,
 	`CREATE INDEX IF NOT EXISTS idx_ds_field_sort_str ON ds_field_index (project, database, namespace, kind, field_path, value_string, doc_path) WHERE in_array = 0`,
 	`CREATE INDEX IF NOT EXISTS idx_ds_field_sort_dbl ON ds_field_index (project, database, namespace, kind, field_path, value_double, doc_path) WHERE in_array = 0`,
+	// Covering filter indexes avoid table lookups when collecting matching document paths.
+	`CREATE INDEX IF NOT EXISTS idx_ds_field_filter_str ON ds_field_index (project, database, namespace, kind, field_path, value_string, doc_path)`,
+	// Typed filter indexes for value columns omitted by idx_ds_field.
+	`CREATE INDEX IF NOT EXISTS idx_ds_field_filter_bool ON ds_field_index (project, database, namespace, kind, field_path, value_bool, doc_path)`,
+	`CREATE INDEX IF NOT EXISTS idx_ds_field_filter_ref ON ds_field_index (project, database, namespace, kind, field_path, value_ref, doc_path)`,
 	// Covering index for path-cursor (no-sort) pagination.
 	`CREATE INDEX IF NOT EXISTS idx_ds_kind_path ON ds_documents (project, database, namespace, kind, path) WHERE deleted = 0`,
 	// Per-type sort covering indexes for Firestore INNER JOIN-driven ORDER BY.
@@ -362,16 +428,16 @@ func New(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("setting mmap_size (read): %w", err)
 	}
 
-	// Dedicated checkpoint connection: keeps TRUNCATE checkpoint off wdb so the
-	// write path never stalls waiting for the checkpoint's busy-timeout (up to 5s).
+	// Dedicated checkpoint connection keeps maintenance work off the write pool.
+	// Periodic PASSIVE checkpoints do not wait for readers or writers.
 	cpdb, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("opening sqlite (checkpoint): %w", err)
 	}
 	cpdb.SetMaxOpenConns(1)
 	cpdb.SetMaxIdleConns(1)
-	// Cap WAL file at 256 MB: SQLite truncates to this limit after a successful
-	// checkpoint, so the file can't grow beyond one checkpoint period's worth of writes.
+	// Limit the retained WAL size after SQLite successfully resets it. A long-lived
+	// reader can temporarily keep the WAL above this limit until it releases its snapshot.
 	if _, err := cpdb.Exec("PRAGMA journal_size_limit=268435456"); err != nil {
 		return nil, fmt.Errorf("setting journal_size_limit: %w", err)
 	}
@@ -381,6 +447,7 @@ func New(dataDir string) (*Store, error) {
 		rdb:        rdb,
 		cpdb:       cpdb,
 		dbPath:     dbPath,
+		dataDir:    dataDir,
 		batchCh:    make(chan batchJob, 1024),
 		priorityCh: make(chan batchJob, 64),
 		subEntries: make(map[uint64]*subEntry),
@@ -394,19 +461,17 @@ func New(dataDir string) (*Store, error) {
 	return s, nil
 }
 
-// checkpointLoop runs a TRUNCATE WAL checkpoint every 30 seconds.
-// TRUNCATE (vs PASSIVE) resets the WAL write position and shrinks the WAL file
-// after moving frames to the main DB. Without the write-position reset, new writes
-// always extend the WAL at an ever-increasing offset - eventually filling the disk.
-// The cpdb busy_timeout (30 s) bounds how long we wait for active readers; if a
-// checkpoint times out the WAL grows by at most one interval's worth of writes.
+// checkpointLoop moves completed WAL frames into the database every 30 seconds.
+// PASSIVE never waits for readers or writers, so maintenance cannot add the
+// connection's 30-second busy timeout to an upsert. Clean shutdown uses TRUNCATE
+// after request processing has stopped to reclaim the WAL file.
 func (s *Store) checkpointLoop() {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
 	for {
 		select {
 		case <-t.C:
-			_, _ = s.cpdb.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+			_, _ = s.runPeriodicCheckpoint()
 		case <-s.done:
 			_, _ = s.cpdb.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 			return
@@ -482,13 +547,13 @@ func (s *Store) NextID() uint64 {
 
 // --- counter accessors ---
 
-func (s *Store) IncrCommitTotal()    { s.commitTotal.Add(1) }
-func (s *Store) IncrCommitError()    { s.commitErrors.Add(1) }
-func (s *Store) IncrBatchJob()       { s.batchJobsExec.Add(1) }
-func (s *Store) IncrBatchPreempt()   { s.batchPreempt.Add(1) }
-func (s *Store) IncrOCCConflict()    { s.occConflicts.Add(1) }
-func (s *Store) IncrListenEvent()    { s.listenEvents.Add(1) }
-func (s *Store) IncrRPC(isErr bool)  {
+func (s *Store) IncrCommitTotal()  { s.commitTotal.Add(1) }
+func (s *Store) IncrCommitError()  { s.commitErrors.Add(1) }
+func (s *Store) IncrBatchJob()     { s.batchJobsExec.Add(1) }
+func (s *Store) IncrBatchPreempt() { s.batchPreempt.Add(1) }
+func (s *Store) IncrOCCConflict()  { s.occConflicts.Add(1) }
+func (s *Store) IncrListenEvent()  { s.listenEvents.Add(1) }
+func (s *Store) IncrRPC(isErr bool) {
 	s.rpcTotal.Add(1)
 	if isErr {
 		s.rpcErrors.Add(1)
@@ -522,16 +587,16 @@ func (s *Store) CounterSnapshot() CounterSnapshot {
 
 // DBContentStats holds cached row counts and size info from the database.
 type DBContentStats struct {
-	Documents      int64 `json:"documents"`
-	DocChanges     int64 `json:"document_changes"`
-	FieldIndex     int64 `json:"field_index"`
-	DsDocuments    int64 `json:"ds_documents"`
-	DsDocChanges   int64 `json:"ds_document_changes"`
-	DsFieldIndex   int64 `json:"ds_field_index"`
-	DsIDSequences  int64 `json:"ds_id_sequences"`
-	DBSizeBytes    int64 `json:"db_size_bytes"`
-	WALSizeBytes   int64 `json:"wal_size_bytes"`
-	FreelistPages  int64 `json:"freelist_pages"`
+	Documents     int64 `json:"documents"`
+	DocChanges    int64 `json:"document_changes"`
+	FieldIndex    int64 `json:"field_index"`
+	DsDocuments   int64 `json:"ds_documents"`
+	DsDocChanges  int64 `json:"ds_document_changes"`
+	DsFieldIndex  int64 `json:"ds_field_index"`
+	DsIDSequences int64 `json:"ds_id_sequences"`
+	DBSizeBytes   int64 `json:"db_size_bytes"`
+	WALSizeBytes  int64 `json:"wal_size_bytes"`
+	FreelistPages int64 `json:"freelist_pages"`
 }
 
 // DBContentStats queries row counts and DB size, caching the result for 5s.
@@ -628,7 +693,7 @@ const batchTimeBudget = 50 * time.Millisecond
 // OCC isolation between concurrent RPCs is not required. For transactional
 // commits with OCC conflict checks, use RunInTxCtx instead.
 func (s *Store) RunBatchedTx(ctx context.Context, fn func(*sql.Tx) error) error {
-	job := batchJob{ctx: ctx, fn: fn, done: make(chan error, 1)}
+	job := batchJob{ctx: ctx, fn: fn, done: make(chan error, 1), enqueuedAt: time.Now()}
 	select {
 	case s.batchCh <- job:
 	case <-ctx.Done():
@@ -742,9 +807,18 @@ func (s *Store) doExecuteBatch(batch []batchJob, earlyPreempt bool) {
 	if len(active) == 0 {
 		return
 	}
+	queueWait := time.Duration(0)
+	now := time.Now()
+	for _, job := range active {
+		if wait := now.Sub(job.enqueuedAt); wait > queueWait {
+			queueWait = wait
+		}
+	}
+	executionStart := time.Now()
 
 	tx, err := s.wdb.Begin()
 	if err != nil {
+		s.recordBatchPerformance(queueWait, time.Since(executionStart), 0)
 		e := wrapBusy(err)
 		for _, j := range active {
 			j.done <- e
@@ -782,6 +856,7 @@ func (s *Store) doExecuteBatch(batch []batchJob, earlyPreempt bool) {
 			j.done <- nil
 		}
 	}
+	s.recordBatchPerformance(queueWait, time.Since(executionStart), len(ran))
 
 	if len(deferred) > 0 {
 		s.drainPriorityCh()

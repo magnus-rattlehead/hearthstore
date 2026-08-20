@@ -18,9 +18,11 @@ import (
 
 // DsSortSpec describes one ORDER BY field for SQL-level keyset pagination.
 type DsSortSpec struct {
-	FieldPath string // property name
-	Col       string // auto-detected ds_field_index column (value_string/value_int/etc.)
-	Desc      bool
+	FieldPath  string // property name
+	Col        string // auto-detected ds_field_index column (value_string/value_int/etc.)
+	Desc       bool
+	FilterSQL  string
+	FilterArgs []any
 }
 
 // CursorSortKV holds the sort-field value for one ORDER BY field in a keyset cursor.
@@ -33,8 +35,12 @@ type CursorSortKV struct {
 // CursorPayload is the structured cursor for keyset pagination; JSON-marshaled
 // and URL-safe base64-encoded before transmission.
 type CursorPayload struct {
+	V int            `json:"v"`           // cursor format version
 	P string         `json:"p"`           // entity path (tie-breaker)
-	S []CursorSortKV `json:"s,omitempty"` // one entry per ORDER BY field
+	S []CursorSortKV `json:"s,omitempty"` // legacy-EAV sort values within v2 cursors
+	I string         `json:"i,omitempty"` // composite index ID
+	G int64          `json:"g,omitempty"` // composite index generation
+	K []byte         `json:"k,omitempty"` // encoded composite index key
 }
 
 // ErrColumnNotDetected is returned by DsQueryKindLimited when a sort field has
@@ -318,6 +324,7 @@ func (s *Store) DsUpsertManyTx(tx *sql.Tx, project, database string, rows []Upse
 			changeTime: nowStr, deleted: 0, data: r.data,
 		})
 		acc.fiDeletes = append(acc.fiDeletes, fiDeleteKey{project, database, r.Namespace, r.Path})
+		acc.ciDocs = append(acc.ciDocs, ciDoc{project, database, r.Namespace, r.Path, r.Kind, r.ParentPath, r.Entity})
 		for propName, v := range r.Entity.Properties {
 			var fiRows []dsFiRow
 			dsCollectValue(propName, v, false, &fiRows)
@@ -367,6 +374,7 @@ func dsUpsertExec(exec dbExec, project, database, namespace, path, kind, parentP
 				changeTime: nowStr, deleted: 0, data: data,
 			})
 			acc.fiDeletes = append(acc.fiDeletes, fiDeleteKey{project, database, namespace, path})
+			acc.ciDocs = append(acc.ciDocs, ciDoc{project, database, namespace, path, kind, parentPath, e})
 			for propName, v := range e.Properties {
 				var fiRows []dsFiRow
 				dsCollectValue(propName, v, false, &fiRows)
@@ -384,6 +392,9 @@ func dsUpsertExec(exec dbExec, project, database, namespace, path, kind, parentP
 				return nil, 0, nil, nil, false, err
 			}
 			if err := dsIndexDocFields(exec, project, database, namespace, kind, path, e); err != nil {
+				return nil, 0, nil, nil, false, err
+			}
+			if err := dsMaintainCompositeIndexes(exec, project, database, namespace, kind, path, parentPath, e); err != nil {
 				return nil, 0, nil, nil, false, err
 			}
 		}
@@ -442,6 +453,7 @@ func dsDeleteExec(exec dbExec, project, database, namespace, path string, acc *C
 
 	if acc != nil {
 		acc.fiDeletes = append(acc.fiDeletes, fiDeleteKey{project, database, namespace, path})
+		acc.ciDocs = append(acc.ciDocs, ciDoc{project, database, namespace, path, kind, parentPath, nil})
 		acc.changes = append(acc.changes, changeRow{
 			project: project, database: database, namespace: namespace,
 			path: path, kind: kind, parentPath: parentPath,
@@ -455,6 +467,9 @@ func dsDeleteExec(exec dbExec, project, database, namespace, path string, acc *C
 		project, database, namespace, path,
 	); err != nil {
 		return fmt.Errorf("ds_field_index delete: %w", err)
+	}
+	if err := dsMaintainCompositeIndexes(exec, project, database, namespace, kind, path, parentPath, nil); err != nil {
+		return err
 	}
 	_, err = exec.Exec(`
 		INSERT INTO ds_document_changes
@@ -533,6 +548,7 @@ type DsEntityRow struct {
 	CreateTime *timestamppb.Timestamp
 	UpdateTime *timestamppb.Timestamp
 	Path       string
+	IndexKey   []byte
 }
 
 // DsQueryKindLimited runs a paginated kind query with ORDER BY, keyset cursor,
@@ -679,6 +695,11 @@ func (s *Store) runSingleSortQuery(
 	if ancestorPath != "" {
 		sb.WriteString(` AND (d.path=? OR d.path LIKE ?)`)
 		args = append(args, ancestorPath, ancestorPath+"/%")
+	}
+	if sort.FilterSQL != "" {
+		sb.WriteString(` AND `)
+		sb.WriteString(sort.FilterSQL)
+		args = append(args, sort.FilterArgs...)
 	}
 	if filterSQL != "" {
 		sb.WriteString(` AND `)
@@ -1011,6 +1032,7 @@ func dsSaveExec(exec dbExec, project, database, namespace, path, kind, parentPat
 			changeTime: updateStr, deleted: 0, data: data,
 		})
 		acc.fiDeletes = append(acc.fiDeletes, fiDeleteKey{project, database, namespace, path})
+		acc.ciDocs = append(acc.ciDocs, ciDoc{project, database, namespace, path, kind, parentPath, entity})
 		for propName, v := range entity.Properties {
 			var fiRows []dsFiRow
 			dsCollectValue(propName, v, false, &fiRows)
@@ -1031,6 +1053,9 @@ func dsSaveExec(exec dbExec, project, database, namespace, path, kind, parentPat
 		return 0, err
 	}
 	if err := dsIndexDocFields(exec, project, database, namespace, kind, path, entity); err != nil {
+		return 0, err
+	}
+	if err := dsMaintainCompositeIndexes(exec, project, database, namespace, kind, path, parentPath, entity); err != nil {
 		return 0, err
 	}
 	return newVersion, nil
@@ -1126,8 +1151,8 @@ type dsFiRow struct {
 
 type changeRow struct {
 	project, database, namespace, path, kind, parentPath, changeTime string
-	deleted                                                           int
-	data                                                              []byte
+	deleted                                                          int
+	data                                                             []byte
 }
 
 type fiDeleteKey struct {
@@ -1139,6 +1164,11 @@ type fiBulkRow struct {
 	row                                         dsFiRow
 }
 
+type ciDoc struct {
+	project, database, namespace, path, kind, parentPath string
+	entity                                               *datastorepb.Entity
+}
+
 // CommitAccumulator batches write-side effects (change-log rows, field-index
 // operations) from multiple mutations so they can be flushed in bulk at the
 // end of a commit transaction, cutting SQL round-trips from O(n) to O(1).
@@ -1146,6 +1176,7 @@ type CommitAccumulator struct {
 	changes   []changeRow
 	fiDeletes []fiDeleteKey
 	fiInserts []fiBulkRow
+	ciDocs    []ciDoc
 }
 
 // NewCommitAccumulator returns an empty accumulator for bulk commit use.
@@ -1159,6 +1190,11 @@ func (a *CommitAccumulator) Flush(exec dbExec) error {
 	}
 	if err := a.flushFiInserts(exec); err != nil {
 		return err
+	}
+	for _, d := range a.ciDocs {
+		if err := dsMaintainCompositeIndexes(exec, d.project, d.database, d.namespace, d.kind, d.path, d.parentPath, d.entity); err != nil {
+			return err
+		}
 	}
 	return a.flushChanges(exec)
 }
@@ -1347,7 +1383,10 @@ func dsIndexDocFields(exec dbExec, project, database, namespace, kind, docPath s
 // Processes entities in batches of 200 to bound transaction size.
 func (s *Store) RebuildDsFieldIndex() error {
 	const batchSize = 200
-	type erow struct{ project, database, namespace, path, kind string; data []byte }
+	type erow struct {
+		project, database, namespace, path, kind string
+		data                                     []byte
+	}
 
 	offset := 0
 	for {

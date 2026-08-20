@@ -58,6 +58,35 @@ func orFilter(filters ...*datastorepb.Filter) *datastorepb.Filter {
 	}
 }
 
+func TestBuildSortSpecs_PushesMatchingRangeFilters(t *testing.T) {
+	filter := andFilter(
+		propFilter("company", datastorepb.PropertyFilter_EQUAL, dsStr("acme")),
+		propFilter("created_date", datastorepb.PropertyFilter_GREATER_THAN_OR_EQUAL, dsTimestamp(time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC))),
+		propFilter("created_date", datastorepb.PropertyFilter_LESS_THAN, dsTimestamp(time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC))),
+	)
+
+	specs := buildSortSpecs([]*datastorepb.PropertyOrder{{
+		Property:  &datastorepb.PropertyReference{Name: "created_date"},
+		Direction: datastorepb.PropertyOrder_DESCENDING,
+	}}, filter)
+
+	if len(specs) != 1 {
+		t.Fatalf("want one sort spec, got %d", len(specs))
+	}
+	if got, want := specs[0].FilterSQL, "fi.value_string>=? AND fi.value_string<?"; got != want {
+		t.Errorf("sort filter SQL = %q, want %q", got, want)
+	}
+	if len(specs[0].FilterArgs) != 2 {
+		t.Fatalf("want two sort filter args, got %d", len(specs[0].FilterArgs))
+	}
+	if got, want := specs[0].FilterArgs[0], "2026-07-01T00:00:00.000000000Z"; got != want {
+		t.Errorf("lower bound = %v, want %v", got, want)
+	}
+	if got, want := specs[0].FilterArgs[1], "2026-08-02T00:00:00.000000000Z"; got != want {
+		t.Errorf("upper bound = %v, want %v", got, want)
+	}
+}
+
 // runQuery executes a RunQuery against the test server.
 func runQuery(t *testing.T, s *Server, q *datastorepb.Query) *datastorepb.RunQueryResponse {
 	t.Helper()
@@ -322,6 +351,47 @@ func TestRunQuery(t *testing.T) {
 			wantN: 1,
 		},
 		{
+			name: "filtered_order_cursor_limit",
+			run: func(t *testing.T, s *Server, kind string) {
+				company := dsKeyVal(dsKey("Company", "377007"))
+				seedKind(t, s, kind, []seedRow{
+					{"before", map[string]*datastorepb.Value{"company": company, "applied": dsBool(true), "created_date": dsTimestamp(time.Date(2026, 6, 30, 0, 0, 0, 0, time.UTC))}},
+					{"first", map[string]*datastorepb.Value{"company": company, "applied": dsBool(true), "created_date": dsTimestamp(time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC))}},
+					{"other_company", map[string]*datastorepb.Value{"company": dsKeyVal(dsKey("Company", "other")), "applied": dsBool(true), "created_date": dsTimestamp(time.Date(2026, 7, 15, 0, 0, 0, 0, time.UTC))}},
+					{"not_applied", map[string]*datastorepb.Value{"company": company, "applied": dsBool(false), "created_date": dsTimestamp(time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC))}},
+					{"latest", map[string]*datastorepb.Value{"company": company, "applied": dsBool(true), "created_date": dsTimestamp(time.Date(2026, 7, 25, 0, 0, 0, 0, time.UTC))}},
+					{"after", map[string]*datastorepb.Value{"company": company, "applied": dsBool(true), "created_date": dsTimestamp(time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC))}},
+				})
+				filter := andFilter(
+					propFilter("company", datastorepb.PropertyFilter_EQUAL, company),
+					propFilter("applied", datastorepb.PropertyFilter_EQUAL, dsBool(true)),
+					propFilter("created_date", datastorepb.PropertyFilter_GREATER_THAN_OR_EQUAL, dsTimestamp(time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC))),
+					propFilter("created_date", datastorepb.PropertyFilter_LESS_THAN, dsTimestamp(time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC))),
+				)
+				order := []*datastorepb.PropertyOrder{{
+					Property:  &datastorepb.PropertyReference{Name: "created_date"},
+					Direction: datastorepb.PropertyOrder_DESCENDING,
+				}}
+
+				firstPage := qKind(t, s, kind, &datastorepb.Query{Filter: filter, Order: order, Limit: wrapperspb.Int32(1)})
+				if len(firstPage.Batch.EntityResults) != 1 {
+					t.Fatalf("first page: want one entity, got %d", len(firstPage.Batch.EntityResults))
+				}
+				if got := firstPage.Batch.EntityResults[0].Entity.Key.Path[0].GetName(); got != "latest" {
+					t.Errorf("first page entity = %q, want latest", got)
+				}
+				secondPage := qKind(t, s, kind, &datastorepb.Query{
+					Filter: filter, Order: order, Limit: wrapperspb.Int32(1), StartCursor: firstPage.Batch.EndCursor,
+				})
+				if len(secondPage.Batch.EntityResults) != 1 {
+					t.Fatalf("second page: want one entity, got %d", len(secondPage.Batch.EntityResults))
+				}
+				if got := secondPage.Batch.EntityResults[0].Entity.Key.Path[0].GetName(); got != "first" {
+					t.Errorf("second page entity = %q, want first", got)
+				}
+			},
+		},
+		{
 			name: "or_composite",
 			seed: []seedRow{
 				{"a", map[string]*datastorepb.Value{"color": dsStr("red"), "score": dsInt(10)}},
@@ -408,6 +478,22 @@ func TestRunQuery(t *testing.T) {
 				}
 				if resp.Batch.MoreResults != datastorepb.QueryResultBatch_MORE_RESULTS_AFTER_LIMIT {
 					t.Errorf("limit_basic: want MORE_RESULTS_AFTER_LIMIT, got %v", resp.Batch.MoreResults)
+				}
+			},
+		},
+		{
+			name: "limit_exact_result_count",
+			run: func(t *testing.T, s *Server, kind string) {
+				seedKind(t, s, kind, []seedRow{
+					{"a", map[string]*datastorepb.Value{"v": dsInt(1)}},
+					{"b", map[string]*datastorepb.Value{"v": dsInt(2)}},
+				})
+				resp := qKind(t, s, kind, &datastorepb.Query{Limit: wrapperspb.Int32(2)})
+				if got := len(resp.Batch.EntityResults); got != 2 {
+					t.Fatalf("want 2 results, got %d", got)
+				}
+				if got := resp.Batch.MoreResults; got != datastorepb.QueryResultBatch_NO_MORE_RESULTS {
+					t.Errorf("more_results = %v, want NO_MORE_RESULTS", got)
 				}
 			},
 		},
@@ -748,18 +834,8 @@ func TestRunQuery(t *testing.T) {
 				if n := len(r2.Batch.EntityResults); n != 5 {
 					t.Fatalf("page2: want 5, got %d", n)
 				}
-				if r2.Batch.MoreResults != datastorepb.QueryResultBatch_MORE_RESULTS_AFTER_LIMIT {
-					t.Errorf("page2: want MORE_RESULTS_AFTER_LIMIT, got %v", r2.Batch.MoreResults)
-				}
-				r3 := qKind(t, s, kind, &datastorepb.Query{
-					Limit:       wrapperspb.Int32(5),
-					StartCursor: r2.Batch.EndCursor,
-				})
-				if n := len(r3.Batch.EntityResults); n != 0 {
-					t.Errorf("page3: want 0, got %d", n)
-				}
-				if r3.Batch.MoreResults != datastorepb.QueryResultBatch_NO_MORE_RESULTS {
-					t.Errorf("page3: want NO_MORE_RESULTS, got %v", r3.Batch.MoreResults)
+				if r2.Batch.MoreResults != datastorepb.QueryResultBatch_NO_MORE_RESULTS {
+					t.Errorf("page2: want NO_MORE_RESULTS, got %v", r2.Batch.MoreResults)
 				}
 			},
 		},

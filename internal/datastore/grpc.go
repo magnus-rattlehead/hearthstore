@@ -17,13 +17,14 @@ import (
 // request handling to it.
 type GRPCServer struct {
 	datastorepb.UnimplementedDatastoreServer
-	store *storage.Store
-	txMu  sync.Mutex
-	txns  map[string]txEntry
+	store   *storage.Store
+	indexes *IndexManager
+	txMu    sync.Mutex
+	txns    map[string]txEntry
 }
 
-func newGRPCServer(store *storage.Store) *GRPCServer {
-	return &GRPCServer{store: store, txns: make(map[string]txEntry)}
+func newGRPCServer(store *storage.Store, indexes *IndexManager) *GRPCServer {
+	return &GRPCServer{store: store, indexes: indexes, txns: make(map[string]txEntry)}
 }
 
 func newTxID() string {

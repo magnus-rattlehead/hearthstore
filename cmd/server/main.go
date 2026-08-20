@@ -26,6 +26,7 @@ import (
 	adminpb "cloud.google.com/go/datastore/admin/apiv1/adminpb"
 	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
 	firestorepb "cloud.google.com/go/firestore/apiv1/firestorepb"
+	longrunningpb "cloud.google.com/go/longrunning/autogen/longrunningpb"
 
 	"github.com/magnus-rattlehead/hearthstore/internal/datastore"
 	"github.com/magnus-rattlehead/hearthstore/internal/server"
@@ -103,18 +104,35 @@ func main() {
 		log.Fatalf("failed to create data directory: %v", err)
 	}
 
+	storageProgress := beginStartupProgress(
+		"loading storage and ensuring database indexes",
+		"data_dir", *dataDir,
+	)
 	store, err := storage.New(*dataDir)
 	if err != nil {
+		storageProgress.halt()
 		log.Fatalf("failed to open storage: %v", err)
 	}
+	storageProgress.complete(time.Now())
 	defer store.Close()
 
 	if *reindexDS {
-		slog.Info("rebuilding ds_field_index from ds_documents...")
+		reindexProgress := beginStartupProgress("rebuilding Datastore field index")
 		if err := store.RebuildDsFieldIndex(); err != nil {
+			reindexProgress.halt()
 			log.Fatalf("reindex failed: %v", err)
 		}
-		slog.Info("ds_field_index rebuild complete")
+		reindexProgress.complete(time.Now())
+	}
+
+	indexManager := datastore.NewIndexManager(store, filepath.Join(*dataDir, "index.generated.yaml"))
+	if *mode == "datastore" || *mode == "both" {
+		indexProgress := beginStartupProgress("loading and building Datastore composite indexes")
+		if err := indexManager.LoadIndexFiles(context.Background(), *indexConfig); err != nil {
+			indexProgress.halt()
+			log.Fatalf("failed to initialize Datastore indexes: %v", err)
+		}
+		indexProgress.complete(time.Now())
 	}
 
 	ops := server.NewOperationLog(startTime.Format("20060102T150405.000000000Z0700"))
@@ -125,10 +143,10 @@ func main() {
 	case "firestore":
 		serveFirestore(*port, *webPort, store, ops, dash, unary, streaming)
 	case "datastore":
-		serveDatastore(*datastoreAddr, store, *indexConfig, ops, dash, unary)
+		serveDatastore(*datastoreAddr, store, indexManager, ops, dash, unary)
 	case "both":
 		go serveFirestore(*port, *webPort, store, ops, dash, unary, streaming)
-		serveDatastore(*datastoreAddr, store, *indexConfig, ops, dash, unary)
+		serveDatastore(*datastoreAddr, store, indexManager, ops, dash, unary)
 	default:
 		log.Fatalf("unknown mode %q: use firestore, datastore, or both", *mode)
 	}
@@ -912,21 +930,19 @@ func queryAttrs(parent string, q *firestorepb.StructuredQuery) []any {
 	return attrs
 }
 
-func serveDatastore(addr string, store *storage.Store, indexConfig string, ops *server.OperationLog, dash http.Handler, unary grpc.UnaryServerInterceptor) {
+func serveDatastore(addr string, store *storage.Store, indexManager *datastore.IndexManager, ops *server.OperationLog, dash http.Handler, unary grpc.UnaryServerInterceptor) {
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatalf("datastore: failed to listen: %v", err)
 	}
-	ds := datastore.New(store)
+	ds := datastore.NewWithIndexManager(store, indexManager)
 	grpcServer := grpc.NewServer(
 		grpc.ChainUnaryInterceptor(unary),
 	)
 	datastorepb.RegisterDatastoreServer(grpcServer, ds.NewGRPCServer())
-	adminSrv, err := datastore.NewAdminServer(indexConfig)
-	if err != nil {
-		log.Fatalf("datastore: failed to load index config: %v", err)
-	}
+	adminSrv := datastore.NewAdminServer(store, indexManager)
 	adminpb.RegisterDatastoreAdminServer(grpcServer, adminSrv)
+	longrunningpb.RegisterOperationsServer(grpcServer, adminSrv.Operations())
 	reflection.Register(grpcServer)
 	slog.Info("hearthstore listening", "protocol", "grpc+http", "addr", addr)
 	slog.Info("set env var", "DATASTORE_EMULATOR_HOST", addr)
