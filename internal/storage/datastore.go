@@ -1,1528 +1,735 @@
 package storage
 
 import (
-	"database/sql"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
+	"math/bits"
+	"slices"
 	"strings"
 	"time"
 
+	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
+	"github.com/dgraph-io/badger/v4"
+	"github.com/magnus-rattlehead/hearthstore/internal/keycodec"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
-
-	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
 )
 
-// DsSortSpec describes one ORDER BY field for SQL-level keyset pagination.
-type DsSortSpec struct {
-	FieldPath  string // property name
-	Col        string // auto-detected ds_field_index column (value_string/value_int/etc.)
-	Desc       bool
-	FilterSQL  string
-	FilterArgs []any
-}
-
-// CursorSortKV holds the sort-field value for one ORDER BY field in a keyset cursor.
-type CursorSortKV struct {
-	Col  string `json:"c"`           // ds_field_index column name
-	V    string `json:"v"`           // sort value serialized as string
-	Null bool   `json:"n,omitempty"` // true when the sort field value is null or absent
-}
-
-// CursorPayload is the structured cursor for keyset pagination; JSON-marshaled
-// and URL-safe base64-encoded before transmission.
 type CursorPayload struct {
-	V int            `json:"v"`           // cursor format version
-	P string         `json:"p"`           // entity path (tie-breaker)
-	S []CursorSortKV `json:"s,omitempty"` // legacy-EAV sort values within v2 cursors
-	I string         `json:"i,omitempty"` // composite index ID
-	G int64          `json:"g,omitempty"` // composite index generation
-	K []byte         `json:"k,omitempty"` // encoded composite index key
+	Before bool   `json:"-"`           // Request-local reversed boundary; never serialized.
+	B      []byte `json:"b,omitempty"` // Logical order tuple, independent of the access index.
+	D      string `json:"d,omitempty"`
+	O      int    `json:"o,omitempty"`
+	H      []byte `json:"h,omitempty"`
+	V      int    `json:"v"`
+	P      string `json:"p"`
+	I      string `json:"i,omitempty"`
+	G      int64  `json:"g,omitempty"`
+	K      []byte `json:"k,omitempty"`
 }
 
-// ErrColumnNotDetected is returned by DsQueryKindLimited when a sort field has
-// no indexed data, preventing SQL ORDER BY column auto-detection.
-var ErrColumnNotDetected = errors.New("sort column not found in field index")
-
-// dbExec is defined in storage.go (shared with document.go).
-
-// DsGet fetches a single active entity. Returns (nil, 0, codes.NotFound) if absent or deleted.
-func (s *Store) DsGet(project, database, namespace, path string) (*datastorepb.Entity, int64, error) {
-	var data []byte
-	var version int64
-	err := s.rdb.QueryRow(
-		`SELECT data, version FROM ds_documents
-		 WHERE project=? AND database=? AND namespace=? AND path=? AND deleted=0`,
-		project, database, namespace, path,
-	).Scan(&data, &version)
-	if err == sql.ErrNoRows {
-		return nil, 0, status.Errorf(codes.NotFound, "entity not found: %s", path)
-	}
-	if err != nil {
-		return nil, 0, fmt.Errorf("ds get: %w", err)
-	}
-	var e datastorepb.Entity
-	if err := proto.Unmarshal(data, &e); err != nil {
-		return nil, 0, fmt.Errorf("ds unmarshal: %w", err)
-	}
-	return &e, version, nil
+type dsRecord struct {
+	Data       []byte `json:"data,omitempty"`
+	Kind       string `json:"kind"`
+	ParentPath string `json:"parent_path"`
+	Version    int64  `json:"version"`
+	Created    int64  `json:"created"`
+	Updated    int64  `json:"updated"`
+	Deleted    bool   `json:"deleted,omitempty"`
+}
+type DsEntityRow struct {
+	ProjectionOffset       int
+	Entity                 *datastorepb.Entity
+	Version                int64
+	CreateTime, UpdateTime *timestamppb.Timestamp
+	Path                   string
+	IndexKey               []byte
 }
 
-// DsGetWithTimes fetches an entity plus its create/update timestamps.
-func (s *Store) DsGetWithTimes(project, database, namespace, path string) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, error) {
-	var data []byte
-	var version int64
-	var createStr, updateStr string
-	err := s.rdb.QueryRow(
-		`SELECT data, version, create_time, update_time FROM ds_documents
-		 WHERE project=? AND database=? AND namespace=? AND path=? AND deleted=0`,
-		project, database, namespace, path,
-	).Scan(&data, &version, &createStr, &updateStr)
-	if err == sql.ErrNoRows {
-		return nil, 0, nil, nil, status.Errorf(codes.NotFound, "entity not found: %s", path)
-	}
-	if err != nil {
-		return nil, 0, nil, nil, fmt.Errorf("ds get: %w", err)
-	}
-	var e datastorepb.Entity
-	if err := proto.Unmarshal(data, &e); err != nil {
-		return nil, 0, nil, nil, fmt.Errorf("ds unmarshal: %w", err)
-	}
-	ct, _ := time.Parse(timeLayout, createStr)
-	ut, _ := time.Parse(timeLayout, updateStr)
-	return &e, version, timestamppb.New(ct), timestamppb.New(ut), nil
+// EntityWrite identifies an entity and its optional version precondition.
+// Updates retain the stored kind and parent; inserts ignore BaseVersion.
+type EntityWrite struct {
+	Project, Database, Namespace string
+	Path, Kind, ParentPath       string
+	Entity                       *datastorepb.Entity
+	BaseVersion                  int64
 }
 
-// DsGetManyWithTimes fetches multiple entities by path in one SQL query.
-// Keys are grouped by (project, database, namespace); paths must be unique within each group.
-// Returns found rows and the paths that were absent or deleted (missing).
-func (s *Store) DsGetManyWithTimes(project, database, namespace string, paths []string) ([]*DsEntityRow, []string, error) {
-	if len(paths) == 0 {
-		return nil, nil, nil
-	}
-	ph := strings.Repeat("?,", len(paths))
-	ph = ph[:len(ph)-1]
-	args := make([]any, 0, 3+len(paths))
-	args = append(args, project, database, namespace)
-	pathSet := make(map[string]struct{}, len(paths))
-	for _, p := range paths {
-		args = append(args, p)
-		pathSet[p] = struct{}{}
-	}
-	rows, err := s.rdb.Query(
-		`SELECT data, version, create_time, update_time, path FROM ds_documents
-		 WHERE project=? AND database=? AND namespace=? AND deleted=0 AND path IN (`+ph+`)`,
-		args...,
-	)
-	if err != nil {
-		return nil, nil, fmt.Errorf("ds get many: %w", err)
-	}
-	defer rows.Close()
-	var found []*DsEntityRow
-	for rows.Next() {
-		var data []byte
-		var version int64
-		var createStr, updateStr, path string
-		if err := rows.Scan(&data, &version, &createStr, &updateStr, &path); err != nil {
-			return nil, nil, fmt.Errorf("ds get many scan: %w", err)
-		}
-		var e datastorepb.Entity
-		if err := proto.Unmarshal(data, &e); err != nil {
-			return nil, nil, fmt.Errorf("ds get many unmarshal: %w", err)
-		}
-		ct, _ := time.Parse(timeLayout, createStr)
-		ut, _ := time.Parse(timeLayout, updateStr)
-		found = append(found, &DsEntityRow{
-			Entity:     &e,
-			Version:    version,
-			CreateTime: timestamppb.New(ct),
-			UpdateTime: timestamppb.New(ut),
-			Path:       path,
-		})
-		delete(pathSet, path)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("ds get many: %w", err)
-	}
-	missing := make([]string, 0, len(pathSet))
-	for p := range pathSet {
-		missing = append(missing, p)
-	}
-	return found, missing, nil
+// WriteResult describes either a persisted write or a version conflict.
+// On conflict, Version is the stored version and no write is performed.
+type WriteResult struct {
+	Entity                 *datastorepb.Entity
+	Version                int64
+	CreateTime, UpdateTime *timestamppb.Timestamp
+	Conflict               bool
 }
 
-// DsInsert creates a new entity, returning codes.AlreadyExists if one is active.
-func (s *Store) DsInsert(project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, error) {
-	return dsInsertExec(s.wdb, project, database, namespace, path, kind, parentPath, entity, nil)
+type putOptions struct {
+	insertOnly, updateOnly, knownMissing bool
 }
 
-// DsInsertTx is like DsInsert but runs within the provided transaction.
-// Pass acc to defer change-log and field-index writes for bulk flushing.
-func (s *Store) DsInsertTx(tx *sql.Tx, project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity, acc *CommitAccumulator) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, error) {
-	return dsInsertExec(tx, project, database, namespace, path, kind, parentPath, entity, acc)
-}
-
-func dsInsertExec(exec dbExec, project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity, acc *CommitAccumulator) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, error) {
-	var dummy int
-	err := exec.QueryRow(
-		`SELECT 1 FROM ds_documents WHERE project=? AND database=? AND namespace=? AND path=? AND deleted=0`,
-		project, database, namespace, path,
-	).Scan(&dummy)
-	if err == nil {
-		return nil, 0, nil, nil, status.Errorf(codes.AlreadyExists, "entity already exists: %s", path)
-	}
-	now := timestamppb.Now()
-	e := proto.Clone(entity).(*datastorepb.Entity)
-	ver, err := dsSaveExec(exec, project, database, namespace, path, kind, parentPath, e, 0, now, now, acc)
-	return e, ver, now, now, err
-}
-
-// DsUpdate merges into an existing entity. Returns codes.NotFound if absent.
-// If baseVersion > 0 and current version differs, returns conflictDetected=true without writing.
-func (s *Store) DsUpdate(project, database, namespace, path string, entity *datastorepb.Entity, baseVersion int64) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
-	return dsUpdateExec(s.wdb, project, database, namespace, path, entity, baseVersion, nil)
-}
-
-// DsUpdateTx is like DsUpdate but runs within the provided transaction.
-// Pass acc to defer change-log and field-index writes for bulk flushing.
-func (s *Store) DsUpdateTx(tx *sql.Tx, project, database, namespace, path string, entity *datastorepb.Entity, baseVersion int64, acc *CommitAccumulator) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
-	return dsUpdateExec(tx, project, database, namespace, path, entity, baseVersion, acc)
-}
-
-func dsUpdateExec(exec dbExec, project, database, namespace, path string, entity *datastorepb.Entity, baseVersion int64, acc *CommitAccumulator) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
-	var data []byte
-	var curVersion int64
-	var createStr, kind, parentPath string
-	err := exec.QueryRow(
-		`SELECT data, version, create_time, kind, parent_path FROM ds_documents
-		 WHERE project=? AND database=? AND namespace=? AND path=? AND deleted=0`,
-		project, database, namespace, path,
-	).Scan(&data, &curVersion, &createStr, &kind, &parentPath)
-	if err == sql.ErrNoRows {
-		return nil, 0, nil, nil, false, status.Errorf(codes.NotFound, "entity not found: %s", path)
-	}
-	if err != nil {
-		return nil, 0, nil, nil, false, fmt.Errorf("ds update read: %w", err)
-	}
-
-	if baseVersion > 0 && curVersion != baseVersion {
-		return nil, curVersion, nil, nil, true, nil // conflict, no write
-	}
-
-	ct, _ := time.Parse(timeLayout, createStr)
-	createTime := timestamppb.New(ct)
-	now := timestamppb.Now()
-
-	e := proto.Clone(entity).(*datastorepb.Entity)
-	newVer, err := dsSaveExec(exec, project, database, namespace, path, kind, parentPath, e, curVersion, createTime, now, acc)
-	return e, newVer, createTime, now, false, err
-}
-
-// DsUpsert creates or replaces an entity, preserving create_time for existing docs.
-// If baseVersion > 0 and the entity exists with a different version, returns conflictDetected=true.
-func (s *Store) DsUpsert(project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity, baseVersion int64) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
-	return dsUpsertExec(s.wdb, project, database, namespace, path, kind, parentPath, entity, baseVersion, nil)
-}
-
-// DsUpsertTx is like DsUpsert but runs within the provided transaction.
-// Pass acc to defer change-log and field-index writes for bulk flushing.
-func (s *Store) DsUpsertTx(tx *sql.Tx, project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity, baseVersion int64, acc *CommitAccumulator) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
-	return dsUpsertExec(tx, project, database, namespace, path, kind, parentPath, entity, baseVersion, acc)
-}
-
-// UpsertManyRow describes one entity in a bulk upsert.
 type UpsertManyRow struct {
 	Namespace, Path, Kind, ParentPath string
 	Entity                            *datastorepb.Entity
+	AllocateID                        bool
+	AllocatedID                       bool
 }
-
-// DsUpsertManyTx upserts multiple entities in a single SQL statement (baseVersion=0 only).
-// Returns a map from path to new version. Change-log and field-index writes are deferred to acc.
-func (s *Store) DsUpsertManyTx(tx *sql.Tx, project, database string, rows []UpsertManyRow, now *timestamppb.Timestamp, acc *CommitAccumulator) (map[string]int64, error) {
-	if len(rows) == 0 {
-		return nil, nil
-	}
-	nowStr := now.AsTime().UTC().Format(timeLayout)
-
-	const colCount = 9 // number of ? per row in VALUES
-	const prefix = `INSERT INTO ds_documents ` +
-		`(project, database, namespace, path, kind, parent_path, data, create_time, update_time, version, deleted) VALUES `
-	const placeholder = `(?,?,?,?,?,?,?,?,?,1,0)`
-	const suffix = `
-		ON CONFLICT (project, database, namespace, path) DO UPDATE SET
-			kind        = excluded.kind,
-			parent_path = excluded.parent_path,
-			data        = excluded.data,
-			create_time = CASE WHEN ds_documents.deleted = 0 THEN ds_documents.create_time ELSE excluded.create_time END,
-			update_time = excluded.update_time,
-			version     = ds_documents.version + 1,
-			deleted     = 0
-		RETURNING path, version`
-
-	type marshaledRow struct {
-		UpsertManyRow
-		data []byte
-	}
-	mRows := make([]marshaledRow, len(rows))
-	for i, r := range rows {
-		data, err := proto.Marshal(r.Entity)
-		if err != nil {
-			return nil, fmt.Errorf("ds upsert many marshal %s: %w", r.Path, err)
-		}
-		mRows[i] = marshaledRow{r, data}
-	}
-
-	// Build and execute batch INSERT in chunks of 500 to stay within SQLite's variable limit.
-	const batchSize = 500
-	versions := make(map[string]int64, len(rows))
-
-	for start := 0; start < len(mRows); start += batchSize {
-		end := start + batchSize
-		if end > len(mRows) {
-			end = len(mRows)
-		}
-		batch := mRows[start:end]
-
-		var sb strings.Builder
-		sb.WriteString(prefix)
-		args := make([]any, 0, len(batch)*colCount)
-		for i, r := range batch {
-			if i > 0 {
-				sb.WriteByte(',')
-			}
-			sb.WriteString(placeholder)
-			args = append(args, project, database, r.Namespace, r.Path, r.Kind, r.ParentPath, r.data, nowStr, nowStr)
-		}
-		sb.WriteString(suffix)
-
-		sqlRows, err := tx.Query(sb.String(), args...)
-		if err != nil {
-			return nil, fmt.Errorf("ds upsert many: %w", err)
-		}
-		for sqlRows.Next() {
-			var path string
-			var ver int64
-			if err := sqlRows.Scan(&path, &ver); err != nil {
-				sqlRows.Close()
-				return nil, fmt.Errorf("ds upsert many scan: %w", err)
-			}
-			versions[path] = ver
-		}
-		sqlRows.Close()
-		if err := sqlRows.Err(); err != nil {
-			return nil, fmt.Errorf("ds upsert many rows: %w", err)
-		}
-	}
-
-	for _, r := range mRows {
-		acc.changes = append(acc.changes, changeRow{
-			project: project, database: database, namespace: r.Namespace,
-			path: r.Path, kind: r.Kind, parentPath: r.ParentPath,
-			changeTime: nowStr, deleted: 0, data: r.data,
-		})
-		acc.fiDeletes = append(acc.fiDeletes, fiDeleteKey{project, database, r.Namespace, r.Path})
-		acc.ciDocs = append(acc.ciDocs, ciDoc{project, database, r.Namespace, r.Path, r.Kind, r.ParentPath, r.Entity})
-		for propName, v := range r.Entity.Properties {
-			var fiRows []dsFiRow
-			dsCollectValue(propName, v, false, &fiRows)
-			for _, fr := range fiRows {
-				acc.fiInserts = append(acc.fiInserts, fiBulkRow{project, database, r.Namespace, r.Kind, r.Path, fr})
-			}
-		}
-	}
-
-	return versions, nil
-}
-
-func dsUpsertExec(exec dbExec, project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity, baseVersion int64, acc *CommitAccumulator) (*datastorepb.Entity, int64, *timestamppb.Timestamp, *timestamppb.Timestamp, bool, error) {
-	now := timestamppb.Now()
-
-	// Fast path: no baseVersion conflict check needed - skip the SELECT and use
-	// a single INSERT ON CONFLICT DO UPDATE with RETURNING to get the new version.
-	if baseVersion == 0 {
-		e := proto.Clone(entity).(*datastorepb.Entity)
-		data, err := proto.Marshal(e)
-		if err != nil {
-			return nil, 0, nil, nil, false, fmt.Errorf("ds marshal: %w", err)
-		}
-		nowStr := now.AsTime().UTC().Format(timeLayout)
-		var newVer int64
-		if err := exec.QueryRow(`
-			INSERT INTO ds_documents
-				(project, database, namespace, path, kind, parent_path, data, create_time, update_time, version, deleted)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
-			ON CONFLICT (project, database, namespace, path) DO UPDATE SET
-				kind        = excluded.kind,
-				parent_path = excluded.parent_path,
-				data        = excluded.data,
-				create_time = CASE WHEN ds_documents.deleted = 0 THEN ds_documents.create_time ELSE excluded.create_time END,
-				update_time = excluded.update_time,
-				version     = ds_documents.version + 1,
-				deleted     = 0
-			RETURNING version`,
-			project, database, namespace, path, kind, parentPath, data, nowStr, nowStr,
-		).Scan(&newVer); err != nil {
-			return nil, 0, nil, nil, false, err
-		}
-		if acc != nil {
-			acc.changes = append(acc.changes, changeRow{
-				project: project, database: database, namespace: namespace,
-				path: path, kind: kind, parentPath: parentPath,
-				changeTime: nowStr, deleted: 0, data: data,
-			})
-			acc.fiDeletes = append(acc.fiDeletes, fiDeleteKey{project, database, namespace, path})
-			acc.ciDocs = append(acc.ciDocs, ciDoc{project, database, namespace, path, kind, parentPath, e})
-			for propName, v := range e.Properties {
-				var fiRows []dsFiRow
-				dsCollectValue(propName, v, false, &fiRows)
-				for _, r := range fiRows {
-					acc.fiInserts = append(acc.fiInserts, fiBulkRow{project, database, namespace, kind, path, r})
-				}
-			}
-		} else {
-			if _, err := exec.Exec(`
-				INSERT INTO ds_document_changes
-					(project, database, namespace, path, kind, parent_path, change_time, deleted, data)
-				VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
-				project, database, namespace, path, kind, parentPath, nowStr, data,
-			); err != nil {
-				return nil, 0, nil, nil, false, err
-			}
-			if err := dsIndexDocFields(exec, project, database, namespace, kind, path, e); err != nil {
-				return nil, 0, nil, nil, false, err
-			}
-			if err := dsMaintainCompositeIndexes(exec, project, database, namespace, kind, path, parentPath, e); err != nil {
-				return nil, 0, nil, nil, false, err
-			}
-		}
-		return e, newVer, now, now, false, nil
-	}
-
-	// Slow path: baseVersion check requires reading current state first.
-	createTime := now
-	var curVersion int64
-	var createStr string
-	err := exec.QueryRow(
-		`SELECT version, create_time FROM ds_documents
-		 WHERE project=? AND database=? AND namespace=? AND path=? AND deleted=0`,
-		project, database, namespace, path,
-	).Scan(&curVersion, &createStr)
-	if err == nil {
-		if curVersion != baseVersion {
-			return nil, curVersion, nil, nil, true, nil // conflict
-		}
-		ct, _ := time.Parse(timeLayout, createStr)
-		createTime = timestamppb.New(ct)
-	}
-
-	e := proto.Clone(entity).(*datastorepb.Entity)
-	newVer, err := dsSaveExec(exec, project, database, namespace, path, kind, parentPath, e, curVersion, createTime, now, acc)
-	return e, newVer, createTime, now, false, err
-}
-
-// DsDelete soft-deletes an entity. No-ops silently if absent.
-func (s *Store) DsDelete(project, database, namespace, path string) error {
-	return dsDeleteExec(s.wdb, project, database, namespace, path, nil)
-}
-
-// DsDeleteTx is like DsDelete but runs within the provided transaction.
-// Pass acc to defer field-index and change-log writes for bulk flushing.
-func (s *Store) DsDeleteTx(tx *sql.Tx, project, database, namespace, path string, acc *CommitAccumulator) error {
-	return dsDeleteExec(tx, project, database, namespace, path, acc)
-}
-
-func dsDeleteExec(exec dbExec, project, database, namespace, path string, acc *CommitAccumulator) error {
-	now := time.Now().UTC().Format(timeLayout)
-	// Soft-delete and retrieve kind/parent_path in one round-trip via RETURNING.
-	var kind, parentPath string
-	err := exec.QueryRow(
-		`UPDATE ds_documents SET deleted=1, update_time=?
-		 WHERE project=? AND database=? AND namespace=? AND path=? AND deleted=0
-		 RETURNING kind, parent_path`,
-		now, project, database, namespace, path,
-	).Scan(&kind, &parentPath)
-	if err == sql.ErrNoRows {
-		return nil // entity absent or already deleted - no-op
-	}
-	if err != nil {
-		return err
-	}
-
-	if acc != nil {
-		acc.fiDeletes = append(acc.fiDeletes, fiDeleteKey{project, database, namespace, path})
-		acc.ciDocs = append(acc.ciDocs, ciDoc{project, database, namespace, path, kind, parentPath, nil})
-		acc.changes = append(acc.changes, changeRow{
-			project: project, database: database, namespace: namespace,
-			path: path, kind: kind, parentPath: parentPath,
-			changeTime: now, deleted: 1, data: nil,
-		})
-		return nil
-	}
-
-	if _, err := exec.Exec(
-		`DELETE FROM ds_field_index WHERE project=? AND database=? AND namespace=? AND doc_path=?`,
-		project, database, namespace, path,
-	); err != nil {
-		return fmt.Errorf("ds_field_index delete: %w", err)
-	}
-	if err := dsMaintainCompositeIndexes(exec, project, database, namespace, kind, path, parentPath, nil); err != nil {
-		return err
-	}
-	_, err = exec.Exec(`
-		INSERT INTO ds_document_changes
-			(project, database, namespace, path, kind, parent_path, change_time, deleted, data)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 1, NULL)`,
-		project, database, namespace, path, kind, parentPath, now,
-	)
-	return err
-}
-
-// DsQueryKind returns all active entities of a given kind under parentPath.
-// If parentPath is empty, returns all entities of that kind in the namespace.
-// If ancestorPath is non-empty, further filters to entities whose path starts with ancestorPath.
-// filterSQL / filterArgs are optional SQL conditions generated by buildDsWhereClause;
-// they are correlated against table alias "d" and ANDed into the WHERE clause.
-func (s *Store) DsQueryKind(project, database, namespace, kind, ancestorPath string, filterSQL string, filterArgs []any) ([]*DsEntityRow, error) {
-	var (
-		rows *sql.Rows
-		err  error
-	)
-	if ancestorPath != "" {
-		// HAS_ANCESTOR: path == ancestorPath OR path LIKE ancestorPath + '/%'
-		q := `SELECT data, version, create_time, update_time, path FROM ds_documents d
-			  WHERE project=? AND database=? AND namespace=? AND kind=? AND deleted=0
-			    AND (path=? OR path LIKE ?)`
-		qArgs := []any{project, database, namespace, kind, ancestorPath, ancestorPath + "/%"}
-		if filterSQL != "" {
-			q += " AND " + filterSQL
-			qArgs = append(qArgs, filterArgs...)
-		}
-		rows, err = s.rdb.Query(q, qArgs...)
-	} else {
-		q := `SELECT data, version, create_time, update_time, path FROM ds_documents d
-			  WHERE project=? AND database=? AND namespace=? AND kind=? AND deleted=0`
-		qArgs := []any{project, database, namespace, kind}
-		if filterSQL != "" {
-			q += " AND " + filterSQL
-			qArgs = append(qArgs, filterArgs...)
-		}
-		rows, err = s.rdb.Query(q, qArgs...)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("ds query kind: %w", err)
-	}
-	defer rows.Close()
-
-	var results []*DsEntityRow
-	for rows.Next() {
-		var data []byte
-		var version int64
-		var createStr, updateStr, path string
-		if err := rows.Scan(&data, &version, &createStr, &updateStr, &path); err != nil {
-			return nil, fmt.Errorf("ds scan: %w", err)
-		}
-		var e datastorepb.Entity
-		if err := proto.Unmarshal(data, &e); err != nil {
-			return nil, fmt.Errorf("ds unmarshal: %w", err)
-		}
-		ct, _ := time.Parse(timeLayout, createStr)
-		ut, _ := time.Parse(timeLayout, updateStr)
-		results = append(results, &DsEntityRow{
-			Entity:     &e,
-			Version:    version,
-			CreateTime: timestamppb.New(ct),
-			UpdateTime: timestamppb.New(ut),
-			Path:       path,
-		})
-	}
-	return results, rows.Err()
-}
-
-// DsEntityRow holds a fetched entity with metadata.
-type DsEntityRow struct {
-	Entity     *datastorepb.Entity
+type UpsertManyResult struct {
 	Version    int64
-	CreateTime *timestamppb.Timestamp
+	Key        *datastorepb.Key
 	UpdateTime *timestamppb.Timestamp
-	Path       string
-	IndexKey   []byte
+}
+type compositeIndexCacheKey struct {
+	project string
+	kind    string
 }
 
-// DsQueryKindLimited runs a paginated kind query with ORDER BY, keyset cursor,
-// and LIMIT pushed into SQLite. Returns the filled-in sort specs (with Col populated)
-// alongside the entity rows.
-//
-// If a sort field has no indexed data, ErrColumnNotDetected is returned and the
-// caller should fall back to DsQueryKind + Go-side processing.
-func (s *Store) DsQueryKindLimited(
-	project, database, namespace, kind, ancestorPath string,
-	filterSQL string, filterArgs []any,
-	sorts []DsSortSpec,
-	cursor *CursorPayload,
-	limit int,
-) ([]DsSortSpec, []*DsEntityRow, error) {
-	// Make a local copy so we can fill in Col without mutating the caller's slice.
-	localSorts := make([]DsSortSpec, len(sorts))
-	copy(localSorts, sorts)
-	for i := range localSorts {
-		if localSorts[i].Col != "" {
-			continue
-		}
-		col, err := s.detectSortColumn(project, database, namespace, kind, localSorts[i].FieldPath)
-		if err != nil {
-			return nil, nil, err
-		}
-		localSorts[i].Col = col
-	}
-	rows, err := s.runLimitedQuery(project, database, namespace, kind, ancestorPath,
-		filterSQL, filterArgs, localSorts, cursor, limit)
-	return localSorts, rows, err
+// CommitAccumulator caches index definitions for one transaction; writes are immediate.
+type CommitAccumulator struct {
+	compositeIndexes map[compositeIndexCacheKey][]DsCompositeIndex
 }
 
-// detectSortColumn probes ds_field_index to find which value column a field uses.
-func (s *Store) detectSortColumn(project, database, namespace, kind, fieldPath string) (string, error) {
-	var vStr *string
-	var vInt *int64
-	var vDouble *float64
-	var vBool *int64
-	var vNull *int64
-	var vRef *string
-	err := s.rdb.QueryRow(
-		`SELECT value_string, value_int, value_double, value_bool, value_null, value_ref
-		 FROM ds_field_index
-		 WHERE project=? AND database=? AND namespace=? AND kind=? AND field_path=? AND in_array=0
-		 LIMIT 1`,
-		project, database, namespace, kind, fieldPath,
-	).Scan(&vStr, &vInt, &vDouble, &vBool, &vNull, &vRef)
-	if err == sql.ErrNoRows {
-		return "", ErrColumnNotDetected
+func NewCommitAccumulator() *CommitAccumulator {
+	return &CommitAccumulator{
+		compositeIndexes: make(map[compositeIndexCacheKey][]DsCompositeIndex),
 	}
+}
+
+func dsPrefix(project, database, namespace string) []byte {
+	return []byte("ds/doc/" + enc(project) + "/" + enc(database) + "/" + enc(namespace) + "/")
+}
+func dsKey(project, database, namespace, path string) []byte {
+	return append(dsPrefix(project, database, namespace), enc(path)...)
+}
+func dsKindPrefix(project, database, namespace, kind string) []byte {
+	return []byte("ds/kind/" + enc(project) + "/" + enc(database) + "/" + enc(namespace) + "/" + enc(kind) + "/")
+}
+func dsKindKey(project, database, namespace, kind, path string) []byte {
+	return append(dsKindPrefix(project, database, namespace, kind), enc(path)...)
+}
+
+func indexScopes(path string) []string {
+	parts := strings.Split(path, "/")
+	scopes := []string{""}
+	for end := 2; end <= len(parts); end += 2 {
+		scopes = append(scopes, strings.Join(parts[:end], "/"))
+	}
+	return scopes
+}
+
+func indexScopeSegment(ancestor string) string {
+	if ancestor == "" {
+		return "_"
+	}
+	return "a" + enc(ancestor)
+}
+func decodeDS(v []byte) (dsRecord, *datastorepb.Entity, error) {
+	r, err := decodeRecord(v)
 	if err != nil {
-		return "", fmt.Errorf("detect sort column: %w", err)
+		return r, nil, err
 	}
-	switch {
-	case vInt != nil:
-		return "value_int", nil
-	case vDouble != nil:
-		return "value_double", nil
-	case vStr != nil:
-		return "value_string", nil
-	case vBool != nil:
-		return "value_bool", nil
-	case vNull != nil:
-		return "value_null", nil
-	case vRef != nil:
-		return "value_ref", nil
-	default:
-		return "", ErrColumnNotDetected
-	}
-}
-
-// runPathSortQuery handles ORDER BY __key__ (Col == "__path__") by ordering
-// directly on d.path without any ds_field_index join. Uses idx_ds_kind_path for
-// O(page-size) scans.
-func (s *Store) runPathSortQuery(
-	project, database, namespace, kind, ancestorPath string,
-	filterSQL string, filterArgs []any,
-	sort DsSortSpec,
-	cursor *CursorPayload,
-	limit int,
-) ([]*DsEntityRow, error) {
-	var sb strings.Builder
-	var args []any
-
-	sb.WriteString(`SELECT d.data, d.version, d.create_time, d.update_time, d.path`)
-	sb.WriteString(` FROM ds_documents d`)
-	sb.WriteString(` WHERE d.project=? AND d.database=? AND d.namespace=? AND d.kind=? AND d.deleted=0`)
-	args = append(args, project, database, namespace, kind)
-
-	if ancestorPath != "" {
-		sb.WriteString(` AND (d.path=? OR d.path LIKE ?)`)
-		args = append(args, ancestorPath, ancestorPath+"/%")
-	}
-	if filterSQL != "" {
-		sb.WriteString(` AND `)
-		sb.WriteString(filterSQL)
-		args = append(args, filterArgs...)
-	}
-	if cursor != nil {
-		op := ">"
-		if sort.Desc {
-			op = "<"
-		}
-		fmt.Fprintf(&sb, ` AND d.path %s ?`, op)
-		args = append(args, cursor.P)
-	}
-
-	if sort.Desc {
-		sb.WriteString(` ORDER BY d.path DESC`)
-	} else {
-		sb.WriteString(` ORDER BY d.path ASC`)
-	}
-	fmt.Fprintf(&sb, ` LIMIT ?`)
-	args = append(args, limit)
-
-	return s.scanEntityRows(sb.String(), args)
-}
-
-// runSingleSortQuery handles the common single-ORDER-BY case by driving from
-// ds_field_index (INNER JOIN to ds_documents). This lets SQLite use the
-// idx_ds_field_sort_* covering indexes to scan in ORDER BY order and stop at
-// LIMIT, making each page O(page-size) rather than O(kind-size).
-func (s *Store) runSingleSortQuery(
-	project, database, namespace, kind, ancestorPath string,
-	filterSQL string, filterArgs []any,
-	sort DsSortSpec,
-	cursor *CursorPayload,
-	limit int,
-) ([]*DsEntityRow, error) {
-	var sb strings.Builder
-	var args []any
-
-	sb.WriteString(`SELECT d.data, d.version, d.create_time, d.update_time, d.path`)
-	sb.WriteString(` FROM ds_field_index fi`)
-	sb.WriteString(` INNER JOIN ds_documents d`)
-	sb.WriteString(` ON d.project=fi.project AND d.database=fi.database`)
-	sb.WriteString(` AND d.namespace=fi.namespace AND d.path=fi.doc_path AND d.deleted=0`)
-
-	sb.WriteString(` WHERE fi.project=? AND fi.database=? AND fi.namespace=? AND fi.kind=?`)
-	sb.WriteString(` AND fi.field_path=? AND fi.in_array=0`)
-	args = append(args, project, database, namespace, kind, sort.FieldPath)
-
-	if ancestorPath != "" {
-		sb.WriteString(` AND (d.path=? OR d.path LIKE ?)`)
-		args = append(args, ancestorPath, ancestorPath+"/%")
-	}
-	if sort.FilterSQL != "" {
-		sb.WriteString(` AND `)
-		sb.WriteString(sort.FilterSQL)
-		args = append(args, sort.FilterArgs...)
-	}
-	if filterSQL != "" {
-		sb.WriteString(` AND `)
-		sb.WriteString(filterSQL)
-		args = append(args, filterArgs...)
-	}
-
-	if cursor != nil && len(cursor.S) > 0 {
-		kv := cursor.S[0]
-		if kv.Null {
-			if sort.Desc {
-				// Null comes last in DESC; remaining nulls are after cursor path.
-				fmt.Fprintf(&sb, ` AND (fi.%s IS NULL AND d.path > ?)`, sort.Col)
-				args = append(args, cursor.P)
-			} else {
-				// Null comes first in ASC; remaining are non-nulls OR nulls after cursor path.
-				fmt.Fprintf(&sb, ` AND (fi.%s IS NOT NULL OR (fi.%s IS NULL AND d.path > ?))`, sort.Col, sort.Col)
-				args = append(args, cursor.P)
-			}
-		} else {
-			cv := parseCursorValue(kv.Col, kv.V)
-			op := ">"
-			if sort.Desc {
-				op = "<"
-				// Include null-valued entities that come after all non-nulls in DESC order.
-				fmt.Fprintf(&sb, ` AND ((fi.%s %s ?) OR (fi.%s = ? AND d.path > ?) OR fi.%s IS NULL)`, sort.Col, op, sort.Col, sort.Col)
-			} else {
-				fmt.Fprintf(&sb, ` AND ((fi.%s %s ?) OR (fi.%s = ? AND d.path > ?))`, sort.Col, op, sort.Col)
-			}
-			args = append(args, cv, cv, cursor.P)
-		}
-	} else if cursor != nil {
-		sb.WriteString(` AND d.path > ?`)
-		args = append(args, cursor.P)
-	}
-
-	fmt.Fprintf(&sb, ` ORDER BY fi.%s`, sort.Col)
-	if sort.Desc {
-		sb.WriteString(` DESC`)
-	} else {
-		sb.WriteString(` ASC`)
-	}
-	sb.WriteString(`, d.path ASC`)
-	fmt.Fprintf(&sb, ` LIMIT ?`)
-	args = append(args, limit)
-
-	return s.scanEntityRows(sb.String(), args)
-}
-
-// scanEntityRows executes a query that selects (data, version, create_time, update_time, path)
-// and returns the decoded entity rows.
-func (s *Store) scanEntityRows(query string, args []any) ([]*DsEntityRow, error) {
-	rows, err := s.rdb.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("ds query: %w", err)
-	}
-	defer rows.Close()
-
-	var results []*DsEntityRow
-	for rows.Next() {
-		var data []byte
-		var version int64
-		var createStr, updateStr, path string
-		if err := rows.Scan(&data, &version, &createStr, &updateStr, &path); err != nil {
-			return nil, fmt.Errorf("ds scan: %w", err)
-		}
-		var e datastorepb.Entity
-		if err := proto.Unmarshal(data, &e); err != nil {
-			return nil, fmt.Errorf("ds unmarshal: %w", err)
-		}
-		ct, _ := time.Parse(timeLayout, createStr)
-		ut, _ := time.Parse(timeLayout, updateStr)
-		results = append(results, &DsEntityRow{
-			Entity:     &e,
-			Version:    version,
-			CreateTime: timestamppb.New(ct),
-			UpdateTime: timestamppb.New(ut),
-			Path:       path,
-		})
-	}
-	return results, rows.Err()
-}
-
-// runLimitedQuery builds and executes the paginated SQL query. For the common
-// single-sort case it delegates to runSingleSortQuery which drives from
-// ds_field_index and is O(page-size). Multi-sort and no-sort cases use the
-// ds_documents-driven LEFT JOIN path.
-func (s *Store) runLimitedQuery(
-	project, database, namespace, kind, ancestorPath string,
-	filterSQL string, filterArgs []any,
-	sorts []DsSortSpec,
-	cursor *CursorPayload,
-	limit int,
-) ([]*DsEntityRow, error) {
-	if len(sorts) == 1 {
-		if sorts[0].Col == "__path__" {
-			return s.runPathSortQuery(project, database, namespace, kind, ancestorPath,
-				filterSQL, filterArgs, sorts[0], cursor, limit)
-		}
-		return s.runSingleSortQuery(project, database, namespace, kind, ancestorPath,
-			filterSQL, filterArgs, sorts[0], cursor, limit)
-	}
-	// Multi-sort with __key__ cannot be pushed to SQL; signal Go-side fallback.
-	for _, sp := range sorts {
-		if sp.Col == "__path__" {
-			return nil, ErrColumnNotDetected
-		}
-	}
-
-	var sb strings.Builder
-	var args []any
-
-	sb.WriteString(`SELECT d.data, d.version, d.create_time, d.update_time, d.path`)
-	sb.WriteString(` FROM ds_documents d`)
-
-	// LEFT JOIN one ds_field_index alias per sort field.
-	for i, sp := range sorts {
-		fmt.Fprintf(&sb,
-			` LEFT JOIN ds_field_index fi_%d ON fi_%d.project=d.project AND fi_%d.database=d.database`+
-				` AND fi_%d.namespace=d.namespace AND fi_%d.doc_path=d.path`+
-				` AND fi_%d.field_path=? AND fi_%d.in_array=0`,
-			i, i, i, i, i, i, i)
-		args = append(args, sp.FieldPath)
-	}
-
-	sb.WriteString(` WHERE d.project=? AND d.database=? AND d.namespace=? AND d.kind=? AND d.deleted=0`)
-	args = append(args, project, database, namespace, kind)
-
-	if ancestorPath != "" {
-		sb.WriteString(` AND (d.path=? OR d.path LIKE ?)`)
-		args = append(args, ancestorPath, ancestorPath+"/%")
-	}
-	if filterSQL != "" {
-		sb.WriteString(` AND `)
-		sb.WriteString(filterSQL)
-		args = append(args, filterArgs...)
-	}
-
-	if cursor != nil {
-		ks, ksArgs := buildKeysetCondition(sorts, cursor)
-		if ks != "" {
-			sb.WriteString(` AND (`)
-			sb.WriteString(ks)
-			sb.WriteByte(')')
-			args = append(args, ksArgs...)
-		}
-	}
-
-	// ORDER BY sort fields then d.path as tie-breaker.
-	if len(sorts) > 0 {
-		sb.WriteString(` ORDER BY `)
-		for i, sp := range sorts {
-			if i > 0 {
-				sb.WriteString(`, `)
-			}
-			fmt.Fprintf(&sb, `fi_%d.%s`, i, sp.Col)
-			if sp.Desc {
-				sb.WriteString(` DESC`)
-			} else {
-				sb.WriteString(` ASC`)
-			}
-		}
-		sb.WriteString(`, d.path ASC`)
-	} else {
-		sb.WriteString(` ORDER BY d.path ASC`)
-	}
-
-	sb.WriteString(` LIMIT ?`)
-	args = append(args, limit)
-
-	return s.scanEntityRows(sb.String(), args)
-}
-
-// buildKeysetCondition constructs the SQL OR-chain for keyset pagination.
-// Each OR-branch advances one position in the sort key hierarchy, e.g.:
-//
-//	(f0>v0) OR (f0=v0 AND f1<v1) OR (f0=v0 AND f1=v1 AND path>cursor_path)
-//
-// The direction of inequality follows each field's Desc flag.
-func buildKeysetCondition(sorts []DsSortSpec, cursor *CursorPayload) (string, []any) {
-	if cursor == nil {
-		return "", nil
-	}
-	if len(sorts) == 0 || len(cursor.S) == 0 {
-		return "d.path > ?", []any{cursor.P}
-	}
-
-	n := len(sorts)
-	if len(cursor.S) < n {
-		n = len(cursor.S)
-	}
-
-	var parts []string
-	var allArgs []any
-
-	for outerIdx := 0; outerIdx <= n; outerIdx++ {
-		var branch strings.Builder
-		var branchArgs []any
-
-		// Equality for all sort fields before outerIdx.
-		for i := 0; i < outerIdx; i++ {
-			if i > 0 {
-				branch.WriteString(" AND ")
-			}
-			fmt.Fprintf(&branch, "fi_%d.%s = ?", i, sorts[i].Col)
-			branchArgs = append(branchArgs, parseCursorValue(cursor.S[i].Col, cursor.S[i].V))
-		}
-
-		if outerIdx < n {
-			// Inequality on field outerIdx: > for ASC, < for DESC.
-			if outerIdx > 0 {
-				branch.WriteString(" AND ")
-			}
-			op := ">"
-			if sorts[outerIdx].Desc {
-				op = "<"
-			}
-			fmt.Fprintf(&branch, "fi_%d.%s %s ?", outerIdx, sorts[outerIdx].Col, op)
-			branchArgs = append(branchArgs, parseCursorValue(cursor.S[outerIdx].Col, cursor.S[outerIdx].V))
-		} else {
-			// Tie-breaker: path is always ascending.
-			if outerIdx > 0 {
-				branch.WriteString(" AND ")
-			}
-			branch.WriteString("d.path > ?")
-			branchArgs = append(branchArgs, cursor.P)
-		}
-
-		parts = append(parts, "("+branch.String()+")")
-		allArgs = append(allArgs, branchArgs...)
-	}
-
-	if len(parts) == 1 {
-		return parts[0], allArgs
-	}
-	return strings.Join(parts, " OR "), allArgs
-}
-
-// parseCursorValue converts a string cursor value back to the Go type appropriate
-// for the given ds_field_index column.
-func parseCursorValue(col, v string) any {
-	switch col {
-	case "value_int", "value_bool", "value_null":
-		n, _ := strconv.ParseInt(v, 10, 64)
-		return n
-	case "value_double":
-		f, _ := strconv.ParseFloat(v, 64)
-		return f
-	default: // value_string, value_ref
-		return v
-	}
-}
-
-// DsAllocateIds atomically reserves count IDs for the given (project, database, namespace, kind).
-// Returns the first allocated ID; caller uses [first, first+count).
-func (s *Store) DsAllocateIds(project, database, namespace, kind string, count int) (int64, error) {
-	var first int64
-	err := s.RunInTx(func(tx *sql.Tx) error {
-		var err error
-		first, err = dsAllocateIdsExec(tx, project, database, namespace, kind, count)
-		return err
-	})
-	return first, err
-}
-
-// DsAllocateIdsTx reserves IDs within an already-open transaction.
-func (s *Store) DsAllocateIdsTx(tx *sql.Tx, project, database, namespace, kind string, count int) (int64, error) {
-	return dsAllocateIdsExec(tx, project, database, namespace, kind, count)
-}
-
-func dsAllocateIdsExec(exec dbExec, project, database, namespace, kind string, count int) (int64, error) {
-	if _, err := exec.Exec(
-		`INSERT OR IGNORE INTO ds_id_sequences (project, database, namespace, kind, next_id)
-		 VALUES (?, ?, ?, ?, 1)`,
-		project, database, namespace, kind,
-	); err != nil {
-		return 0, fmt.Errorf("ds sequence init: %w", err)
-	}
-
-	var first int64
-	if err := exec.QueryRow(
-		`SELECT next_id FROM ds_id_sequences WHERE project=? AND database=? AND namespace=? AND kind=?`,
-		project, database, namespace, kind,
-	).Scan(&first); err != nil {
-		return 0, fmt.Errorf("ds sequence read: %w", err)
-	}
-
-	if _, err := exec.Exec(
-		`UPDATE ds_id_sequences SET next_id=next_id+? WHERE project=? AND database=? AND namespace=? AND kind=?`,
-		count, project, database, namespace, kind,
-	); err != nil {
-		return 0, fmt.Errorf("ds sequence update: %w", err)
-	}
-	return first, nil
-}
-
-// dsSaveExec marshals and persists an entity using the given executor.
-// nextVersion is the new version assigned (curVersion+1).
-// When acc is non-nil, change-log and field-index writes are deferred into the
-// accumulator for bulk flushing; otherwise they execute immediately.
-func dsSaveExec(exec dbExec, project, database, namespace, path, kind, parentPath string, entity *datastorepb.Entity, curVersion int64, createTime, updateTime *timestamppb.Timestamp, acc *CommitAccumulator) (int64, error) {
-	data, err := proto.Marshal(entity)
-	if err != nil {
-		return 0, fmt.Errorf("ds marshal: %w", err)
-	}
-	newVersion := curVersion + 1
-	createStr := createTime.AsTime().UTC().Format(timeLayout)
-	updateStr := updateTime.AsTime().UTC().Format(timeLayout)
-	_, err = exec.Exec(`
-		INSERT INTO ds_documents
-			(project, database, namespace, path, kind, parent_path, data, create_time, update_time, version, deleted)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-		ON CONFLICT (project, database, namespace, path) DO UPDATE SET
-			kind        = excluded.kind,
-			parent_path = excluded.parent_path,
-			data        = excluded.data,
-			create_time = excluded.create_time,
-			update_time = excluded.update_time,
-			version     = excluded.version,
-			deleted     = 0`,
-		project, database, namespace, path, kind, parentPath, data, createStr, updateStr, newVersion,
-	)
-	if err != nil {
-		return 0, err
-	}
-	if acc != nil {
-		acc.changes = append(acc.changes, changeRow{
-			project: project, database: database, namespace: namespace,
-			path: path, kind: kind, parentPath: parentPath,
-			changeTime: updateStr, deleted: 0, data: data,
-		})
-		acc.fiDeletes = append(acc.fiDeletes, fiDeleteKey{project, database, namespace, path})
-		acc.ciDocs = append(acc.ciDocs, ciDoc{project, database, namespace, path, kind, parentPath, entity})
-		for propName, v := range entity.Properties {
-			var fiRows []dsFiRow
-			dsCollectValue(propName, v, false, &fiRows)
-			for _, r := range fiRows {
-				acc.fiInserts = append(acc.fiInserts, fiBulkRow{project, database, namespace, kind, path, r})
-			}
-		}
-		return newVersion, nil
-	}
-	// Immediate mode: write change-log and field-index now.
-	_, err = exec.Exec(`
-		INSERT INTO ds_document_changes
-			(project, database, namespace, path, kind, parent_path, change_time, deleted, data)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`,
-		project, database, namespace, path, kind, parentPath, updateStr, data,
-	)
-	if err != nil {
-		return 0, err
-	}
-	if err := dsIndexDocFields(exec, project, database, namespace, kind, path, entity); err != nil {
-		return 0, err
-	}
-	if err := dsMaintainCompositeIndexes(exec, project, database, namespace, kind, path, parentPath, entity); err != nil {
-		return 0, err
-	}
-	return newVersion, nil
-}
-
-// DsGetAsOf returns the entity state at or before asOf. Returns nil (not found) if no row exists.
-func (s *Store) DsGetAsOf(project, database, namespace, path string, asOf time.Time) (*datastorepb.Entity, error) {
-	asOfStr := asOf.UTC().Format(timeLayout)
-	var data []byte
-	var deleted int
-	err := s.rdb.QueryRow(`
-		SELECT data, deleted FROM ds_document_changes
-		WHERE project=? AND database=? AND namespace=? AND path=? AND change_time <= ?
-		ORDER BY seq DESC LIMIT 1`,
-		project, database, namespace, path, asOfStr,
-	).Scan(&data, &deleted)
-	if err == sql.ErrNoRows || deleted == 1 {
-		return nil, status.Errorf(codes.NotFound, "entity not found at readTime: %s", path)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("ds get as of: %w", err)
+	if r.Deleted {
+		return r, nil, nil
 	}
 	var e datastorepb.Entity
-	if err := proto.Unmarshal(data, &e); err != nil {
-		return nil, fmt.Errorf("ds unmarshal: %w", err)
+	if err := proto.Unmarshal(r.Data, &e); err != nil {
+		return r, nil, err
 	}
-	return &e, nil
+	return r, &e, nil
 }
-
-// DsQueryKindAsOf returns all entities of a given kind as of asOf.
-func (s *Store) DsQueryKindAsOf(project, database, namespace, kind, ancestorPath string, asOf time.Time) ([]*DsEntityRow, error) {
-	asOfStr := asOf.UTC().Format(timeLayout)
-	var rows *sql.Rows
-	var err error
-	if ancestorPath != "" {
-		rows, err = s.rdb.Query(`
-			SELECT path, data FROM (
-				SELECT path, data, deleted,
-					ROW_NUMBER() OVER (PARTITION BY path ORDER BY seq DESC) rn
-				FROM ds_document_changes
-				WHERE project=? AND database=? AND namespace=? AND kind=? AND change_time <= ?
-				  AND (path=? OR path LIKE ?)
-			) WHERE rn=1 AND deleted=0`,
-			project, database, namespace, kind, asOfStr, ancestorPath, ancestorPath+"/%",
-		)
-	} else {
-		rows, err = s.rdb.Query(`
-			SELECT path, data FROM (
-				SELECT path, data, deleted,
-					ROW_NUMBER() OVER (PARTITION BY path ORDER BY seq DESC) rn
-				FROM ds_document_changes
-				WHERE project=? AND database=? AND namespace=? AND kind=? AND change_time <= ?
-			) WHERE rn=1 AND deleted=0`,
-			project, database, namespace, kind, asOfStr,
-		)
+func getDSTxn(tx *Txn, project, database, namespace, path string) (dsRecord, *datastorepb.Entity, error) {
+	item, err := tx.Get(dsKey(project, database, namespace, path))
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return dsRecord{}, nil, status.Errorf(codes.NotFound, "entity not found: %s", path)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("ds query kind as of: %w", err)
+		return dsRecord{}, nil, err
 	}
-	defer rows.Close()
+	v, err := itemValue(item)
+	if err != nil {
+		return dsRecord{}, nil, err
+	}
+	r, e, err := decodeDS(v)
+	if err == nil && r.Deleted {
+		err = status.Errorf(codes.NotFound, "entity not found: %s", path)
+	}
+	return r, e, err
+}
+func rowFrom(r dsRecord, e *datastorepb.Entity, path string) *DsEntityRow {
+	return &DsEntityRow{Entity: e, Version: r.Version, CreateTime: timestamppb.New(time.Unix(0, r.Created)), UpdateTime: timestamppb.New(time.Unix(0, r.Updated)), Path: path}
+}
 
-	var results []*DsEntityRow
-	for rows.Next() {
-		var path string
-		var data []byte
-		if err := rows.Scan(&path, &data); err != nil {
-			return nil, fmt.Errorf("ds scan as of: %w", err)
+func (s *Store) DsGet(project, database, namespace, path string) (e *datastorepb.Entity, v int64, err error) {
+	err = s.view(func(tx *Txn) error {
+		r, x, z := getDSTxn(tx, project, database, namespace, path)
+		e, v, err = x, r.Version, z
+		return z
+	})
+	return
+}
+
+// DsGetTx reads an entity inside the caller's transaction, including pending writes.
+func (s *Store) DsGetTx(tx *Txn, project, database, namespace, path string) (*datastorepb.Entity, int64, error) {
+	r, entity, err := getDSTxn(tx, project, database, namespace, path)
+	return entity, r.Version, err
+}
+
+// DsVisitAllEntities visits every live entity for a project and database from
+// one consistent read snapshot.
+func (s *Store) DsVisitAllEntities(ctx context.Context, project, database string, visit func(namespace string, row *DsEntityRow) error) error {
+	prefix := []byte("ds/doc/" + enc(project) + "/" + enc(database) + "/")
+	return s.view(func(tx *Txn) error {
+		iterator := tx.NewIterator(badger.DefaultIteratorOptions)
+		defer iterator.Close()
+		for iterator.Seek(prefix); iterator.ValidForPrefix(prefix); iterator.Next() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			remainder := string(iterator.Item().Key()[len(prefix):])
+			separator := strings.IndexByte(remainder, '/')
+			if separator < 0 {
+				return fmt.Errorf("invalid Datastore entity key %q", iterator.Item().Key())
+			}
+			namespace := dec(remainder[:separator])
+			path := dec(remainder[separator+1:])
+			raw, err := itemValue(iterator.Item())
+			if err != nil {
+				return err
+			}
+			record, entity, err := decodeDS(raw)
+			if err != nil {
+				return fmt.Errorf("decoding entity %s: %w", path, err)
+			}
+			if record.Deleted {
+				continue
+			}
+			if err := visit(namespace, rowFrom(record, entity, path)); err != nil {
+				return err
+			}
 		}
-		var e datastorepb.Entity
-		if err := proto.Unmarshal(data, &e); err != nil {
-			return nil, fmt.Errorf("ds unmarshal as of: %w", err)
-		}
-		results = append(results, &DsEntityRow{Entity: &e, Path: path})
-	}
-	return results, rows.Err()
+		return nil
+	})
 }
 
-// dsFiRow represents one row to insert into ds_field_index.
-// Nil pointer fields are stored as SQL NULL.
-type dsFiRow struct {
-	fieldPath string
-	vStr      *string
-	vInt      *int64
-	vDouble   *float64
-	vBool     *int64 // 0 or 1
-	vNull     *int64 // always 1 when set
-	vBytes    []byte
-	vRef      *string
-	vLat      *float64
-	vLng      *float64
-	inArray   bool
-}
-
-type changeRow struct {
-	project, database, namespace, path, kind, parentPath, changeTime string
-	deleted                                                          int
-	data                                                             []byte
-}
-
-type fiDeleteKey struct {
-	project, database, namespace, docPath string
-}
-
-type fiBulkRow struct {
-	project, database, namespace, kind, docPath string
-	row                                         dsFiRow
-}
-
-type ciDoc struct {
-	project, database, namespace, path, kind, parentPath string
-	entity                                               *datastorepb.Entity
-}
-
-// CommitAccumulator batches write-side effects (change-log rows, field-index
-// operations) from multiple mutations so they can be flushed in bulk at the
-// end of a commit transaction, cutting SQL round-trips from O(n) to O(1).
-type CommitAccumulator struct {
-	changes   []changeRow
-	fiDeletes []fiDeleteKey
-	fiInserts []fiBulkRow
-	ciDocs    []ciDoc
-}
-
-// NewCommitAccumulator returns an empty accumulator for bulk commit use.
-func NewCommitAccumulator() *CommitAccumulator { return &CommitAccumulator{} }
-
-// Flush writes all accumulated change-log rows and field-index operations to exec.
-// Call once, at the end of the commit transaction, after all mutations.
-func (a *CommitAccumulator) Flush(exec dbExec) error {
-	if err := a.flushFiDeletes(exec); err != nil {
-		return err
-	}
-	if err := a.flushFiInserts(exec); err != nil {
-		return err
-	}
-	for _, d := range a.ciDocs {
-		if err := dsMaintainCompositeIndexes(exec, d.project, d.database, d.namespace, d.kind, d.path, d.parentPath, d.entity); err != nil {
+// ListDsKinds returns the distinct kinds stored for a project.
+func (s *Store) ListDsKinds(project string) ([]string, error) {
+	kinds := make(map[string]struct{})
+	err := s.view(func(tx *Txn) error {
+		entries, err := s.kindCatalog(tx, project)
+		if err != nil {
 			return err
 		}
-	}
-	return a.flushChanges(exec)
-}
-
-func (a *CommitAccumulator) flushFiDeletes(exec dbExec) error {
-	if len(a.fiDeletes) == 0 {
+		for _, entry := range entries {
+			kinds[entry.Kind] = struct{}{}
+		}
 		return nil
+	})
+	out := make([]string, 0, len(kinds))
+	for kind := range kinds {
+		out = append(out, kind)
 	}
-	type nsKey struct{ project, database, namespace string }
-	groups := make(map[nsKey][]string, len(a.fiDeletes))
-	for _, d := range a.fiDeletes {
-		k := nsKey{d.project, d.database, d.namespace}
-		groups[k] = append(groups[k], d.docPath)
-	}
-	const chunkSize = 900
-	for k, paths := range groups {
-		for start := 0; start < len(paths); start += chunkSize {
-			end := start + chunkSize
-			if end > len(paths) {
-				end = len(paths)
-			}
-			chunk := paths[start:end]
-			ph := strings.Repeat("?,", len(chunk))
-			ph = ph[:len(ph)-1]
-			args := make([]any, 0, 3+len(chunk))
-			args = append(args, k.project, k.database, k.namespace)
-			for _, p := range chunk {
-				args = append(args, p)
-			}
-			q := `DELETE FROM ds_field_index WHERE project=? AND database=? AND namespace=? AND doc_path IN (` + ph + `)`
-			if _, err := exec.Exec(q, args...); err != nil {
-				return fmt.Errorf("ds_field_index bulk delete: %w", err)
-			}
+	slices.Sort(out)
+	return out, err
+}
+func (s *Store) DsVersionTx(tx *Txn, project, database, namespace, path string) (int64, error) {
+	r, _, err := getDSTxn(tx, project, database, namespace, path)
+	return r.Version, err
+}
+func (s *Store) DsGetWithTimes(project, database, namespace, path string) (e *datastorepb.Entity, v int64, ct, ut *timestamppb.Timestamp, err error) {
+	err = s.view(func(tx *Txn) error {
+		r, x, z := getDSTxn(tx, project, database, namespace, path)
+		if z == nil {
+			row := rowFrom(r, x, path)
+			e, v, ct, ut = row.Entity, row.Version, row.CreateTime, row.UpdateTime
 		}
-	}
-	return nil
+		return z
+	})
+	return
+}
+func (s *Store) DsGetManyWithTimes(project, database, namespace string, paths []string) ([]*DsEntityRow, []string, error) {
+	var found []*DsEntityRow
+	var missing []string
+	err := s.DsVisitManyWithTimes(context.Background(), project, database, namespace, paths, func(row *DsEntityRow, missingPath string) bool {
+		if row == nil {
+			missing = append(missing, missingPath)
+		} else {
+			found = append(found, row)
+		}
+		return true
+	})
+	return found, missing, err
 }
 
-func (a *CommitAccumulator) flushFiInserts(exec dbExec) error {
-	return dsBatchInsertFIBulk(exec, a.fiInserts)
+// DsVisitManyWithTimes visits requested paths in order using one read snapshot.
+// Returning false from visit stops before decoding another entity.
+func (s *Store) DsVisitManyWithTimes(ctx context.Context, project, database, namespace string, paths []string, visit func(*DsEntityRow, string) bool) error {
+	return s.dsVisitManyAt(ctx, 0, project, database, namespace, paths, visit)
 }
 
-func (a *CommitAccumulator) flushChanges(exec dbExec) error {
-	if len(a.changes) == 0 {
-		return nil
+// DsVisitManyWithTimesAsOf visits requested paths at a historical snapshot.
+func (s *Store) DsVisitManyWithTimesAsOf(ctx context.Context, asOf time.Time, project, database, namespace string, paths []string, visit func(*DsEntityRow, string) bool) error {
+	return s.dsVisitManyAt(ctx, uint64(asOf.UnixNano()), project, database, namespace, paths, visit)
+}
+
+func (s *Store) dsVisitManyAt(ctx context.Context, readTs uint64, project, database, namespace string, paths []string, visit func(*DsEntityRow, string) bool) error {
+	view := s.view
+	if readTs != 0 {
+		view = func(fn func(*Txn) error) error { return s.viewAt(readTs, fn) }
 	}
-	const batchSize = 500
-	const prefix = `INSERT INTO ds_document_changes ` +
-		`(project, database, namespace, path, kind, parent_path, change_time, deleted, data) VALUES `
-	const placeholder = `(?,?,?,?,?,?,?,?,?)`
-	for start := 0; start < len(a.changes); start += batchSize {
-		end := start + batchSize
-		if end > len(a.changes) {
-			end = len(a.changes)
-		}
-		batch := a.changes[start:end]
-		var sb strings.Builder
-		sb.WriteString(prefix)
-		args := make([]any, 0, len(batch)*9)
-		for i, c := range batch {
-			if i > 0 {
-				sb.WriteByte(',')
+	return view(func(tx *Txn) error {
+		for _, path := range paths {
+			if err := ctx.Err(); err != nil {
+				return err
 			}
-			sb.WriteString(placeholder)
-			args = append(args, c.project, c.database, c.namespace, c.path, c.kind, c.parentPath, c.changeTime, c.deleted, c.data)
-		}
-		if _, err := exec.Exec(sb.String(), args...); err != nil {
-			return fmt.Errorf("ds_document_changes bulk insert: %w", err)
-		}
-	}
-	return nil
-}
-
-// dsKeyToPath builds a storage path string from a *datastorepb.Key.
-// Path format: Kind/id[/Kind/id...] - mirrors keyComponents in the datastore package.
-func dsKeyToPath(key *datastorepb.Key) string {
-	if key == nil {
-		return ""
-	}
-	var parts []string
-	for _, pe := range key.GetPath() {
-		switch id := pe.GetIdType().(type) {
-		case *datastorepb.Key_PathElement_Id:
-			parts = append(parts, pe.Kind+"/"+strconv.FormatInt(id.Id, 10))
-		case *datastorepb.Key_PathElement_Name:
-			parts = append(parts, pe.Kind+"/"+id.Name)
-		default:
-			parts = append(parts, pe.Kind+"/")
-		}
-	}
-	return strings.Join(parts, "/")
-}
-
-// dsCollectValue extracts indexable values from a Datastore property value recursively.
-// inArray=true means we are already inside an array - nested arrays are skipped.
-func dsCollectValue(fieldPath string, v *datastorepb.Value, inArray bool, rows *[]dsFiRow) {
-	if v == nil || v.GetExcludeFromIndexes() {
-		return
-	}
-	switch vt := v.GetValueType().(type) {
-	case *datastorepb.Value_NullValue:
-		one := int64(1)
-		*rows = append(*rows, dsFiRow{fieldPath: fieldPath, vNull: &one, inArray: inArray})
-	case *datastorepb.Value_BooleanValue:
-		b := int64(0)
-		if vt.BooleanValue {
-			b = 1
-		}
-		*rows = append(*rows, dsFiRow{fieldPath: fieldPath, vBool: &b, inArray: inArray})
-	case *datastorepb.Value_IntegerValue:
-		n := vt.IntegerValue
-		*rows = append(*rows, dsFiRow{fieldPath: fieldPath, vInt: &n, inArray: inArray})
-	case *datastorepb.Value_DoubleValue:
-		f := vt.DoubleValue
-		*rows = append(*rows, dsFiRow{fieldPath: fieldPath, vDouble: &f, inArray: inArray})
-	case *datastorepb.Value_StringValue:
-		s := vt.StringValue
-		*rows = append(*rows, dsFiRow{fieldPath: fieldPath, vStr: &s, inArray: inArray})
-	case *datastorepb.Value_BlobValue:
-		*rows = append(*rows, dsFiRow{fieldPath: fieldPath, vBytes: vt.BlobValue, inArray: inArray})
-	case *datastorepb.Value_TimestampValue:
-		s := vt.TimestampValue.AsTime().UTC().Format(timeLayout)
-		*rows = append(*rows, dsFiRow{fieldPath: fieldPath, vStr: &s, inArray: inArray})
-	case *datastorepb.Value_KeyValue:
-		p := dsKeyToPath(vt.KeyValue)
-		*rows = append(*rows, dsFiRow{fieldPath: fieldPath, vRef: &p, inArray: inArray})
-	case *datastorepb.Value_GeoPointValue:
-		if vt.GeoPointValue != nil {
-			lat := vt.GeoPointValue.Latitude
-			lng := vt.GeoPointValue.Longitude
-			*rows = append(*rows, dsFiRow{fieldPath: fieldPath, vLat: &lat, vLng: &lng, inArray: inArray})
-		}
-	case *datastorepb.Value_EntityValue:
-		if !inArray {
-			// Sentinel row carries canonical proto bytes for EQUAL pushdown;
-			// sub-properties are indexed separately below via recursion.
-			opts := proto.MarshalOptions{Deterministic: true}
-			b, _ := opts.Marshal(vt.EntityValue)
-			*rows = append(*rows, dsFiRow{fieldPath: fieldPath, vBytes: b, inArray: false})
-		}
-		if vt.EntityValue != nil {
-			for k, child := range vt.EntityValue.Properties {
-				dsCollectValue(fieldPath+"."+k, child, inArray, rows)
-			}
-		}
-	case *datastorepb.Value_ArrayValue:
-		if inArray {
-			return // no nested arrays
-		}
-		if vt.ArrayValue == nil || len(vt.ArrayValue.Values) == 0 {
-			*rows = append(*rows, dsFiRow{fieldPath: fieldPath, inArray: false}) // empty-array sentinel
-			return
-		}
-		// Canonical bytes sentinel for EQUAL filter on the whole array.
-		opts := proto.MarshalOptions{Deterministic: true}
-		b, _ := opts.Marshal(vt.ArrayValue)
-		*rows = append(*rows, dsFiRow{fieldPath: fieldPath, vBytes: b, inArray: false})
-		for _, elem := range vt.ArrayValue.Values {
-			dsCollectValue(fieldPath, elem, true, rows)
-		}
-	}
-}
-
-// dsIndexDocFields rebuilds the ds_field_index rows for a single entity within exec.
-func dsIndexDocFields(exec dbExec, project, database, namespace, kind, docPath string, entity *datastorepb.Entity) error {
-	if _, err := exec.Exec(
-		`DELETE FROM ds_field_index WHERE project=? AND database=? AND namespace=? AND doc_path=?`,
-		project, database, namespace, docPath,
-	); err != nil {
-		return fmt.Errorf("ds_field_index delete: %w", err)
-	}
-	if entity == nil || len(entity.Properties) == 0 {
-		return nil
-	}
-	var rows []dsFiRow
-	for propName, v := range entity.Properties {
-		dsCollectValue(propName, v, false, &rows)
-	}
-	return dsBatchInsertFI(exec, project, database, namespace, kind, docPath, rows)
-}
-
-// dsBatchInsertFI inserts field index rows in chunks of 500 to stay within
-// SQLite's bound-variable limit.
-// RebuildDsFieldIndex rebuilds ds_field_index from all active entities in ds_documents.
-// Run once after a schema change or manual truncation of the index table.
-// Processes entities in batches of 200 to bound transaction size.
-func (s *Store) RebuildDsFieldIndex() error {
-	const batchSize = 200
-	type erow struct {
-		project, database, namespace, path, kind string
-		data                                     []byte
-	}
-
-	offset := 0
-	for {
-		rows, err := s.rdb.Query(
-			`SELECT project, database, namespace, path, kind, data
-			 FROM ds_documents WHERE deleted=0
-			 ORDER BY rowid LIMIT ? OFFSET ?`,
-			batchSize, offset,
-		)
-		if err != nil {
-			return fmt.Errorf("reindex query: %w", err)
-		}
-		var batch []erow
-		for rows.Next() {
-			var r erow
-			if err := rows.Scan(&r.project, &r.database, &r.namespace, &r.path, &r.kind, &r.data); err != nil {
-				rows.Close()
-				return fmt.Errorf("reindex scan: %w", err)
-			}
-			batch = append(batch, r)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return fmt.Errorf("reindex rows: %w", err)
-		}
-		if len(batch) == 0 {
-			break
-		}
-		if err := s.RunInTx(func(tx *sql.Tx) error {
-			for _, r := range batch {
-				var entity datastorepb.Entity
-				if err := proto.Unmarshal(r.data, &entity); err != nil {
-					return fmt.Errorf("reindex unmarshal %s: %w", r.path, err)
+			record, entity, err := getDSQueryTxn(ctx, tx, project, database, namespace, path)
+			if status.Code(err) == codes.NotFound {
+				if !visit(nil, path) {
+					return nil
 				}
-				if err := dsIndexDocFields(tx, r.project, r.database, r.namespace, r.kind, r.path, &entity); err != nil {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if !visit(rowFrom(record, entity, path), "") {
+				return nil
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Store) putDS(tx *Txn, write EntityWrite, options putOptions, acc *CommitAccumulator) (WriteResult, error) {
+	var old dsRecord
+	var oldEntity *datastorepb.Entity
+	var err error
+	exists := false
+	if !options.knownMissing {
+		old, oldEntity, err = getDSTxn(tx, write.Project, write.Database, write.Namespace, write.Path)
+		exists = err == nil
+	}
+	if err != nil && status.Code(err) != codes.NotFound {
+		return WriteResult{}, err
+	}
+	if options.insertOnly && exists {
+		return WriteResult{}, status.Errorf(codes.AlreadyExists, "entity already exists: %s", write.Path)
+	}
+	if options.updateOnly && !exists {
+		return WriteResult{}, status.Errorf(codes.NotFound, "entity not found: %s", write.Path)
+	}
+	if write.BaseVersion != 0 && (!exists || old.Version != write.BaseVersion) {
+		return WriteResult{Entity: write.Entity, Version: old.Version, Conflict: true}, nil
+	}
+	if options.updateOnly {
+		write.Kind, write.ParentPath = old.Kind, old.ParentPath
+	}
+	if write.Kind == "__namespace__" || write.Kind == "__kind__" || write.Kind == "__property__" {
+		return WriteResult{}, status.Error(codes.InvalidArgument, "metadata entities cannot be stored")
+	}
+	write.Entity, err = normalizeEntityTimestamps(write.Entity)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	indexes, err := compositeIndexesForKind(tx, write.Project, write.Kind, acc)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	if err := validateEntityIndexLimits(context.Background(), write.Entity, write.Path, indexes); err != nil {
+		return WriteResult{}, err
+	}
+	if !exists {
+		if err := adjustKindCount(tx, write.Project, write.Database, write.Namespace, write.Kind, 1); err != nil {
+			return WriteResult{}, err
+		}
+	}
+	now := monotonicNow().AsTime().UnixNano()
+	created := now
+	version := old.Version + 1
+	if exists {
+		created = old.Created
+		version = old.Version + 1
+		if old.Kind != write.Kind {
+			_ = tx.Delete(dsKindKey(write.Project, write.Database, write.Namespace, old.Kind, write.Path))
+		}
+	}
+	data, err := proto.Marshal(write.Entity)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	r := dsRecord{Data: data, Kind: write.Kind, ParentPath: write.ParentPath, Version: version, Created: created, Updated: now}
+	raw := encodeRecord(r)
+	if err = tx.Set(dsKey(write.Project, write.Database, write.Namespace, write.Path), raw); err != nil {
+		return WriteResult{}, err
+	}
+	if err = tx.Set(dsKindKey(write.Project, write.Database, write.Namespace, write.Kind, write.Path), []byte(write.Path)); err != nil {
+		return WriteResult{}, err
+	}
+	if err = s.maintainBuiltinIndexes(tx, write.Project, write.Database, write.Namespace, write.Path, write.Kind, oldEntity, write.Entity, r); err != nil {
+		return WriteResult{}, err
+	}
+	if err = maintainPropertyCatalog(tx, write.Project, write.Database, write.Namespace, write.Kind, oldEntity, write.Entity); err != nil {
+		return WriteResult{}, err
+	}
+	if err = s.maintainCompositeIndexes(tx, write.Project, write.Database, write.Namespace, write.Path, write.Kind, oldEntity, write.Entity, acc, r); err != nil {
+		return WriteResult{}, err
+	}
+	if err = touchKind(tx, write.Project, write.Database, write.Namespace, write.Kind); err != nil {
+		return WriteResult{}, err
+	}
+	return WriteResult{
+		Entity: write.Entity, Version: version,
+		CreateTime: timestamppb.New(time.Unix(0, created)),
+		UpdateTime: timestamppb.New(time.Unix(0, now)),
+	}, nil
+}
+func (s *Store) DsInsert(write EntityWrite) (result WriteResult, err error) {
+	err = s.RunBatchedTx(context.Background(), func(tx *Txn) error {
+		result, err = s.DsInsertTx(tx, write, NewCommitAccumulator())
+		return err
+	})
+	return
+}
+
+func (s *Store) DsInsertTx(tx *Txn, write EntityWrite, acc *CommitAccumulator) (WriteResult, error) {
+	write.BaseVersion = 0
+	return s.putDS(tx, write, putOptions{insertOnly: true}, acc)
+}
+
+func (s *Store) DsUpdate(write EntityWrite) (result WriteResult, err error) {
+	err = s.RunBatchedTx(context.Background(), func(tx *Txn) error {
+		result, err = s.DsUpdateTx(tx, write, NewCommitAccumulator())
+		return err
+	})
+	return
+}
+
+func (s *Store) DsUpdateTx(tx *Txn, write EntityWrite, acc *CommitAccumulator) (WriteResult, error) {
+	return s.putDS(tx, write, putOptions{updateOnly: true}, acc)
+}
+
+func (s *Store) DsUpsert(write EntityWrite) (result WriteResult, err error) {
+	err = s.RunBatchedTx(context.Background(), func(tx *Txn) error {
+		result, err = s.DsUpsertTx(tx, write, NewCommitAccumulator())
+		return err
+	})
+	return
+}
+
+func (s *Store) DsUpsertTx(tx *Txn, write EntityWrite, acc *CommitAccumulator) (WriteResult, error) {
+	return s.putDS(tx, write, putOptions{}, acc)
+}
+
+func (s *Store) DsUpsertManyTx(tx *Txn, project, database string, rows []UpsertManyRow, _ *timestamppb.Timestamp, acc *CommitAccumulator) ([]UpsertManyResult, error) {
+	type allocatorKey struct{ namespace, kind string }
+	allocators := make(map[allocatorKey]*dsIDBatch)
+	out := make([]UpsertManyResult, len(rows))
+	for i, r := range rows {
+		entity, path, knownMissing := r.Entity, r.Path, false
+		if r.AllocateID {
+			key := allocatorKey{r.Namespace, r.Kind}
+			allocator := allocators[key]
+			if allocator == nil {
+				var err error
+				allocator, err = newDsIDBatch(tx, project, database, r.Namespace, r.Kind)
+				if err != nil {
+					return nil, err
+				}
+				allocators[key] = allocator
+			}
+			for {
+				id, err := allocator.nextID()
+				if err != nil {
+					return nil, err
+				}
+				path = keycodec.AppendID(r.ParentPath, r.Kind, id)
+				_, _, err = getDSTxn(tx, project, database, r.Namespace, path)
+				if status.Code(err) == codes.NotFound {
+					entity = proto.Clone(r.Entity).(*datastorepb.Entity)
+					last := entity.Key.Path[len(entity.Key.Path)-1]
+					last.IdType = &datastorepb.Key_PathElement_Id{Id: id}
+					knownMissing = true
+					break
+				}
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		result, err := s.putDS(tx, EntityWrite{
+			Project: project, Database: database, Namespace: r.Namespace,
+			Path: path, Kind: r.Kind, ParentPath: r.ParentPath, Entity: entity,
+		}, putOptions{insertOnly: r.AllocatedID, knownMissing: knownMissing}, acc)
+		if err != nil {
+			return nil, err
+		}
+		out[i].Version = result.Version
+		out[i].UpdateTime = result.UpdateTime
+		if r.AllocateID || r.AllocatedID {
+			out[i].Key = entity.Key
+		}
+	}
+	for _, allocator := range allocators {
+		if err := allocator.flush(tx); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// DsUpsertMany commits independent upserts in the largest transactions Badger accepts.
+func (s *Store) DsUpsertMany(ctx context.Context, project, database string, rows []UpsertManyRow, commitTime *timestamppb.Timestamp) ([]UpsertManyResult, error) {
+	var err error
+	rows, err = s.allocateBulkIDs(ctx, project, database, rows)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]UpsertManyResult, len(rows))
+	chunkSize := len(rows)
+	for start := 0; start < len(rows); {
+		if remaining := len(rows) - start; chunkSize > remaining {
+			chunkSize = remaining
+		}
+		end := start + chunkSize
+		var chunkResults []UpsertManyResult
+		err := s.runUpdateRaw(ctx, true, func(tx *Txn) error {
+			acc := NewCommitAccumulator()
+			var err error
+			chunkResults, err = s.DsUpsertManyTx(tx, project, database, rows[start:end], commitTime, acc)
+			return err
+		})
+		if errors.Is(err, badger.ErrTxnTooBig) {
+			s.txnTooBig.Add(1)
+			if chunkSize == 1 {
+				return nil, status.Error(codes.ResourceExhausted, "entity exceeds Badger transaction limits")
+			}
+			chunkSize = (chunkSize + 1) / 2
+			continue
+		}
+		if errors.Is(err, badger.ErrConflict) {
+			return nil, status.Error(codes.Aborted, "storage transaction conflicted; retry the operation")
+		}
+		if err != nil {
+			return nil, err
+		}
+		copy(results[start:end], chunkResults)
+		start = end
+	}
+	return results, nil
+}
+
+func (s *Store) allocateBulkIDs(ctx context.Context, project, database string, rows []UpsertManyRow) ([]UpsertManyRow, error) {
+	type allocatorKey struct{ namespace, kind string }
+	groups := make(map[allocatorKey][]int)
+	for i, row := range rows {
+		if row.AllocateID {
+			key := allocatorKey{row.Namespace, row.Kind}
+			groups[key] = append(groups[key], i)
+		}
+	}
+	if len(groups) == 0 {
+		return rows, nil
+	}
+
+	prepared := append([]UpsertManyRow(nil), rows...)
+	for key, indexes := range groups {
+		parents := make([]string, len(indexes))
+		for i, index := range indexes {
+			parents[i] = rows[index].ParentPath
+		}
+		ids, err := s.DsAllocateIDBlock(ctx, project, database, key.namespace, key.kind, parents)
+		if err != nil {
+			return nil, err
+		}
+		for i, index := range indexes {
+			row := rows[index]
+			entity := proto.Clone(row.Entity).(*datastorepb.Entity)
+			entity.Key.Path[len(entity.Key.Path)-1].IdType = &datastorepb.Key_PathElement_Id{Id: ids[i]}
+			path := keycodec.AppendID(row.ParentPath, row.Kind, ids[i])
+			row.Entity = entity
+			row.Path = path
+			row.AllocateID = false
+			row.AllocatedID = true
+			prepared[index] = row
+		}
+	}
+	return prepared, nil
+}
+func (s *Store) DsDelete(project, database, namespace, path string) error {
+	return s.RunBatchedTx(context.Background(), func(tx *Txn) error { return s.DsDeleteTx(tx, project, database, namespace, path, nil) })
+}
+func (s *Store) DsDeleteTx(tx *Txn, project, database, namespace, path string, acc *CommitAccumulator) error {
+	old, e, err := getDSTxn(tx, project, database, namespace, path)
+	if status.Code(err) == codes.NotFound {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	now := monotonicNow().AsTime().UnixNano()
+	data, _ := proto.Marshal(e)
+	r := dsRecord{Data: data, Kind: old.Kind, ParentPath: old.ParentPath, Version: old.Version + 1, Created: old.Created, Updated: now, Deleted: true}
+	raw := encodeRecord(r)
+	if err = tx.Set(dsKey(project, database, namespace, path), raw); err != nil {
+		return err
+	}
+	if err = s.maintainCompositeIndexes(tx, project, database, namespace, path, old.Kind, e, nil, acc, r); err != nil {
+		return err
+	}
+	if err = s.maintainBuiltinIndexes(tx, project, database, namespace, path, old.Kind, e, nil, r); err != nil {
+		return err
+	}
+	if err = touchKind(tx, project, database, namespace, old.Kind); err != nil {
+		return err
+	}
+	if err = adjustKindCount(tx, project, database, namespace, old.Kind, -1); err != nil {
+		return err
+	}
+	if err = maintainPropertyCatalog(tx, project, database, namespace, old.Kind, e, nil); err != nil {
+		return err
+	}
+	return tx.Delete(dsKindKey(project, database, namespace, old.Kind, path))
+}
+
+const (
+	scatteredIDBase       = int64(1 << 52)
+	maxScatteredIDCounter = int64((1 << 51) - 1)
+	scatterShift          = 13
+)
+
+func dsIDSequenceKey(project, database, namespace, kind string) []byte {
+	return []byte("ds/sequence/" + enc(project) + "/" + enc(database) + "/" + enc(namespace) + "/" + enc(kind))
+}
+
+func readIDCounter(tx *Txn, key []byte) (int64, error) {
+	next := int64(1)
+	item, err := tx.Get(key)
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return next, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	v, err := itemValue(item)
+	if err != nil {
+		return 0, err
+	}
+	if err := json.Unmarshal(v, &next); err != nil {
+		return 0, err
+	}
+	return next, nil
+}
+
+func scatteredID(counter int64) (int64, error) {
+	if counter < 1 || counter > maxScatteredIDCounter {
+		return 0, fmt.Errorf("Datastore automatic ID space exhausted")
+	}
+	return scatteredIDBase + int64(bits.Reverse64(uint64(counter)<<scatterShift)), nil
+}
+
+func scatteredCounter(id int64) (int64, bool) {
+	offset := id - scatteredIDBase
+	if offset < 0 || offset > maxScatteredIDCounter {
+		return 0, false
+	}
+	return int64(bits.Reverse64(uint64(offset)) >> scatterShift), true
+}
+
+type dsIDBatch struct {
+	key  []byte
+	next int64
+}
+
+func newDsIDBatch(tx *Txn, project, database, namespace, kind string) (*dsIDBatch, error) {
+	key := dsIDSequenceKey(project, database, namespace, kind)
+	next, err := readIDCounter(tx, key)
+	if err != nil {
+		return nil, err
+	}
+	return &dsIDBatch{key: key, next: next}, nil
+}
+
+func (b *dsIDBatch) nextID() (int64, error) {
+	id, err := scatteredID(b.next)
+	if err != nil {
+		return 0, err
+	}
+	b.next++
+	return id, nil
+}
+
+func (b *dsIDBatch) flush(tx *Txn) error {
+	v, err := json.Marshal(b.next)
+	if err != nil {
+		return err
+	}
+	return tx.Set(b.key, v)
+}
+
+// DsAllocateIDBlock reserves IDs in a short transaction before bulk entity writes.
+func (s *Store) DsAllocateIDBlock(ctx context.Context, project, database, namespace, kind string, parentPaths []string) ([]int64, error) {
+	ids := make([]int64, len(parentPaths))
+	err := s.RunBatchedTx(ctx, func(tx *Txn) error {
+		batch, err := newDsIDBatch(tx, project, database, namespace, kind)
+		if err != nil {
+			return err
+		}
+		for i, parent := range parentPaths {
+			for {
+				id, err := batch.nextID()
+				if err != nil {
+					return err
+				}
+				path := keycodec.AppendID(parent, kind, id)
+				_, _, err = getDSTxn(tx, project, database, namespace, path)
+				if status.Code(err) == codes.NotFound {
+					ids[i] = id
+					break
+				}
+				if err != nil {
 					return err
 				}
 			}
-			return nil
-		}); err != nil {
-			return err
 		}
-		offset += len(batch)
-		if len(batch) < batchSize {
-			break
-		}
-	}
-	return nil
+		return batch.flush(tx)
+	})
+	return ids, err
 }
 
-// dsBatchInsertFIBulk inserts field index rows where each row carries its own
-// project/database/namespace/kind/docPath metadata. Used by CommitAccumulator.Flush
-// to write all accumulated field-index rows in one batched operation.
-func dsBatchInsertFIBulk(exec dbExec, rows []fiBulkRow) error {
-	if len(rows) == 0 {
-		return nil
+func (s *Store) DsAllocateIDTx(tx *Txn, project, database, namespace, kind string) (int64, error) {
+	batch, err := newDsIDBatch(tx, project, database, namespace, kind)
+	if err != nil {
+		return 0, err
 	}
-	const batchSize = 500
-	const prefix = `INSERT INTO ds_field_index` +
-		` (project, database, namespace, kind, doc_path, field_path,` +
-		`  value_string, value_int, value_double, value_bool, value_null, value_ref, value_bytes, value_lat, value_lng, in_array)` +
-		` VALUES `
-	const placeholder = `(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-
-	for start := 0; start < len(rows); start += batchSize {
-		end := start + batchSize
-		if end > len(rows) {
-			end = len(rows)
-		}
-		batch := rows[start:end]
-		var sb strings.Builder
-		sb.WriteString(prefix)
-		args := make([]any, 0, len(batch)*16)
-		for i, br := range batch {
-			if i > 0 {
-				sb.WriteByte(',')
-			}
-			sb.WriteString(placeholder)
-			inArrayInt := 0
-			if br.row.inArray {
-				inArrayInt = 1
-			}
-			args = append(args,
-				br.project, br.database, br.namespace, br.kind, br.docPath, br.row.fieldPath,
-				br.row.vStr, br.row.vInt, br.row.vDouble, br.row.vBool, br.row.vNull, br.row.vRef, nilIfEmpty(br.row.vBytes),
-				br.row.vLat, br.row.vLng,
-				inArrayInt,
-			)
-		}
-		if _, err := exec.Exec(sb.String(), args...); err != nil {
-			return fmt.Errorf("ds_field_index bulk insert: %w", err)
-		}
+	id, err := batch.nextID()
+	if err != nil {
+		return 0, err
 	}
-	return nil
+	return id, batch.flush(tx)
 }
 
-func dsBatchInsertFI(exec dbExec, project, database, namespace, kind, docPath string, rows []dsFiRow) error {
-	if len(rows) == 0 {
+func (s *Store) DsReserveIDTx(tx *Txn, project, database, namespace, kind string, id int64) error {
+	counter, ok := scatteredCounter(id)
+	if !ok {
 		return nil
 	}
-	const batchSize = 500
-	const prefix = `INSERT INTO ds_field_index` +
-		` (project, database, namespace, kind, doc_path, field_path,` +
-		`  value_string, value_int, value_double, value_bool, value_null, value_ref, value_bytes, value_lat, value_lng, in_array)` +
-		` VALUES `
-	const placeholder = `(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-
-	for start := 0; start < len(rows); start += batchSize {
-		end := start + batchSize
-		if end > len(rows) {
-			end = len(rows)
-		}
-		batch := rows[start:end]
-
-		var sb strings.Builder
-		sb.WriteString(prefix)
-		args := make([]any, 0, len(batch)*16)
-		for i, r := range batch {
-			if i > 0 {
-				sb.WriteByte(',')
-			}
-			sb.WriteString(placeholder)
-			inArrayInt := 0
-			if r.inArray {
-				inArrayInt = 1
-			}
-			args = append(args,
-				project, database, namespace, kind, docPath, r.fieldPath,
-				r.vStr, r.vInt, r.vDouble, r.vBool, r.vNull, r.vRef, nilIfEmpty(r.vBytes),
-				r.vLat, r.vLng,
-				inArrayInt,
-			)
-		}
-		if _, err := exec.Exec(sb.String(), args...); err != nil {
-			return fmt.Errorf("ds_field_index insert: %w", err)
-		}
+	key := dsIDSequenceKey(project, database, namespace, kind)
+	next, err := readIDCounter(tx, key)
+	if err != nil || next > counter {
+		return err
 	}
-	return nil
+	v, _ := json.Marshal(counter + 1)
+	return tx.Set(key, v)
+}
+func (s *Store) DsGetAsOf(project, database, namespace, path string, asOf time.Time) (*datastorepb.Entity, error) {
+	var entity *datastorepb.Entity
+	err := s.viewAt(uint64(asOf.UnixNano()), func(tx *Txn) error {
+		_, found, err := getDSTxn(tx, project, database, namespace, path)
+		entity = found
+		return err
+	})
+	return entity, err
 }

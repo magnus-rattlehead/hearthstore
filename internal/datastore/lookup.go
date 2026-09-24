@@ -5,27 +5,83 @@ import (
 	"net/http"
 	"time"
 
+	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
+	"github.com/magnus-rattlehead/hearthstore/internal/storage"
 )
 
+const maxLookupResponseBytes = 4 << 20
+
 // Lookup fetches entities by key.
-func (g *GRPCServer) Lookup(ctx context.Context, req *datastorepb.LookupRequest) (*datastorepb.LookupResponse, error) {
+func (g *GRPCServer) Lookup(ctx context.Context, req *datastorepb.LookupRequest) (out *datastorepb.LookupResponse, resultErr error) {
+	defer func() { resultErr = rpcError(resultErr) }()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := g.store.CheckAvailable(); err != nil {
+		return nil, err
+	}
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "lookup request is required")
+	}
+	if len(req.Keys) > maxLookupKeys {
+		return nil, status.Errorf(codes.InvalidArgument, "lookup contains %d keys; maximum is %d", len(req.Keys), maxLookupKeys)
+	}
 	if req.ProjectId == "" {
-		req.ProjectId = defaultProjectFromKey(req.Keys)
+		return nil, status.Error(codes.InvalidArgument, "project_id is required")
 	}
 	database := req.DatabaseId
 	if database == "" {
 		database = defaultDatabase
 	}
+	for _, key := range req.Keys {
+		if err := validateKeyScope(key, req.ProjectId, database, false); err != nil {
+			return nil, err
+		}
+	}
 
-	readAt, activeTxID, newTxIDForResp := g.resolveReadOptions(req.GetReadOptions())
+	readAt, activeTxID, newTxIDForResp, err := g.resolveReadOptions(req.GetReadOptions(), req.ProjectId, database)
+	if err != nil {
+		return nil, err
+	}
+	if readAt == nil {
+		snapshot := g.store.ReadTime()
+		readAt = &snapshot
+	}
+	releaseSnapshot, err := g.store.PinReadTime(*readAt)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseSnapshot()
 
 	now := timestamppb.Now()
+	if readAt != nil {
+		now = timestamppb.New(*readAt)
+	}
 	resp := &datastorepb.LookupResponse{
 		ReadTime:    now,
 		Transaction: []byte(newTxIDForResp),
+	}
+	responseBytes := proto.Size(resp)
+	appendResult := func(result *datastorepb.EntityResult, found bool) bool {
+		key := result.GetEntity().GetKey()
+		cost := messageFieldSize(1, proto.Size(result))
+		reserved := messageFieldSize(3, proto.Size(key))
+		if responseBytes-reserved+cost > maxLookupResponseBytes {
+			resp.Deferred = append(resp.Deferred, key)
+			return false
+		}
+		responseBytes += cost - reserved
+		if found {
+			resp.Found = append(resp.Found, result)
+		} else {
+			resp.Missing = append(resp.Missing, result)
+		}
+		return true
 	}
 	seen := make(map[string]bool, len(req.Keys))
 
@@ -36,9 +92,8 @@ func (g *GRPCServer) Lookup(ctx context.Context, req *datastorepb.LookupRequest)
 		path string
 	}
 	groups := make(map[nsKey][]keyMeta)
-	keyByPath := make(map[string]*datastorepb.Key, len(req.Keys))
-
 	for _, key := range req.Keys {
+		key = scopedKey(key, req.ProjectId, database)
 		ks := keyString(key)
 		if seen[ks] {
 			continue
@@ -53,82 +108,63 @@ func (g *GRPCServer) Lookup(ctx context.Context, req *datastorepb.LookupRequest)
 			db = database
 		}
 
-		if readAt != nil {
-			// Snapshot reads must be per-entity (time-based query).
-			entity, err := g.store.DsGetAsOf(proj, db, ns, path, *readAt)
-			if err != nil {
-				resp.Missing = append(resp.Missing, &datastorepb.EntityResult{
-					Entity: &datastorepb.Entity{Key: key},
-				})
-			} else {
-				resp.Found = append(resp.Found, &datastorepb.EntityResult{
-					Entity: entity,
-				})
-			}
-		} else {
-			nk := nsKey{proj, db, ns}
-			groups[nk] = append(groups[nk], keyMeta{key, path})
-			keyByPath[path] = key
-		}
+		nk := nsKey{proj, db, ns}
+		groups[nk] = append(groups[nk], keyMeta{key, path})
+		responseBytes += messageFieldSize(3, proto.Size(key))
 	}
 
-	// Batch fetch all non-snapshot keys per namespace group.
+	// Visit one entity at a time so decoded entities are bounded by the exact
+	// serialized response ceiling rather than an arbitrary fetch batch.
 	for nk, metas := range groups {
 		paths := make([]string, len(metas))
-		for i, m := range metas {
-			paths[i] = m.path
+		for i, meta := range metas {
+			paths[i] = meta.path
 		}
-		found, missing, err := g.store.DsGetManyWithTimes(nk.project, nk.database, nk.namespace, paths)
-		if err != nil {
-			return nil, err
+		visited := 0
+		visit := func(row *storage.DsEntityRow, _ string) bool {
+			meta := metas[visited]
+			visited++
+			if row == nil {
+				return appendResult(&datastorepb.EntityResult{Entity: &datastorepb.Entity{Key: meta.key}}, false)
+			}
+			return appendResult(&datastorepb.EntityResult{Entity: row.Entity, Version: row.Version, CreateTime: row.CreateTime, UpdateTime: row.UpdateTime}, true)
 		}
-		for _, row := range found {
-			resp.Found = append(resp.Found, &datastorepb.EntityResult{
-				Entity:     row.Entity,
-				Version:    row.Version,
-				CreateTime: row.CreateTime,
-				UpdateTime: row.UpdateTime,
-			})
+		var getErr error
+		if readAt == nil {
+			getErr = g.store.DsVisitManyWithTimes(ctx, nk.project, nk.database, nk.namespace, paths, visit)
+		} else {
+			getErr = g.store.DsVisitManyWithTimesAsOf(ctx, *readAt, nk.project, nk.database, nk.namespace, paths, visit)
 		}
-		for _, path := range missing {
-			key := keyByPath[path]
-			resp.Missing = append(resp.Missing, &datastorepb.EntityResult{
-				Entity: &datastorepb.Entity{Key: key},
-			})
+		if getErr != nil {
+			return nil, getErr
+		}
+		for ; visited < len(metas); visited++ {
+			resp.Deferred = append(resp.Deferred, metas[visited].key)
 		}
 	}
 
 	// Record found entity versions into the transaction's read set for OCC.
 	if activeTxID != "" {
-		g.txMu.Lock()
-		if entry, ok := g.txns[activeTxID]; ok {
-			if entry.reads == nil {
-				entry.reads = make(map[txReadKey]int64)
+		reads := make(map[txReadKey]int64, len(resp.Found))
+		for _, er := range append(append([]*datastorepb.EntityResult{}, resp.Found...), resp.Missing...) {
+			proj2, db2, ns2, _, _, path2 := keyComponents(er.Entity.Key)
+			if proj2 == "" {
+				proj2 = req.ProjectId
 			}
-			for _, er := range resp.Found {
-				proj2, db2, ns2, _, _, path2 := keyComponents(er.Entity.Key)
-				if proj2 == "" {
-					proj2 = req.ProjectId
-				}
-				if db2 == "" {
-					db2 = database
-				}
-				entry.reads[txReadKey{proj2, db2, ns2, path2}] = er.Version
+			if db2 == "" {
+				db2 = database
 			}
-			g.txns[activeTxID] = entry
+			reads[txReadKey{proj2, db2, ns2, path2}] = er.Version
 		}
-		g.txMu.Unlock()
+		if err := g.recordTransactionReads(activeTxID, reads); err != nil {
+			return nil, err
+		}
 	}
 
+	if proto.Size(resp) > maxLookupResponseBytes {
+		return nil, status.Error(codes.ResourceExhausted, "lookup keys exceed response size limit")
+	}
 	return resp, nil
-}
-
-// defaultProjectFromKey extracts the project ID from the first key, if any.
-func defaultProjectFromKey(keys []*datastorepb.Key) string {
-	if len(keys) > 0 {
-		return keys[0].GetPartitionId().GetProjectId()
-	}
-	return ""
 }
 
 func (s *Server) handleLookup(w http.ResponseWriter, r *http.Request, project string) {

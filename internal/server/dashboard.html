@@ -3,511 +3,123 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
     <title>hearthstore dashboard</title>
     <style>
-      :root {
-        color-scheme: light dark;
-        --background: #fff;
-        --surface: #f5f5f5;
-        --border: #ccc;
-        --text: #222;
-        --muted: #666;
-        --link: #075eb5;
-        --good: #176b32;
-        --warn: #865b00;
-        --bad: #b42318;
-      }
-
-      @media (prefers-color-scheme: dark) {
-        :root {
-          --background: #111;
-          --surface: #1c1c1c;
-          --border: #444;
-          --text: #ddd;
-          --muted: #aaa;
-          --link: #75baff;
-          --good: #6dc887;
-          --warn: #e2b95c;
-          --bad: #ff8a80;
-        }
-      }
-
-      * {
-        box-sizing: border-box;
-      }
-
-      body {
-        max-width: 100rem;
-        margin: 0 auto;
-        padding: 1rem;
-        background: var(--background);
-        color: var(--text);
-        font:
-          0.8rem/1.45 ui-monospace,
-          SFMono-Regular,
-          Consolas,
-          monospace;
-      }
-
-      header {
-        display: flex;
-        flex-wrap: wrap;
-        align-items: baseline;
-        gap: 0.75rem;
-        padding-bottom: 0.75rem;
-        border-bottom: 1px solid var(--border);
-      }
-
-      h1,
-      h2,
-      h3 {
-        margin: 0;
-      }
-
-      h1 {
-        font-size: 1.35rem;
-      }
-
-      h2 {
-        margin-bottom: 0.5rem;
-        font-size: 1rem;
-      }
-
-      section {
-        margin-top: 1.25rem;
-      }
-
-      .muted {
-        color: var(--muted);
-      }
-
-      .metric-sections {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
-        gap: 1.25rem;
-      }
-
-      table {
-        width: 100%;
-        border-collapse: collapse;
-      }
-
-      th,
-      td {
-        padding: 0.25rem 0.5rem;
-        border-bottom: 1px solid var(--border);
-        text-align: left;
-        vertical-align: top;
-      }
-
-      th {
-        color: var(--muted);
-        font-weight: normal;
-      }
-
-      .metrics td:last-child {
-        text-align: right;
-        font-variant-numeric: tabular-nums;
-      }
-
-      .filter-form {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr));
-        gap: 0.5rem;
-        align-items: end;
-        margin-bottom: 0.75rem;
-      }
-
-      .filter-form label {
-        display: grid;
-        min-width: 0;
-        gap: 0.2rem;
-        color: var(--muted);
-      }
-
-      input,
-      select,
-      button {
-        display: block;
-        max-width: 100%;
-        min-height: 2rem;
-        padding: 0.3rem 0.45rem;
-        border: 1px solid var(--border);
-        border-radius: 0.2rem;
-        background: var(--background);
-        color: var(--text);
-        font: inherit;
-      }
-
-      .filter-form input,
-      .filter-form select {
-        width: 100%;
-        min-width: 0;
-      }
-
-      button {
-        cursor: pointer;
-      }
-
-      button:hover,
-      button:focus-visible,
-      input:focus-visible,
-      select:focus-visible {
-        border-color: var(--link);
-        outline: 2px solid color-mix(in srgb, var(--link) 35%, transparent);
-        outline-offset: 1px;
-      }
-
-      .filter-actions {
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        min-width: 0;
-        gap: 0.4rem;
-      }
-
-      .filter-actions button {
-        width: 100%;
-      }
-
-      .operations-count {
-        margin: 0 0 0.5rem;
-        color: var(--muted);
-      }
-
       .table-wrap {
         overflow-x: auto;
       }
 
-      .recent th,
-      .recent td {
-        white-space: nowrap;
-        font-variant-numeric: tabular-nums;
+      .table-wrap table {
+        width: 100%;
       }
 
-      .recent td.path {
-        max-width: 24rem;
-        overflow: hidden;
-        color: var(--muted);
-        text-overflow: ellipsis;
-      }
-
-      .recent td.number,
-      .recent th.number {
-        text-align: right;
-      }
-
-      .recent tr[data-idx] {
-        cursor: pointer;
-      }
-
-      .recent tr[data-idx]:hover td,
-      .recent tr.selected td {
-        background: var(--surface);
-      }
-
-      .recent tr.warn td {
-        color: var(--warn);
-      }
-
-      .recent tr.err td {
-        color: var(--bad);
+      .table-wrap th,
+      .table-wrap td {
+        padding: 0.5rem 1rem;
+        text-align: center;
       }
 
       .rpc-panel {
         position: fixed;
         inset: 0 0 0 auto;
-        width: min(36rem, 100%);
+        z-index: 1;
+        width: min(32rem, 100%);
+        box-sizing: border-box;
+        overflow: auto;
         padding: 1rem;
-        overflow-y: auto;
-        border-left: 1px solid var(--border);
-        background: var(--background);
-        transform: translateX(100%);
-        transition: transform 0.2s ease;
-      }
-
-      .rpc-panel.open {
-        transform: translateX(0);
-      }
-
-      .rpc-panel-close {
-        float: right;
-        min-width: 2.75rem;
-        min-height: 2.75rem;
-        border: 0;
-        font-size: 1.2rem;
-      }
-
-      .rpc-section {
-        margin-top: 0.75rem;
-        border: 1px solid var(--border);
-      }
-
-      .rpc-section > summary {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 0.4rem 0.5rem;
-        background: var(--surface);
-        cursor: pointer;
-      }
-
-      .rpc-section-body {
-        padding: 0.35rem 0.5rem;
-      }
-
-      .rpc-copy {
-        min-height: auto;
-        padding: 0.1rem 0.35rem;
-      }
-
-      .error-block {
-        margin-top: 0.75rem;
-        padding: 0.5rem;
-        border: 1px solid var(--bad);
-        color: var(--bad);
-        white-space: pre-wrap;
-        word-break: break-word;
-      }
-
-      .val-str {
-        color: var(--link);
-      }
-
-      .val-num,
-      .val-bool {
-        color: var(--good);
-      }
-
-      .val-null,
-      .val-arr {
-        color: var(--muted);
-      }
-
-      @media (prefers-reduced-motion: reduce) {
-        .rpc-panel {
-          transition: none;
-        }
+        background: Canvas;
+        color: CanvasText;
+        border-left: 1px solid;
       }
     </style>
   </head>
 
   <body>
-    <header>
-      <h1>hearthstore</h1>
-      <span id="uptime" class="muted">loading...</span>
-    </header>
-
     <main>
-      <div class="metric-sections">
-        <section aria-labelledby="activity-heading">
-          <h2 id="activity-heading">Activity</h2>
-          <table class="metrics">
-            <tbody>
-              <tr>
-                <th scope="row">commits/s</th>
-                <td id="commit-rate">-</td>
-              </tr>
-              <tr>
-                <th scope="row">commit total</th>
-                <td id="commit-total">-</td>
-              </tr>
-              <tr>
-                <th scope="row">commit errors</th>
-                <td id="commit-errors">-</td>
-              </tr>
-              <tr>
-                <th scope="row">RPCs/s</th>
-                <td id="rpc-rate">-</td>
-              </tr>
-              <tr>
-                <th scope="row">RPC total</th>
-                <td id="rpc-total">-</td>
-              </tr>
-              <tr>
-                <th scope="row">RPC errors</th>
-                <td id="rpc-errors">-</td>
-              </tr>
-              <tr>
-                <th scope="row">listen events/s</th>
-                <td id="listen-rate">-</td>
-              </tr>
-              <tr>
-                <th scope="row">listen events</th>
-                <td id="listen-events">-</td>
-              </tr>
-              <tr>
-                <th scope="row">OCC conflicts</th>
-                <td id="occ-conflicts">-</td>
-              </tr>
-              <tr>
-                <th scope="row">batch preemptions</th>
-                <td id="batch-preempted">-</td>
-              </tr>
-            </tbody>
-          </table>
-        </section>
-
-        <section aria-labelledby="storage-heading">
-          <h2 id="storage-heading">Storage</h2>
-          <table class="metrics">
-            <tbody>
-              <tr>
-                <th scope="row">batch channel</th>
-                <td id="batch-channel">-</td>
-              </tr>
-              <tr>
-                <th scope="row">priority channel</th>
-                <td id="priority-channel">-</td>
-              </tr>
-              <tr>
-                <th scope="row">subscribers</th>
-                <td id="subscribers">-</td>
-              </tr>
-              <tr>
-                <th scope="row">scopes</th>
-                <td id="scopes">-</td>
-              </tr>
-              <tr>
-                <th scope="row">collection groups</th>
-                <td id="collection-groups">-</td>
-              </tr>
-              <tr>
-                <th scope="row">write DB open/use/idle</th>
-                <td id="wdb-pool">-</td>
-              </tr>
-              <tr>
-                <th scope="row">read DB open/use/idle</th>
-                <td id="rdb-pool">-</td>
-              </tr>
-              <tr>
-                <th scope="row">checkpoint DB open/use/idle</th>
-                <td id="cpdb-pool">-</td>
-              </tr>
-              <tr>
-                <th scope="row">write DB waits</th>
-                <td id="wdb-waits">-</td>
-              </tr>
-              <tr>
-                <th scope="row">batch queue wait latest/max</th>
-                <td id="batch-queue-wait">-</td>
-              </tr>
-              <tr>
-                <th scope="row">batch execution latest/max</th>
-                <td id="batch-execution">-</td>
-              </tr>
-              <tr>
-                <th scope="row">last checkpoint</th>
-                <td id="checkpoint-duration">-</td>
-              </tr>
-              <tr>
-                <th scope="row">checkpoint frames applied/total</th>
-                <td id="checkpoint-frames">-</td>
-              </tr>
-            </tbody>
-          </table>
-        </section>
-
-        <section aria-labelledby="database-heading">
-          <h2 id="database-heading">Database</h2>
-          <table class="metrics">
-            <tbody>
-              <tr>
-                <th scope="row">documents</th>
-                <td id="documents">-</td>
-              </tr>
-              <tr>
-                <th scope="row">document changes</th>
-                <td id="document-changes">-</td>
-              </tr>
-              <tr>
-                <th scope="row">field index</th>
-                <td id="field-index">-</td>
-              </tr>
-              <tr>
-                <th scope="row">Datastore documents</th>
-                <td id="ds-documents">-</td>
-              </tr>
-              <tr>
-                <th scope="row">Datastore document changes</th>
-                <td id="ds-document-changes">-</td>
-              </tr>
-              <tr>
-                <th scope="row">Datastore field index</th>
-                <td id="ds-field-index">-</td>
-              </tr>
-              <tr>
-                <th scope="row">Datastore ID sequences</th>
-                <td id="ds-id-sequences">-</td>
-              </tr>
-              <tr>
-                <th scope="row">database size</th>
-                <td id="database-size">-</td>
-              </tr>
-              <tr>
-                <th scope="row">WAL size</th>
-                <td id="wal-size">-</td>
-              </tr>
-              <tr>
-                <th scope="row">freelist pages</th>
-                <td id="freelist-pages">-</td>
-              </tr>
-            </tbody>
-          </table>
-        </section>
-
-        <section aria-labelledby="runtime-heading">
-          <h2 id="runtime-heading">Runtime</h2>
-          <table class="metrics">
-            <tbody>
-              <tr>
-                <th scope="row">goroutines</th>
-                <td id="goroutines">-</td>
-              </tr>
-              <tr>
-                <th scope="row">RSS</th>
-                <td id="rss">-</td>
-              </tr>
-              <tr>
-                <th scope="row">allocated</th>
-                <td id="allocated">-</td>
-              </tr>
-              <tr>
-                <th scope="row">heap in use</th>
-                <td id="heap-in-use">-</td>
-              </tr>
-              <tr>
-                <th scope="row">system memory</th>
-                <td id="system-memory">-</td>
-              </tr>
-              <tr>
-                <th scope="row">heap objects</th>
-                <td id="heap-objects">-</td>
-              </tr>
-              <tr>
-                <th scope="row">GC cycles</th>
-                <td id="gc-cycles">-</td>
-              </tr>
-              <tr>
-                <th scope="row">GC pause total</th>
-                <td id="gc-pause-total">-</td>
-              </tr>
-              <tr>
-                <th scope="row">GOMAXPROCS</th>
-                <td id="gomaxprocs">-</td>
-              </tr>
-            </tbody>
-          </table>
-        </section>
-      </div>
-
       <section aria-labelledby="indexes-heading">
-        <h2 id="indexes-heading">Datastore indexes</h2>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>project</th><th>kind</th><th>properties</th><th>source</th><th>state</th><th>progress</th><th>error</th></tr></thead>
-            <tbody id="indexes-body"><tr><td colspan="7" class="muted">none</td></tr></tbody>
-          </table>
-        </div>
+        <details class="indexes-details">
+          <summary id="indexes-heading">
+            Datastore indexes (click to expand)
+            <span id="indexes-count">(0)</span>
+          </summary>
+          <div class="table-wrap">
+            <table class="indexes">
+              <thead>
+                <tr>
+                  <th aria-sort="none">
+                    <button
+                      class="sort-button"
+                      data-index-sort="project"
+                      type="button"
+                    >
+                      project
+                    </button>
+                  </th>
+                  <th aria-sort="none">
+                    <button
+                      class="sort-button"
+                      data-index-sort="kind"
+                      type="button"
+                    >
+                      kind
+                    </button>
+                  </th>
+                  <th aria-sort="none">
+                    <button
+                      class="sort-button"
+                      data-index-sort="properties"
+                      type="button"
+                    >
+                      properties
+                    </button>
+                  </th>
+                  <th aria-sort="none">
+                    <button
+                      class="sort-button"
+                      data-index-sort="source"
+                      type="button"
+                    >
+                      source
+                    </button>
+                  </th>
+                  <th aria-sort="none">
+                    <button
+                      class="sort-button"
+                      data-index-sort="state"
+                      type="button"
+                    >
+                      state
+                    </button>
+                  </th>
+                  <th aria-sort="none">
+                    <button
+                      class="sort-button"
+                      data-index-sort="progress"
+                      type="button"
+                    >
+                      progress
+                    </button>
+                  </th>
+                  <th aria-sort="none">
+                    <button
+                      class="sort-button"
+                      data-index-sort="error"
+                      type="button"
+                    >
+                      error
+                    </button>
+                  </th>
+                </tr>
+              </thead>
+              <tbody id="indexes-body">
+                <tr>
+                  <td colspan="7" class="muted">none</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
       </section>
 
       <section aria-labelledby="operations-heading">
@@ -516,12 +128,6 @@
           <label
             >method
             <select id="f-method">
-              <option value="">all</option>
-            </select>
-          </label>
-          <label
-            >source
-            <select id="f-source">
               <option value="">all</option>
             </select>
           </label>
@@ -544,13 +150,6 @@
           </label>
           <label>search <input id="f-q" autocomplete="off" /></label>
           <label>path <input id="f-path" autocomplete="off" /></label>
-          <label
-            >collection
-            <select id="f-collection">
-              <option value="">all</option>
-            </select>
-          </label>
-          <label>detail <input id="f-detail" autocomplete="off" /></label>
           <label
             >min ms <input id="f-min-latency" type="number" min="0"
           /></label>
@@ -578,7 +177,6 @@
             <thead>
               <tr>
                 <th>time</th>
-                <th>source</th>
                 <th>method</th>
                 <th>path</th>
                 <th class="number">latency</th>
@@ -596,6 +194,7 @@
       id="rpc-panel"
       aria-labelledby="rpc-panel-title"
       aria-hidden="true"
+      hidden
     >
       <button
         class="rpc-panel-close"
@@ -611,13 +210,16 @@
     <script>
       let operationEntries = [];
       let selectedIdx = -1;
+      let selectedOperationID = null;
       let copySlots = {};
-      let previousCounters = null;
-      const operationFilterOptions = {
-        "f-method": new Set(),
-        "f-source": new Set(),
-        "f-collection": new Set(),
-      };
+      let indexEntries = [];
+      let indexSortKey = null;
+      let indexSortDirection = "asc";
+      const operationMethods = new Set();
+      const indexCollator = new Intl.Collator(undefined, {
+        numeric: true,
+        sensitivity: "base",
+      });
 
       function esc(value) {
         return String(value)
@@ -635,138 +237,74 @@
         return Number(value).toFixed(decimals);
       }
 
-      function fmtBytes(bytes) {
-        if (bytes >= 1 << 30) return (bytes / (1 << 30)).toFixed(2) + " GB";
-        if (bytes >= 1 << 20) return (bytes / (1 << 20)).toFixed(1) + " MB";
-        if (bytes >= 1 << 10) return (bytes / (1 << 10)).toFixed(0) + " KB";
-        return bytes + " B";
-      }
-
-      function fmtUptime(seconds) {
-        const hours = Math.floor(seconds / 3600);
-        const minutes = Math.floor((seconds % 3600) / 60);
-        const remaining = Math.floor(seconds % 60);
-        return [hours, minutes, remaining]
-          .map((value) => String(value).padStart(2, "0"))
-          .join(":");
-      }
-
       function setText(id, value) {
         document.getElementById(id).textContent = value;
       }
 
-      function renderMetrics(data) {
-        const counters = data.counters;
-        const storage = data.storage;
-        const database = data.db;
-        const runtime = data.runtime;
-        const rate = (current, previous) =>
-          previousCounters ? ((current - previous) / 2).toFixed(1) : "-";
+      function indexProperties(index) {
+        return (index.properties || [])
+          .map((property) => property.name + (property.desc ? " desc" : ""))
+          .join(", ");
+      }
 
-        setText("uptime", "up " + fmtUptime(data.uptime_sec));
-        setText(
-          "commit-rate",
-          rate(counters.commit_total, previousCounters?.commit_total),
-        );
-        setText("commit-total", fmt(counters.commit_total));
-        setText("commit-errors", fmt(counters.commit_errors));
-        setText(
-          "rpc-rate",
-          rate(counters.rpc_total, previousCounters?.rpc_total),
-        );
-        setText("rpc-total", fmt(counters.rpc_total));
-        setText("rpc-errors", fmt(counters.rpc_errors));
-        setText(
-          "listen-rate",
-          rate(counters.listen_events, previousCounters?.listen_events),
-        );
-        setText("listen-events", fmt(counters.listen_events));
-        setText("occ-conflicts", fmt(counters.occ_conflicts));
-        setText("batch-preempted", fmt(counters.batch_preempted));
-        setText(
-          "batch-channel",
-          `${storage.batch_ch.len} / ${storage.batch_ch.cap}`,
-        );
-        setText(
-          "priority-channel",
-          `${storage.priority_ch.len} / ${storage.priority_ch.cap}`,
-        );
-        setText("subscribers", storage.sub_entries);
-        setText("scopes", storage.by_scope);
-        setText("collection-groups", storage.by_coll_g);
-        setText(
-          "wdb-pool",
-          `${storage.wdb.open}/${storage.wdb.in_use}/${storage.wdb.idle}`,
-        );
-        setText(
-          "rdb-pool",
-          `${storage.rdb.open}/${storage.rdb.in_use}/${storage.rdb.idle}`,
-        );
-        setText(
-          "cpdb-pool",
-          `${storage.cpdb.open}/${storage.cpdb.in_use}/${storage.cpdb.idle}`,
-        );
-        setText(
-          "wdb-waits",
-          `${fmt(storage.wdb.wait_count)} x ${fmt(storage.wdb.wait_duration_ms, 1)} ms`,
-        );
-        const performance = storage.performance;
-        setText(
-          "batch-queue-wait",
-          `${fmt(performance.last_batch_queue_wait_ms, 1)} / ${fmt(performance.max_batch_queue_wait_ms, 1)} ms`,
-        );
-        setText(
-          "batch-execution",
-          `${fmt(performance.last_batch_execution_ms, 1)} / ${fmt(performance.max_batch_execution_ms, 1)} ms (${performance.last_batch_jobs} jobs)`,
-        );
-        setText(
-          "checkpoint-duration",
-          performance.checkpoint_count === 0
-            ? "not run"
-            : `${fmt(performance.checkpoint_last_duration_ms, 1)} ms${performance.checkpoint_busy ? " (busy)" : ""}`,
-        );
-        setText(
-          "checkpoint-frames",
-          `${fmt(performance.checkpointed_frames)} / ${fmt(performance.checkpoint_log_frames)} (${fmt(performance.checkpoint_count)} runs, ${fmt(performance.checkpoint_errors)} errors)`,
-        );
-        setText("documents", fmt(database.documents));
-        setText("document-changes", fmt(database.document_changes));
-        setText("field-index", fmt(database.field_index));
-        setText("ds-documents", fmt(database.ds_documents));
-        setText("ds-document-changes", fmt(database.ds_document_changes));
-        setText("ds-field-index", fmt(database.ds_field_index));
-        setText("ds-id-sequences", fmt(database.ds_id_sequences));
-        setText("database-size", fmtBytes(database.db_size_bytes));
-        setText("wal-size", fmtBytes(database.wal_size_bytes));
-        setText("freelist-pages", fmt(database.freelist_pages));
-        setText("goroutines", runtime.goroutines);
-        setText(
-          "rss",
-          runtime.rss_mb > 0 ? runtime.rss_mb.toFixed(1) + " MB" : "-",
-        );
-        setText("allocated", runtime.alloc_mb.toFixed(1) + " MB");
-        setText("heap-in-use", runtime.heap_inuse_mb.toFixed(1) + " MB");
-        setText("system-memory", runtime.sys_mb.toFixed(1) + " MB");
-        setText("heap-objects", fmt(runtime.heap_objects));
-        setText("gc-cycles", runtime.num_gc);
-        setText("gc-pause-total", runtime.pause_total_ms.toFixed(1) + " ms");
-        setText("gomaxprocs", runtime.gomaxprocs);
+      function indexValue(index, key) {
+        if (key === "properties") return indexProperties(index);
+        if (key === "progress") {
+          return index.total_entities > 0
+            ? index.processed_entities / index.total_entities
+            : null;
+        }
+        return index[key] || null;
+      }
 
-		const indexBody = document.getElementById("indexes-body");
-		const indexes = data.indexes || [];
-		indexBody.innerHTML = indexes.length
-		  ? indexes.map((index) => {
-		      const properties = index.properties.map((property) => property.name + (property.desc ? " desc" : "")).join(", ");
-		      const progress = index.total_entities ? `${fmt(index.processed_entities)} / ${fmt(index.total_entities)}` : "-";
-		      return `<tr><td>${esc(index.project)}</td><td>${esc(index.kind)}</td><td>${esc(properties)}</td><td>${esc(index.source)}</td><td>${esc(index.state)}</td><td>${progress}</td><td>${esc(index.error || "")}</td></tr>`;
-		    }).join("")
-		  : '<tr><td colspan="7" class="muted">none</td></tr>';
+      function renderIndexes(indexes = indexEntries) {
+        indexEntries = indexes;
+        const sorted = indexes.map((index, position) => ({ index, position }));
+        if (indexSortKey) {
+          sorted.sort((left, right) => {
+            const leftValue = indexValue(left.index, indexSortKey);
+            const rightValue = indexValue(right.index, indexSortKey);
+            if (leftValue == null || rightValue == null) {
+              if (leftValue == null && rightValue == null)
+                return left.position - right.position;
+              return leftValue == null ? 1 : -1;
+            }
+            const comparison =
+              typeof leftValue === "number"
+                ? leftValue - rightValue
+                : indexCollator.compare(String(leftValue), String(rightValue));
+            return comparison === 0
+              ? left.position - right.position
+              : comparison * (indexSortDirection === "asc" ? 1 : -1);
+          });
+        }
 
-        previousCounters = {
-          commit_total: counters.commit_total,
-          rpc_total: counters.rpc_total,
-          listen_events: counters.listen_events,
-        };
+        setText("indexes-count", `(${indexes.length})`);
+        document.getElementById("indexes-body").innerHTML = sorted.length
+          ? sorted
+              .map(({ index }) => {
+                const progress = index.total_entities
+                  ? `${fmt(index.processed_entities)} / ${fmt(index.total_entities)}`
+                  : "-";
+                return `<tr><td>${esc(index.project)}</td><td>${esc(index.kind)}</td><td>${esc(indexProperties(index))}</td><td>${esc(index.source)}</td><td>${esc(index.state)}</td><td>${progress}</td><td>${esc(index.error || "")}</td></tr>`;
+              })
+              .join("")
+          : '<tr><td colspan="7" class="muted">none</td></tr>';
+
+        document.querySelectorAll("[data-index-sort]").forEach((button) => {
+          const isActive = button.dataset.indexSort === indexSortKey;
+          button.parentElement.setAttribute(
+            "aria-sort",
+            isActive
+              ? indexSortDirection === "asc"
+                ? "ascending"
+                : "descending"
+              : "none",
+          );
+          button.textContent =
+            button.dataset.indexSort +
+            (isActive ? ` ${indexSortDirection}` : "");
+        });
       }
 
       const DETAIL_KEY_ORDER = [
@@ -839,6 +377,9 @@
         "field_count",
         "update_time",
         "create_time",
+        "access_path",
+        "index_id",
+        "index_entries_scanned",
         "scanned",
         "execution_duration_ms",
         "name",
@@ -867,6 +408,9 @@
         "field_count",
         "update_time",
         "create_time",
+        "access_path",
+        "index_id",
+        "index_entries_scanned",
         "scanned",
         "execution_duration_ms",
         "name",
@@ -885,8 +429,12 @@
           return `<span class="val-num">${value}</span>`;
         if (Array.isArray(value)) {
           const full = value.join(", ");
-          const display =
-            value.length > 5
+          const omitted = value.at(-1);
+          const hasOmittedCount =
+            typeof omitted === "string" && /^\+\d+ more$/.test(omitted);
+          const display = hasOmittedCount
+            ? value.slice(0, -1).join(", ") + ", " + omitted
+            : value.length > 5
               ? value.slice(0, 5).join(", ") +
                 " ... +" +
                 (value.length - 5) +
@@ -970,6 +518,7 @@
         const entry = operationEntries[index];
         if (!entry) return;
         selectedIdx = index;
+        selectedOperationID = entry.id;
         document
           .querySelectorAll(".recent tbody tr")
           .forEach((row) => row.classList.remove("selected"));
@@ -989,7 +538,7 @@
           makeSection("Request", request, "request") +
           makeSection("Response", response, "response") +
           error;
-        document.getElementById("rpc-panel").classList.add("open");
+        document.getElementById("rpc-panel").hidden = false;
         document
           .getElementById("rpc-panel")
           .setAttribute("aria-hidden", "false");
@@ -997,7 +546,8 @@
 
       function closePanel() {
         selectedIdx = -1;
-        document.getElementById("rpc-panel").classList.remove("open");
+        selectedOperationID = null;
+        document.getElementById("rpc-panel").hidden = true;
         document
           .getElementById("rpc-panel")
           .setAttribute("aria-hidden", "true");
@@ -1014,13 +564,10 @@
         const params = new URLSearchParams();
         const fields = [
           ["f-method", "method"],
-          ["f-source", "source"],
           ["f-status", "status_class"],
           ["f-error", "error"],
           ["f-q", "q"],
           ["f-path", "path"],
-          ["f-collection", "collection"],
-          ["f-detail", "detail"],
           ["f-min-latency", "min_latency_ms"],
           ["f-limit", "limit"],
         ];
@@ -1034,23 +581,18 @@
 
       function updateOperationFilterOptions(entries) {
         for (const entry of entries) {
-          if (entry.method) operationFilterOptions["f-method"].add(entry.method);
-          if (entry.source) operationFilterOptions["f-source"].add(entry.source);
-          const collection = entry.details?.collection;
-          if (typeof collection === "string" && collection) {
-            operationFilterOptions["f-collection"].add(collection);
-          }
+          if (entry.method) operationMethods.add(entry.method);
         }
 
-        for (const [id, values] of Object.entries(operationFilterOptions)) {
-          const select = document.getElementById(id);
-          const selected = select.value;
-          select.length = 1;
-          for (const value of [...values].sort((a, b) => a.localeCompare(b))) {
-            select.add(new Option(value, value));
-          }
-          select.value = selected;
+        const select = document.getElementById("f-method");
+        const selected = select.value;
+        select.length = 1;
+        for (const value of [...operationMethods].sort((a, b) =>
+          a.localeCompare(b),
+        )) {
+          select.add(new Option(value, value));
         }
+        select.value = selected;
       }
 
       function renderOperations(result) {
@@ -1068,7 +610,6 @@
             const shortPath = path.length > 60 ? "..." + path.slice(-57) : path;
             return `<tr class="${className}" data-idx="${index}">
               <td class="muted">${esc(entry.t)}</td>
-              <td class="muted">${esc(entry.source || "")}</td>
               <td class="muted">${esc(entry.method || "")}</td>
               <td class="path" title="${esc(path)}">${esc(shortPath)}</td>
               <td class="number">${entry.latency_ms} ms</td>
@@ -1080,10 +621,17 @@
           "ops-count",
           `${fmt(result.matched)} matched / ${fmt(result.total)} total - session ${result.session_id || "-"}`,
         );
+        if (selectedOperationID != null) {
+          selectedIdx = operationEntries.findIndex(
+            (entry) => entry.id === selectedOperationID,
+          );
+        }
         if (selectedIdx >= 0) {
           document
             .querySelector(`.recent tbody tr[data-idx="${selectedIdx}"]`)
             ?.classList.add("selected");
+        } else if (selectedOperationID != null) {
+          closePanel();
         }
       }
 
@@ -1098,15 +646,19 @@
         }
       }
 
-      async function poll() {
+      async function pollIndexes() {
         try {
-          const response = await fetch("/_/metrics");
-          if (response.ok) renderMetrics(await response.json());
-          await refreshOperations();
+          const response = await fetch("/_/indexes");
+          if (response.ok) renderIndexes(await response.json());
         } catch (error) {
           console.error(error);
         }
-        setTimeout(poll, 2000);
+        setTimeout(pollIndexes, 2000);
+      }
+
+      async function pollOperations() {
+        await refreshOperations();
+        setTimeout(pollOperations, 2000);
       }
 
       document
@@ -1117,6 +669,18 @@
           const index = Number.parseInt(row.dataset.idx, 10);
           index === selectedIdx ? closePanel() : openPanel(index);
         });
+      document.querySelectorAll("[data-index-sort]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const key = button.dataset.indexSort;
+          if (indexSortKey === key) {
+            indexSortDirection = indexSortDirection === "asc" ? "desc" : "asc";
+          } else {
+            indexSortKey = key;
+            indexSortDirection = "asc";
+          }
+          renderIndexes();
+        });
+      });
       document
         .getElementById("ops-filters")
         .addEventListener("submit", (event) => {
@@ -1137,7 +701,8 @@
         if (event.key === "Escape") closePanel();
       });
 
-      poll();
+      pollIndexes();
+      pollOperations();
     </script>
   </body>
 </html>

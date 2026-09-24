@@ -2,7 +2,7 @@ package datastore
 
 import (
 	"context"
-	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -26,7 +26,7 @@ type AdminServer struct {
 }
 
 func NewAdminServer(store *storage.Store, manager *IndexManager) *AdminServer {
-	operations := &IndexOperationsServer{store: store, operations: make(map[string]*longrunningpb.Operation)}
+	operations := &IndexOperationsServer{store: store, operations: make(map[string]*longrunningpb.Operation), changed: make(chan struct{})}
 	return &AdminServer{store: store, manager: manager, operations: operations}
 }
 
@@ -35,7 +35,7 @@ func (s *AdminServer) Operations() *IndexOperationsServer { return s.operations 
 func (s *AdminServer) ListIndexes(_ context.Context, req *adminpb.ListIndexesRequest) (*adminpb.ListIndexesResponse, error) {
 	indexes, err := s.store.ListDsCompositeIndexes(req.ProjectId)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, rpcError(err)
 	}
 	resp := &adminpb.ListIndexesResponse{}
 	for _, idx := range indexes {
@@ -46,11 +46,11 @@ func (s *AdminServer) ListIndexes(_ context.Context, req *adminpb.ListIndexesReq
 
 func (s *AdminServer) GetIndex(_ context.Context, req *adminpb.GetIndexRequest) (*adminpb.Index, error) {
 	idx, err := s.store.GetDsCompositeIndex(req.ProjectId, req.IndexId)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, storage.ErrIndexNotFound) {
 		return nil, status.Errorf(codes.NotFound, "index %q not found", req.IndexId)
 	}
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, rpcError(err)
 	}
 	return adminIndex(idx), nil
 }
@@ -72,17 +72,16 @@ func (s *AdminServer) CreateIndex(ctx context.Context, req *adminpb.CreateIndexR
 	idx.ID = storage.DsCompositeIndexID(idx.Kind, idx.Ancestor, idx.Properties)
 	if _, err := s.store.GetDsCompositeIndex(idx.Project, idx.ID); err == nil {
 		return nil, status.Errorf(codes.AlreadyExists, "index %q already exists", idx.ID)
-	} else if err != sql.ErrNoRows {
-		return nil, status.Error(codes.Internal, err.Error())
+	} else if !errors.Is(err, storage.ErrIndexNotFound) {
+		return nil, rpcError(err)
 	}
 	current, created, err := s.store.EnsureDsCompositeIndex(ctx, idx, false)
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, rpcError(err)
 	}
 	if !created {
 		return nil, status.Errorf(codes.AlreadyExists, "index %q already exists", idx.ID)
 	}
-	_ = s.manager.recordGenerated(idx)
 	name := fmt.Sprintf("projects/%s/operations/index-create-%s", req.ProjectId, idx.ID)
 	op := newIndexOperation(name, current, false, nil)
 	s.operations.put(op)
@@ -92,11 +91,11 @@ func (s *AdminServer) CreateIndex(ctx context.Context, req *adminpb.CreateIndexR
 
 func (s *AdminServer) DeleteIndex(ctx context.Context, req *adminpb.DeleteIndexRequest) (*longrunningpb.Operation, error) {
 	idx, err := s.store.GetDsCompositeIndex(req.ProjectId, req.IndexId)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, storage.ErrIndexNotFound) {
 		return nil, status.Errorf(codes.NotFound, "index %q not found", req.IndexId)
 	}
 	if err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, rpcError(err)
 	}
 	if idx.State != storage.DsIndexReady && idx.State != storage.DsIndexError {
 		return nil, status.Errorf(codes.FailedPrecondition, "index %q is %s", idx.ID, idx.State)
@@ -106,8 +105,8 @@ func (s *AdminServer) DeleteIndex(ctx context.Context, req *adminpb.DeleteIndexR
 	s.operations.put(op)
 	go func() {
 		err := s.store.DeleteDsCompositeIndex(context.Background(), req.ProjectId, req.IndexId)
-		if err == nil {
-			_ = s.manager.removeGenerated(req.IndexId)
+		if err == nil && s.manager != nil {
+			s.manager.invalidateTemplates(req.ProjectId)
 		}
 		s.operations.finishDelete(name, err)
 	}()
@@ -148,12 +147,33 @@ type IndexOperationsServer struct {
 	store      *storage.Store
 	mu         sync.RWMutex
 	operations map[string]*longrunningpb.Operation
+	completed  []string
+	changed    chan struct{}
 }
+
+const completedOperationLimit = 1_000
 
 func (s *IndexOperationsServer) put(op *longrunningpb.Operation) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.operations == nil {
+		s.operations = make(map[string]*longrunningpb.Operation)
+	}
+	if s.changed == nil {
+		s.changed = make(chan struct{})
+	}
+	previous := s.operations[op.Name]
 	s.operations[op.Name] = op
+	if op.Done && (previous == nil || !previous.Done) {
+		s.completed = append(s.completed, op.Name)
+		if len(s.completed) > completedOperationLimit {
+			oldest := s.completed[0]
+			s.completed = s.completed[1:]
+			delete(s.operations, oldest)
+		}
+	}
+	close(s.changed)
+	s.changed = make(chan struct{})
 }
 func (s *IndexOperationsServer) get(name string) (*longrunningpb.Operation, bool) {
 	s.mu.RLock()
@@ -171,33 +191,31 @@ func newIndexOperation(name string, idx storage.DsCompositeIndex, done bool, ope
 	}
 	if operationErr != nil {
 		op.Done = true
-		op.Result = &longrunningpb.Operation_Error{Error: status.Convert(operationErr).Proto()}
+		op.Result = &longrunningpb.Operation_Error{Error: status.Convert(rpcError(operationErr)).Proto()}
 	}
 	return op
 }
 
-func (s *IndexOperationsServer) watch(name, project, id string, deleting bool) {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for range ticker.C {
-		idx, err := s.store.GetDsCompositeIndex(project, id)
-		if err == sql.ErrNoRows && deleting {
-			s.finishDelete(name, nil)
-			return
+func (s *IndexOperationsServer) watch(name, project, id string, _ bool) {
+	err := s.store.WatchDsCompositeIndex(context.Background(), project, id, func(idx storage.DsCompositeIndex) {
+		if idx.State != storage.DsIndexReady && idx.State != storage.DsIndexError {
+			s.put(newIndexOperation(name, idx, false, nil))
 		}
-		if err != nil {
-			continue
-		}
-		done := idx.State == storage.DsIndexReady || idx.State == storage.DsIndexError
-		var operationErr error
-		if idx.State == storage.DsIndexError {
-			operationErr = status.Error(codes.Internal, idx.Error)
-		}
-		s.put(newIndexOperation(name, idx, done, operationErr))
-		if done {
-			return
-		}
+	})
+	if err != nil {
+		s.put(newIndexOperation(name, storage.DsCompositeIndex{}, true, rpcError(err)))
+		return
 	}
+	idx, err := s.store.GetDsCompositeIndex(project, id)
+	if err != nil {
+		s.put(newIndexOperation(name, storage.DsCompositeIndex{}, true, rpcError(err)))
+		return
+	}
+	var operationErr error
+	if idx.State == storage.DsIndexError {
+		operationErr = rpcError(errors.New(idx.Error))
+	}
+	s.put(newIndexOperation(name, idx, true, operationErr))
 }
 func (s *IndexOperationsServer) finishDelete(name string, err error) {
 	idx := storage.DsCompositeIndex{}
@@ -236,17 +254,20 @@ func (s *IndexOperationsServer) CancelOperation(context.Context, *longrunningpb.
 	return nil, status.Error(codes.Unimplemented, "index build cancellation is not supported")
 }
 func (s *IndexOperationsServer) WaitOperation(ctx context.Context, req *longrunningpb.WaitOperationRequest) (*longrunningpb.Operation, error) {
-	deadline := time.NewTimer(30 * time.Second)
-	defer deadline.Stop()
+	var timeout <-chan time.Time
+	var timer *time.Timer
 	if req.Timeout != nil {
-		deadline.Reset(req.Timeout.AsDuration())
+		timer = time.NewTimer(req.Timeout.AsDuration())
+		timeout = timer.C
+		defer timer.Stop()
 	}
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
 	for {
-		op, err := s.GetOperation(ctx, &longrunningpb.GetOperationRequest{Name: req.Name})
-		if err != nil {
-			return nil, err
+		s.mu.RLock()
+		op, ok := s.operations[req.Name]
+		changed := s.changed
+		s.mu.RUnlock()
+		if !ok {
+			return nil, status.Error(codes.NotFound, "operation not found")
 		}
 		if op.Done {
 			return op, nil
@@ -254,9 +275,9 @@ func (s *IndexOperationsServer) WaitOperation(ctx context.Context, req *longrunn
 		select {
 		case <-ctx.Done():
 			return nil, status.FromContextError(ctx.Err()).Err()
-		case <-deadline.C:
+		case <-timeout:
 			return op, nil
-		case <-ticker.C:
+		case <-changed:
 		}
 	}
 }

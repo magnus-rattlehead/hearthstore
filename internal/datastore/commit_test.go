@@ -1,6 +1,9 @@
 package datastore
 
 import (
+	"context"
+	"encoding/json"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,7 +13,127 @@ import (
 	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
 )
 
+func TestCommitContainerAndTimestampContracts(t *testing.T) {
+	s := newTestDsServer(t)
+	t.Run("embedded_array_unindexed_payload", func(t *testing.T) {
+		payload := dsStr(strings.Repeat("x", 70_000))
+		payload.ExcludeFromIndexes = true
+		entity := dsEntity(dsKey("ContainerContract", "one"), map[string]*datastorepb.Value{"items": dsArray(dsEntityVal(map[string]*datastorepb.Value{"payload": payload}))})
+		upsertEntity(t, s, entity)
+		response, err := s.grpc.Lookup(context.Background(), &datastorepb.LookupRequest{ProjectId: testProject, Keys: []*datastorepb.Key{entity.Key}})
+		if err != nil || len(response.GetFound()) != 1 {
+			t.Fatalf("lookup=%v err=%v", response, err)
+		}
+		stored := response.Found[0].Entity.Properties["items"].GetArrayValue().Values[0].GetEntityValue().Properties["payload"]
+		if stored.GetStringValue() != payload.GetStringValue() || !stored.ExcludeFromIndexes {
+			t.Fatal("embedded unindexed payload changed")
+		}
+	})
+	t.Run("request_time_milliseconds", func(t *testing.T) {
+		stamp := &timestamppb.Timestamp{Seconds: 1, Nanos: 123456789}
+		entity, values, err := applyPropertyTransforms(dsEntity(dsKey("TimeContract", "one"), nil), []*datastorepb.PropertyTransform{{Property: "time", TransformType: &datastorepb.PropertyTransform_SetToServerValue{SetToServerValue: datastorepb.PropertyTransform_REQUEST_TIME}}}, stamp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if entity.Properties["time"].GetTimestampValue().Nanos != 123000000 || values[0].GetTimestampValue().Nanos != 123000000 || stamp.Nanos != 123456789 {
+			t.Fatalf("entity=%v result=%v original=%v", entity, values, stamp)
+		}
+	})
+}
+
+func testCommitBulkIncompleteUpserts(t *testing.T, s *Server) {
+	const count = 500
+	mutations := make([]*datastorepb.Mutation, count)
+	for i := range mutations {
+		mutations[i] = &datastorepb.Mutation{Operation: &datastorepb.Mutation_Upsert{
+			Upsert: dsEntity(incompleteKey("Call"), map[string]*datastorepb.Value{"n": dsInt(int64(i))}),
+		}}
+	}
+	req := &datastorepb.CommitRequest{
+		ProjectId: testProject,
+		Mode:      datastorepb.CommitRequest_NON_TRANSACTIONAL,
+		Mutations: mutations,
+	}
+	resp, err := s.grpc.Commit(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.MutationResults) != count {
+		t.Fatalf("results = %d, want %d", len(resp.MutationResults), count)
+	}
+	ids := make(map[int64]struct{}, count)
+	for _, result := range resp.MutationResults {
+		id := result.GetKey().GetPath()[0].GetId()
+		if id == 0 {
+			t.Fatal("bulk upsert returned an incomplete key")
+		}
+		ids[id] = struct{}{}
+	}
+	if len(ids) != count {
+		t.Fatalf("allocated %d distinct IDs, want %d", len(ids), count)
+	}
+}
+
+func testCommitBulkIncompleteUpsertsConcurrent(t *testing.T, s *Server) {
+	const (
+		batches   = 4
+		batchSize = 500
+	)
+	start := make(chan struct{})
+	responses := make(chan *datastorepb.CommitResponse, batches)
+	errors := make(chan error, batches)
+	var wg sync.WaitGroup
+	for batch := range batches {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mutations := make([]*datastorepb.Mutation, batchSize)
+			for i := range mutations {
+				mutations[i] = &datastorepb.Mutation{Operation: &datastorepb.Mutation_Upsert{
+					Upsert: dsEntity(incompleteKey("PlanBalanceChange"), map[string]*datastorepb.Value{
+						"batch": dsInt(int64(batch)),
+						"row":   dsInt(int64(i)),
+					}),
+				}}
+			}
+			<-start
+			resp, err := s.grpc.Commit(context.Background(), &datastorepb.CommitRequest{
+				ProjectId: testProject,
+				Mode:      datastorepb.CommitRequest_NON_TRANSACTIONAL,
+				Mutations: mutations,
+			})
+			if err != nil {
+				errors <- err
+				return
+			}
+			responses <- resp
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errors)
+	close(responses)
+	for err := range errors {
+		t.Errorf("concurrent commit failed: %v", err)
+	}
+
+	ids := make(map[int64]struct{}, batches*batchSize)
+	for resp := range responses {
+		for _, result := range resp.MutationResults {
+			id := result.GetKey().GetPath()[0].GetId()
+			if _, exists := ids[id]; exists {
+				t.Errorf("duplicate allocated ID %d", id)
+			}
+			ids[id] = struct{}{}
+		}
+	}
+	if len(ids) != batches*batchSize {
+		t.Fatalf("allocated %d distinct IDs, want %d", len(ids), batches*batchSize)
+	}
+}
+
 func TestCommit(t *testing.T) {
+	s := newTestDsServer(t)
 	tests := []struct {
 		name string
 		run  func(t *testing.T, s *Server)
@@ -130,8 +253,8 @@ func TestCommit(t *testing.T) {
 					ProjectId:           testProject,
 					TransactionSelector: &datastorepb.CommitRequest_Transaction{Transaction: []byte("bogus-tx")},
 				}, nil)
-				if r.StatusCode != http.StatusNotFound {
-					t.Errorf("want 404 for unknown tx, got %d", r.StatusCode)
+				if r.StatusCode != http.StatusBadRequest {
+					t.Errorf("want 400 for invalid transaction, got %d", r.StatusCode)
 				}
 			},
 		},
@@ -231,6 +354,63 @@ func TestCommit(t *testing.T) {
 				if !resp.MutationResults[0].ConflictDetected {
 					t.Error("expected conflict_detected=true for stale base_version")
 				}
+			},
+		},
+		{
+			name: "base_version_match",
+			run: func(t *testing.T, s *Server) {
+				key := dsKey("K_bvm", "match")
+				upsertEntity(t, s, dsEntity(key, map[string]*datastorepb.Value{"v": dsInt(1)}))
+				var lookup datastorepb.LookupResponse
+				mustPost(t, s, "lookup", &datastorepb.LookupRequest{
+					ProjectId: testProject,
+					Keys:      []*datastorepb.Key{key},
+				}, &lookup)
+				version := lookup.Found[0].Version
+				var response datastorepb.CommitResponse
+				mustPost(t, s, "commit", &datastorepb.CommitRequest{
+					ProjectId: testProject,
+					Mutations: []*datastorepb.Mutation{{
+						Operation:                 &datastorepb.Mutation_Upsert{Upsert: dsEntity(key, map[string]*datastorepb.Value{"v": dsInt(2)})},
+						ConflictDetectionStrategy: &datastorepb.Mutation_BaseVersion{BaseVersion: version},
+					}},
+				}, &response)
+				if response.MutationResults[0].ConflictDetected {
+					t.Fatal("matching base version reported a conflict")
+				}
+			},
+		},
+		{
+			name: "create_after_delete",
+			run: func(t *testing.T, s *Server) {
+				key := dsKey("K_create_after_delete", "entity")
+				upsertEntity(t, s, dsEntity(key, map[string]*datastorepb.Value{"v": dsInt(1)}))
+				mustPost(t, s, "commit", &datastorepb.CommitRequest{
+					ProjectId: testProject,
+					Mutations: []*datastorepb.Mutation{{Operation: &datastorepb.Mutation_Delete{Delete: key}}},
+				}, nil)
+				mustPost(t, s, "commit", &datastorepb.CommitRequest{
+					ProjectId: testProject,
+					Mutations: []*datastorepb.Mutation{{Operation: &datastorepb.Mutation_Insert{
+						Insert: dsEntity(key, map[string]*datastorepb.Value{"v": dsInt(2)}),
+					}}},
+				}, nil)
+				var lookup datastorepb.LookupResponse
+				mustPost(t, s, "lookup", &datastorepb.LookupRequest{ProjectId: testProject, Keys: []*datastorepb.Key{key}}, &lookup)
+				if got := lookup.Found[0].Entity.Properties["v"].GetIntegerValue(); got != 2 {
+					t.Fatalf("value after delete and create = %d, want 2", got)
+				}
+			},
+		},
+		{
+			name: "delete_nonexistent_is_idempotent",
+			run: func(t *testing.T, s *Server) {
+				mustPost(t, s, "commit", &datastorepb.CommitRequest{
+					ProjectId: testProject,
+					Mutations: []*datastorepb.Mutation{{Operation: &datastorepb.Mutation_Delete{
+						Delete: dsKey("K_delete_nonexistent", "missing"),
+					}}},
+				}, nil)
 			},
 		},
 		{
@@ -339,8 +519,8 @@ func TestCommit(t *testing.T) {
 						{Operation: &datastorepb.Mutation_Upsert{Upsert: dsEntity(key, nil)}},
 					},
 				}, nil)
-				if r.StatusCode != http.StatusPreconditionFailed {
-					t.Errorf("want 412 for commit on read-only tx, got %d", r.StatusCode)
+				if r.StatusCode != http.StatusBadRequest {
+					t.Errorf("want 400 for commit on read-only tx, got %d", r.StatusCode)
 				}
 			},
 		},
@@ -387,6 +567,13 @@ func TestCommit(t *testing.T) {
 				}, nil)
 				if r.StatusCode != http.StatusConflict {
 					t.Errorf("occ_concurrent: want 409 (conflict), got %d", r.StatusCode)
+				}
+				var response errResp
+				if err := json.NewDecoder(r.Body).Decode(&response); err != nil {
+					t.Fatal(err)
+				}
+				if response.Error.Status != "ABORTED" {
+					t.Errorf("occ_concurrent: status = %q, want ABORTED", response.Error.Status)
 				}
 			},
 		},
@@ -456,8 +643,13 @@ func TestCommit(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			s := newTestDsServer(t)
 			tc.run(t, s)
 		})
 	}
+	t.Run("bulk_incomplete_upserts", func(t *testing.T) {
+		testCommitBulkIncompleteUpserts(t, s)
+	})
+	t.Run("concurrent_incomplete_upserts", func(t *testing.T) {
+		testCommitBulkIncompleteUpsertsConcurrent(t, s)
+	})
 }

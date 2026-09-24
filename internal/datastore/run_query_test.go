@@ -1,16 +1,102 @@
 package datastore
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
+	"math"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
 )
+
+func TestDatastoreMixedValueOrdering(t *testing.T) {
+	s := newTestDsServer(t)
+	rows := []seedRow{
+		{"null", map[string]*datastorepb.Value{"v": dsNull()}},
+		{"date", map[string]*datastorepb.Value{"v": dsTimestamp(time.Unix(0, 38000))}},
+		{"int", map[string]*datastorepb.Value{"v": dsInt(38)}},
+		{"bool", map[string]*datastorepb.Value{"v": dsBool(false)}},
+		{"blob", map[string]*datastorepb.Value{"v": {ValueType: &datastorepb.Value_BlobValue{BlobValue: []byte("z")}}}},
+		{"text", map[string]*datastorepb.Value{"v": dsStr("a")}},
+		{"float", map[string]*datastorepb.Value{"v": dsDouble(37.5)}},
+		{"inf", map[string]*datastorepb.Value{"v": dsDouble(math.Inf(1))}},
+		{"nan", map[string]*datastorepb.Value{"v": dsDouble(math.NaN())}},
+		{"key", map[string]*datastorepb.Value{"v": {ValueType: &datastorepb.Value_KeyValue{KeyValue: dsKey("MixedOrder", "a")}}}},
+	}
+	seedKind(t, s, "MixedOrder", rows)
+	for _, fallback := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fallback=%t", fallback), func(t *testing.T) {
+			var filter *datastorepb.Filter
+			if fallback {
+				filter = orFilter(propFilter("v", datastorepb.PropertyFilter_EQUAL, dsNull()), propFilter("v", datastorepb.PropertyFilter_GREATER_THAN, dsNull()))
+			}
+			q := &datastorepb.Query{Filter: filter, Order: []*datastorepb.PropertyOrder{{Property: &datastorepb.PropertyReference{Name: "v"}}}, Limit: wrapperspb.Int32(2)}
+			var got []string
+			for page := 0; page < 10; page++ {
+				response := qKind(t, s, "MixedOrder", q)
+				for _, row := range response.Batch.EntityResults {
+					got = append(got, row.Entity.Key.Path[0].GetName())
+				}
+				if response.Batch.MoreResults == datastorepb.QueryResultBatch_NO_MORE_RESULTS {
+					break
+				}
+				q.StartCursor = response.Batch.EndCursor
+			}
+			want := []string{"null", "date", "int", "bool", "blob", "text", "float", "inf", "nan", "key"}
+			if !slices.Equal(got, want) {
+				t.Fatalf("order=%v, want %v", got, want)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		value *datastorepb.Value
+		want  int
+	}{{dsInt(38), 2}, {dsDouble(38), 0}} {
+		response := qKind(t, s, "MixedOrder", &datastorepb.Query{Filter: propFilter("v", datastorepb.PropertyFilter_EQUAL, tc.value)})
+		if got := len(response.Batch.EntityResults); got != tc.want {
+			t.Fatalf("equality %v: got %d, want %d", tc.value, got, tc.want)
+		}
+	}
+}
+
+func TestTimestampProjectionContract(t *testing.T) {
+	s := newTestDsServer(t)
+	stamp := &datastorepb.Value{ValueType: &datastorepb.Value_TimestampValue{TimestampValue: timestamppb.New(time.Unix(-1, 123456000))}}
+	seedKind(t, s, "TimestampProjection", []seedRow{{"one", map[string]*datastorepb.Value{"date": dsArray(stamp, &datastorepb.Value{ValueType: &datastorepb.Value_TimestampValue{TimestampValue: timestamppb.New(time.Unix(2, 0))}})}}})
+	for _, fallback := range []bool{false, true} {
+		filter := propFilter("date", datastorepb.PropertyFilter_GREATER_THAN_OR_EQUAL, stamp)
+		if fallback {
+			filter = orFilter(filter, propFilter("date", datastorepb.PropertyFilter_LESS_THAN, stamp))
+		}
+		var cursor []byte
+		for _, want := range []int64{-876544, 2000000} {
+			q := &datastorepb.Query{Kind: []*datastorepb.KindExpression{{Name: "TimestampProjection"}}, Projection: []*datastorepb.Projection{{Property: &datastorepb.PropertyReference{Name: "date"}}}, Order: []*datastorepb.PropertyOrder{{Property: &datastorepb.PropertyReference{Name: "date"}}}, Filter: filter, Limit: wrapperspb.Int32(1), StartCursor: cursor}
+			response, err := s.grpc.RunQuery(context.Background(), &datastorepb.RunQueryRequest{ProjectId: testProject, QueryType: &datastorepb.RunQueryRequest_Query{Query: q}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(response.Batch.EntityResults) != 1 {
+				t.Fatalf("fallback=%t: %v", fallback, response.Batch)
+			}
+			value := response.Batch.EntityResults[0].Entity.Properties["date"]
+			integer, ok := value.ValueType.(*datastorepb.Value_IntegerValue)
+			if !ok || integer.IntegerValue != want || value.Meaning != 18 {
+				t.Fatalf("fallback=%t projection=%v, want integer %d with meaning 18", fallback, value, want)
+			}
+			cursor = response.Batch.EndCursor
+		}
+	}
+}
 
 type seedRow struct {
 	name  string
@@ -58,38 +144,15 @@ func orFilter(filters ...*datastorepb.Filter) *datastorepb.Filter {
 	}
 }
 
-func TestBuildSortSpecs_PushesMatchingRangeFilters(t *testing.T) {
-	filter := andFilter(
-		propFilter("company", datastorepb.PropertyFilter_EQUAL, dsStr("acme")),
-		propFilter("created_date", datastorepb.PropertyFilter_GREATER_THAN_OR_EQUAL, dsTimestamp(time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC))),
-		propFilter("created_date", datastorepb.PropertyFilter_LESS_THAN, dsTimestamp(time.Date(2026, 8, 2, 0, 0, 0, 0, time.UTC))),
-	)
-
-	specs := buildSortSpecs([]*datastorepb.PropertyOrder{{
-		Property:  &datastorepb.PropertyReference{Name: "created_date"},
-		Direction: datastorepb.PropertyOrder_DESCENDING,
-	}}, filter)
-
-	if len(specs) != 1 {
-		t.Fatalf("want one sort spec, got %d", len(specs))
-	}
-	if got, want := specs[0].FilterSQL, "fi.value_string>=? AND fi.value_string<?"; got != want {
-		t.Errorf("sort filter SQL = %q, want %q", got, want)
-	}
-	if len(specs[0].FilterArgs) != 2 {
-		t.Fatalf("want two sort filter args, got %d", len(specs[0].FilterArgs))
-	}
-	if got, want := specs[0].FilterArgs[0], "2026-07-01T00:00:00.000000000Z"; got != want {
-		t.Errorf("lower bound = %v, want %v", got, want)
-	}
-	if got, want := specs[0].FilterArgs[1], "2026-08-02T00:00:00.000000000Z"; got != want {
-		t.Errorf("upper bound = %v, want %v", got, want)
-	}
-}
-
 // runQuery executes a RunQuery against the test server.
 func runQuery(t *testing.T, s *Server, q *datastorepb.Query) *datastorepb.RunQueryResponse {
 	t.Helper()
+	if definition, needed := queryIndexDefinition(q, hasAncestorFilter(q.GetFilter())); needed {
+		definition.Project = testProject
+		if _, _, err := s.grpc.store.EnsureDsCompositeIndex(context.Background(), definition, true); err != nil {
+			t.Fatalf("prepare composite index: %v", err)
+		}
+	}
 	var resp datastorepb.RunQueryResponse
 	mustPost(t, s, "runQuery", &datastorepb.RunQueryRequest{
 		ProjectId: testProject,
@@ -112,14 +175,15 @@ func TestRunQuery(t *testing.T) {
 	s := newTestDsServer(t)
 
 	tests := []struct {
-		name   string
-		seed   []seedRow
-		filter *datastorepb.Filter
-		order  []*datastorepb.PropertyOrder
-		proj   []*datastorepb.Projection
-		limit  int32
-		offset int32
-		wantN  int
+		name        string
+		seed        []seedRow
+		filter      *datastorepb.Filter
+		order       []*datastorepb.PropertyOrder
+		proj        []*datastorepb.Projection
+		limit       int32
+		offset      int32
+		wantN       int
+		wantInvalid bool
 		// run overrides the above fields for multi-step or non-count assertions.
 		run func(t *testing.T, s *Server, kind string)
 	}{
@@ -207,7 +271,7 @@ func TestRunQuery(t *testing.T) {
 			},
 			filter: propFilter("emb", datastorepb.PropertyFilter_EQUAL,
 				dsEntityVal(map[string]*datastorepb.Value{"name": dsStr("foo")})),
-			wantN: 1,
+			wantInvalid: true, // Java: "An entity value is not allowed".
 		},
 		{
 			name: "eq_array_whole",
@@ -215,8 +279,8 @@ func TestRunQuery(t *testing.T) {
 				{"a", map[string]*datastorepb.Value{"tags": dsArray(dsStr("x"), dsStr("y"))}},
 				{"b", map[string]*datastorepb.Value{"tags": dsArray(dsStr("p"), dsStr("q"))}},
 			},
-			filter: propFilter("tags", datastorepb.PropertyFilter_EQUAL, dsArray(dsStr("x"), dsStr("y"))),
-			wantN:  1,
+			filter:      propFilter("tags", datastorepb.PropertyFilter_EQUAL, dsArray(dsStr("x"), dsStr("y"))),
+			wantInvalid: true, // Java: "A list value is not allowed".
 		},
 		{
 			name: "eq_keyval",
@@ -668,7 +732,7 @@ func TestRunQuery(t *testing.T) {
 		{
 			name: "cursor_order_asc",
 			run: func(t *testing.T, s *Server, kind string) {
-				// Seed in reverse order to verify SQL sorts correctly
+				// Seed in reverse order to verify query sorting.
 				rows := make([]seedRow, 20)
 				for i := range rows {
 					rows[i] = seedRow{
@@ -973,12 +1037,7 @@ func TestRunQuery(t *testing.T) {
 			},
 		},
 		{
-			// Simulate the REST/JSON transport double-encoding: pjsonMarshal encodes the
-			// EndCursor bytes field as StdB64; the Python gcloud.rest client then applies
-			// _cursor_to_urlsafe and sends the result directly (no _cursor_from_urlsafe).
-			// pjsonUnmarshal URL-safe-decodes that, giving StdB64(URLSafeB64(JSON)) bytes
-			// as StartCursor. Without the double-decode fix, decodeCursorFull would treat
-			// URLSafeB64(JSON) as a plain path, and the keyset condition would return 0 rows.
+			// Reproduce the REST client's StdB64(URLSafeB64(cursor)) envelope.
 			name: "rest_double_encoded_cursor",
 			run: func(t *testing.T, s *Server, kind string) {
 				rows := make([]seedRow, 30)
@@ -1011,9 +1070,7 @@ func TestRunQuery(t *testing.T) {
 					if resp.Batch.MoreResults != datastorepb.QueryResultBatch_MORE_RESULTS_AFTER_LIMIT {
 						break
 					}
-					// Simulate REST double-encoding: pjsonMarshal encodes EndCursor bytes as
-					// StdB64, Python applies urlsafe substitution, pjsonUnmarshal URL-safe-decodes.
-					// Net result received by decodeCursorFull: StdB64(original EndCursor bytes).
+					// decodeCursorFull receives StdB64(original cursor) after REST decoding.
 					raw := resp.Batch.EndCursor
 					stdEncoded := base64.StdEncoding.EncodeToString(raw)
 					urlSafe := strings.NewReplacer("+", "-", "/", "_").Replace(stdEncoded)
@@ -1122,10 +1179,78 @@ func TestRunQuery(t *testing.T) {
 			if tc.limit > 0 {
 				q.Limit = wrapperspb.Int32(tc.limit)
 			}
+			if tc.wantInvalid {
+				q.Kind = []*datastorepb.KindExpression{{Name: kind}}
+				_, err := s.grpc.RunQuery(context.Background(), &datastorepb.RunQueryRequest{ProjectId: testProject, QueryType: &datastorepb.RunQueryRequest_Query{Query: q}})
+				if status.Code(err) != codes.InvalidArgument {
+					t.Errorf("%s: error=%v, want InvalidArgument", tc.name, err)
+				}
+				return
+			}
 			resp := qKind(t, s, kind, q)
 			if got := len(resp.Batch.EntityResults); got != tc.wantN {
-				t.Errorf("want %d results, got %d", tc.wantN, got)
+				t.Errorf("%s: want %d results, got %d", tc.name, tc.wantN, got)
 			}
 		})
+	}
+}
+
+func TestRunQueryBatchesUnlimitedResults(t *testing.T) {
+	s := newTestDsServer(t)
+	const rowCount = 1_001
+	rows := make([]seedRow, rowCount)
+	for i := range rows {
+		rows[i] = seedRow{name: fmt.Sprintf("entity-%04d", i)}
+	}
+	seedKind(t, s, "Batched", rows)
+	query := &datastorepb.Query{Kind: []*datastorepb.KindExpression{{Name: "Batched"}}}
+	request := &datastorepb.RunQueryRequest{ProjectId: testProject, QueryType: &datastorepb.RunQueryRequest_Query{Query: query}}
+
+	first, err := s.grpc.RunQuery(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(first.Batch.EntityResults); got != rowCount {
+		t.Fatalf("first batch results = %d, want %d", got, rowCount)
+	}
+	if first.Batch.MoreResults != datastorepb.QueryResultBatch_NO_MORE_RESULTS {
+		t.Fatalf("first batch continuation = %s, want NO_MORE_RESULTS", first.Batch.MoreResults)
+	}
+	if got := proto.Size(first); got > maxQueryResponseBytes {
+		t.Fatalf("serialized response = %d bytes, exceeds %d", got, maxQueryResponseBytes)
+	}
+}
+
+func TestRunQuerySignalsContinuationAtMaterializedByteBound(t *testing.T) {
+	s := newTestDsServer(t)
+	rows := make([]seedRow, 5)
+	for i := range rows {
+		rows[i] = seedRow{
+			name: fmt.Sprintf("entity-%02d", i),
+			props: map[string]*datastorepb.Value{
+				"payload": {
+					ValueType:          &datastorepb.Value_BlobValue{BlobValue: make([]byte, 900<<10)},
+					ExcludeFromIndexes: true,
+				},
+			},
+		}
+	}
+	seedKind(t, s, "LargeBatch", rows)
+	request := &datastorepb.RunQueryRequest{
+		ProjectId: testProject,
+		QueryType: &datastorepb.RunQueryRequest_Query{Query: &datastorepb.Query{
+			Kind: []*datastorepb.KindExpression{{Name: "LargeBatch"}},
+		}},
+	}
+
+	first, err := s.grpc.RunQuery(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Batch.MoreResults != datastorepb.QueryResultBatch_NOT_FINISHED {
+		t.Fatalf("continuation=%s, want NOT_FINISHED", first.Batch.MoreResults)
+	}
+	if got := proto.Size(first); got > maxQueryResponseBytes {
+		t.Fatalf("serialized response=%d, exceeds %d", got, maxQueryResponseBytes)
 	}
 }

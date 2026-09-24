@@ -10,7 +10,14 @@ import (
 	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
 )
 
-func (g *GRPCServer) Rollback(ctx context.Context, req *datastorepb.RollbackRequest) (*datastorepb.RollbackResponse, error) {
+func (g *GRPCServer) Rollback(ctx context.Context, req *datastorepb.RollbackRequest) (out *datastorepb.RollbackResponse, resultErr error) {
+	defer func() { resultErr = rpcError(resultErr) }()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := g.store.CheckAvailable(); err != nil {
+		return nil, err
+	}
 	txID := string(req.Transaction)
 	g.txMu.Lock()
 	_, ok := g.txns[txID]

@@ -1,13 +1,10 @@
 package datastore
 
 import (
-	"encoding/base64"
-	"encoding/json"
-	"fmt"
-	"strconv"
-	"strings"
+	"encoding/binary"
 
 	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
+	"github.com/magnus-rattlehead/hearthstore/internal/keycodec"
 
 	"github.com/magnus-rattlehead/hearthstore/internal/storage"
 )
@@ -26,34 +23,15 @@ func keyComponents(key *datastorepb.Key) (project, database, namespace, kind, pa
 		return
 	}
 
-	segments := make([]string, 0, len(parts)*2)
-	for _, p := range parts {
-		segments = append(segments, p.GetKind())
-		switch id := p.GetIdType().(type) {
-		case *datastorepb.Key_PathElement_Id:
-			segments = append(segments, strconv.FormatInt(id.Id, 10))
-		case *datastorepb.Key_PathElement_Name:
-			segments = append(segments, id.Name)
-		default:
-			segments = append(segments, "") // incomplete key
-		}
-	}
-
-	path = strings.Join(segments, "/")
-	last := parts[len(parts)-1]
-	kind = last.GetKind()
-
-	if len(segments) >= 4 {
-		parentPath = strings.Join(segments[:len(segments)-2], "/")
-	}
+	path = keycodec.Path(parts)
+	kind = parts[len(parts)-1].GetKind()
+	parentPath = keycodec.Path(parts[:len(parts)-1])
 	return
 }
 
 // keyString returns a canonical string for deduplication (used in Lookup).
 func keyString(key *datastorepb.Key) string {
-	_, _, namespace, _, _, path := keyComponents(key)
-	pid := key.GetPartitionId()
-	return fmt.Sprintf("%s|%s|%s|%s", pid.GetProjectId(), pid.GetDatabaseId(), namespace, path)
+	return string(keycodec.Ordered(key))
 }
 
 // isIncompleteKey reports whether the last path element has no ID or name.
@@ -85,7 +63,7 @@ func withID(key *datastorepb.Key, id int64) *datastorepb.Key {
 
 // encodeCursor encodes an entity path in the only supported cursor format.
 func encodeCursor(path string) []byte {
-	return encodeCursorFull(storage.CursorPayload{V: 2, P: path})
+	return encodeCursorFull(storage.CursorPayload{V: 4, P: path})
 }
 
 // decodeCursor decodes a cursor back to a path string.
@@ -97,88 +75,47 @@ func decodeCursor(cursor []byte) string {
 	return cp.P
 }
 
-// encodeCursorFull encodes a CursorPayload as JSON then URL-safe base64.
+// encodeCursorFull writes a binary cursor; the protobuf REST adapter supplies base64.
 func encodeCursorFull(cp storage.CursorPayload) []byte {
-	data, _ := json.Marshal(cp)
-	return []byte(base64.URLEncoding.EncodeToString(data))
+	out := []byte{'H', 'S', 4}
+	out = binary.AppendVarint(out, cp.G)
+	out = binary.AppendUvarint(out, uint64(cp.O))
+	for _, value := range [][]byte{[]byte(cp.P), []byte(cp.I), cp.K, cp.H, []byte(cp.D), cp.B} {
+		out = binary.AppendUvarint(out, uint64(len(value)))
+		out = append(out, value...)
+	}
+	return out
 }
 
-// decodeCursorFull decodes a cursor byte slice to a CursorPayload.
-// Only version 2 JSON cursors are accepted.
-func decodeCursorFull(b []byte) (storage.CursorPayload, bool) {
-	if len(b) == 0 {
-		return storage.CursorPayload{}, false
-	}
-	decoded, err := base64.URLEncoding.DecodeString(string(b))
-	if err != nil {
-		decoded, err = base64.StdEncoding.DecodeString(string(b))
-		if err != nil {
-			return storage.CursorPayload{}, false
-		}
-	}
+// decodeCursorFull accepts only bounded v4 binary cursors.
+func decodeCursorFull(data []byte) (storage.CursorPayload, bool) {
 	var cp storage.CursorPayload
-	if jsonErr := json.Unmarshal(decoded, &cp); jsonErr == nil && cp.V == 2 && cp.P != "" {
-		return cp, true
+	if len(data) < 3 || len(data) > 64<<10 || string(data[:3]) != "HS\x04" {
+		return cp, false
 	}
-	// The REST/JSON transport double-encodes cursors: pjsonMarshal serialises the
-	// EndCursor []byte field as StdB64, so clients receive StdB64(URLSafeB64(JSON)).
-	// After one decode above we hold URLSafeB64(JSON); one more URL-safe decode reaches
-	// the JSON payload. This depth is always exactly 2 - cursors are regenerated fresh
-	// from entity data each page, so layers never accumulate across pages.
-	if decoded2, err2 := base64.URLEncoding.DecodeString(string(decoded)); err2 == nil {
-		if jsonErr := json.Unmarshal(decoded2, &cp); jsonErr == nil && cp.V == 2 && cp.P != "" {
-			return cp, true
+	data = data[3:]
+	generation, n := binary.Varint(data)
+	if n <= 0 {
+		return cp, false
+	}
+	data = data[n:]
+	offset, n := binary.Uvarint(data)
+	if n <= 0 || offset > uint64(^uint(0)>>1) {
+		return cp, false
+	}
+	data = data[n:]
+	var fields [6][]byte
+	for i := range fields {
+		length, n := binary.Uvarint(data)
+		if n <= 0 || length > uint64(len(data)-n) {
+			return cp, false
 		}
+		fields[i] = data[n : n+int(length)]
+		data = data[n+int(length):]
 	}
-	return storage.CursorPayload{}, false
-}
-
-// buildCursor constructs the per-entity cursor for keyset pagination.
-// When sorts is non-empty it encodes a CursorPayload with sort field values;
-// otherwise it emits a path-only v2 cursor.
-func buildCursor(path string, sorts []storage.DsSortSpec, row *storage.DsEntityRow) []byte {
-	if len(sorts) == 0 {
-		return encodeCursor(path)
+	if len(data) != 0 || len(fields[0]) == 0 {
+		return cp, false
 	}
-	kvs := make([]storage.CursorSortKV, 0, len(sorts))
-	for _, sp := range sorts {
-		if sp.Col == "__path__" {
-			// __key__ sort: path is the sort value, no field index involved.
-			kvs = append(kvs, storage.CursorSortKV{Col: "__path__", V: path})
-			continue
-		}
-		v := getProp(row.Entity, sp.FieldPath)
-		kv := storage.CursorSortKV{Col: sp.Col}
-		if v == nil {
-			kv.Null = true
-		} else if _, isNull := v.ValueType.(*datastorepb.Value_NullValue); isNull {
-			kv.Null = true
-		} else {
-			kv.V = serializeSortValue(v)
-		}
-		kvs = append(kvs, kv)
-	}
-	return encodeCursorFull(storage.CursorPayload{V: 2, P: path, S: kvs})
-}
-
-// serializeSortValue converts a Datastore property value to a string
-// for storage in a CursorSortKV entry.
-func serializeSortValue(v *datastorepb.Value) string {
-	if v == nil {
-		return ""
-	}
-	_, sqlVal, ok := dsValueColumn(v)
-	if !ok {
-		return ""
-	}
-	switch sv := sqlVal.(type) {
-	case string:
-		return sv
-	case int64:
-		return strconv.FormatInt(sv, 10)
-	case float64:
-		return strconv.FormatFloat(sv, 'f', -1, 64)
-	default:
-		return ""
-	}
+	cp = storage.CursorPayload{V: 4, P: string(fields[0]), I: string(fields[1]), K: fields[2], H: fields[3], D: string(fields[4]), B: fields[5], O: int(offset), G: generation}
+	return cp, true
 }

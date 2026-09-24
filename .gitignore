@@ -3,5 +3,7 @@ hearthstore
 cmd/server/server
 *.test
 *.un~
+.reminders/
+.codegraph
 
 .DS_Store

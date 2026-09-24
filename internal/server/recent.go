@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const operationHistoryLimit = 10_000
+
 // OperationEntry is one dashboard-visible logical operation.
 type OperationEntry struct {
 	ID         int64          `json:"id"`
@@ -26,10 +28,11 @@ type OperationEntry struct {
 
 // OperationLog keeps every operation for the current server process.
 type OperationLog struct {
-	mu        sync.Mutex
+	mu        sync.RWMutex
 	sessionID string
 	nextID    int64
 	entries   []OperationEntry
+	start     int
 }
 
 func NewOperationLog(sessionID string) *OperationLog {
@@ -56,14 +59,21 @@ func (l *OperationLog) Add(e OperationEntry) OperationEntry {
 	}
 	e.Time = e.T.Format("15:04:05.000")
 	e.SessionID = l.sessionID
+	stored := e
 	if e.Details != nil {
-		e.Details = cloneDetails(e.Details)
-		e.detailText = detailsSearchText(e.Details)
+		stored.Details = cloneDetails(e.Details)
+		stored.detailText = detailsSearchText(stored.Details)
 	}
 	l.mu.Lock()
 	l.nextID++
 	e.ID = l.nextID
-	l.entries = append(l.entries, e)
+	stored.ID = e.ID
+	if len(l.entries) < operationHistoryLimit {
+		l.entries = append(l.entries, stored)
+	} else {
+		l.entries[l.start] = stored
+		l.start = (l.start + 1) % operationHistoryLimit
+	}
 	l.mu.Unlock()
 	return e
 }
@@ -73,24 +83,25 @@ func (l *OperationLog) Recent(n int) []OperationEntry {
 	if l == nil || n <= 0 {
 		return nil
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	start := len(l.entries) - n
 	if start < 0 {
 		start = 0
 	}
-	return cloneEntries(l.entries[start:])
+	out := make([]OperationEntry, len(l.entries)-start)
+	for i := range out {
+		out[i] = l.entryAtLocked(start + i)
+	}
+	return out
 }
 
 type OperationQuery struct {
 	Method       string
-	Source       string
 	StatusClass  int
 	ErrorOnly    bool
 	Text         string
 	Path         string
-	Collection   string
-	Detail       string
 	From         time.Time
 	To           time.Time
 	MinLatencyMs int64
@@ -124,73 +135,62 @@ func (l *OperationLog) Query(q OperationQuery) OperationQueryResult {
 	}
 
 	method := strings.ToLower(q.Method)
-	source := strings.ToLower(q.Source)
 	text := strings.ToLower(q.Text)
 	path := strings.ToLower(q.Path)
-	collection := strings.ToLower(q.Collection)
-	detail := strings.ToLower(q.Detail)
 
-	l.mu.Lock()
-	all := cloneEntries(l.entries)
-	sessionID := l.sessionID
-	l.mu.Unlock()
-
-	filtered := make([]OperationEntry, 0, len(all))
-	for _, e := range all {
+	matches := func(e OperationEntry) bool {
 		if method != "" && !strings.Contains(strings.ToLower(e.Method), method) {
-			continue
-		}
-		if source != "" && !strings.Contains(strings.ToLower(e.Source), source) {
-			continue
+			return false
 		}
 		if q.StatusClass > 0 && e.Status/100 != q.StatusClass/100 {
-			continue
+			return false
 		}
 		if q.ErrorOnly && e.Err == "" && e.Status < 400 {
-			continue
+			return false
 		}
 		if !q.From.IsZero() && e.T.Before(q.From) {
-			continue
+			return false
 		}
 		if !q.To.IsZero() && e.T.After(q.To) {
-			continue
+			return false
 		}
 		if q.MinLatencyMs > 0 && e.LatencyMs < q.MinLatencyMs {
-			continue
+			return false
 		}
 		if path != "" && !strings.Contains(strings.ToLower(e.Path), path) {
-			continue
-		}
-		if collection != "" && !strings.Contains(strings.ToLower(detailsValue(e.Details, "collection")), collection) {
-			continue
-		}
-		if detail != "" && !strings.Contains(strings.ToLower(e.detailText), detail) {
-			continue
+			return false
 		}
 		if text != "" && !operationContains(e, text) {
+			return false
+		}
+		return true
+	}
+
+	l.mu.RLock()
+	total := len(l.entries)
+	filtered := make([]OperationEntry, 0, min(q.Limit, total))
+	matched := 0
+	for i := 0; i < total; i++ {
+		logicalIndex := i
+		if q.OrderDesc {
+			logicalIndex = total - 1 - i
+		}
+		e := l.entryAtLocked(logicalIndex)
+		if !matches(e) {
+			continue
+		}
+		matched++
+		if matched <= q.Offset || len(filtered) >= q.Limit {
 			continue
 		}
 		filtered = append(filtered, e)
 	}
-
-	if q.OrderDesc {
-		for i, j := 0, len(filtered)-1; i < j; i, j = i+1, j-1 {
-			filtered[i], filtered[j] = filtered[j], filtered[i]
-		}
-	}
-	matched := len(filtered)
-	if q.Offset > len(filtered) {
-		filtered = nil
-	} else {
-		filtered = filtered[q.Offset:]
-	}
-	if len(filtered) > q.Limit {
-		filtered = filtered[:q.Limit]
-	}
+	sessionID := l.sessionID
+	l.mu.RUnlock()
 
 	return OperationQueryResult{
 		SessionID: sessionID,
-		Total:     len(all),
+		Total:     total,
 		Matched:   matched,
 		Limit:     q.Limit,
 		Offset:    q.Offset,
@@ -199,20 +199,19 @@ func (l *OperationLog) Query(q OperationQuery) OperationQueryResult {
 	}
 }
 
+func (l *OperationLog) entryAtLocked(logicalIndex int) OperationEntry {
+	physicalIndex := l.start + logicalIndex
+	if physicalIndex >= len(l.entries) {
+		physicalIndex -= len(l.entries)
+	}
+	return l.entries[physicalIndex]
+}
+
 func queryOrder(q OperationQuery) string {
 	if q.OrderDesc {
 		return "desc"
 	}
 	return "asc"
-}
-
-func cloneEntries(in []OperationEntry) []OperationEntry {
-	out := make([]OperationEntry, len(in))
-	for i, e := range in {
-		e.Details = cloneDetails(e.Details)
-		out[i] = e
-	}
-	return out
 }
 
 func cloneDetails(in map[string]any) map[string]any {
@@ -229,30 +228,6 @@ func cloneDetails(in map[string]any) map[string]any {
 func operationContains(e OperationEntry, needle string) bool {
 	hay := strings.ToLower(e.Method + " " + e.Source + " " + e.Path + " " + e.Err + " " + e.detailText)
 	return strings.Contains(hay, needle)
-}
-
-func detailsValue(details map[string]any, key string) string {
-	if details == nil {
-		return ""
-	}
-	v, ok := details[key]
-	if !ok {
-		return ""
-	}
-	switch x := v.(type) {
-	case string:
-		return x
-	case []string:
-		return strings.Join(x, " ")
-	case []any:
-		parts := make([]string, 0, len(x))
-		for _, item := range x {
-			parts = append(parts, detailsAnyString(item))
-		}
-		return strings.Join(parts, " ")
-	default:
-		return detailsAnyString(v)
-	}
 }
 
 func detailsSearchText(details map[string]any) string {

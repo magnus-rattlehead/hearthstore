@@ -2,6 +2,7 @@ package datastore
 
 import (
 	"bytes"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,7 +19,7 @@ import (
 	"github.com/magnus-rattlehead/hearthstore/internal/storage"
 )
 
-// newTestDsServer creates a Server backed by an in-memory (temp dir) SQLite store.
+// newTestDsServer creates a Server backed by a temporary Badger store.
 func newTestDsServer(t *testing.T) *Server {
 	t.Helper()
 	dir := t.TempDir()
@@ -170,25 +171,18 @@ func projectURL(method string) string {
 // mustPost asserts status 200 and unmarshals the response.
 func mustPost(t *testing.T, s *Server, method string, req proto.Message, resp proto.Message) {
 	t.Helper()
-	var body []byte
-	if req != nil {
-		var err error
-		body, err = pjsonMarshal.Marshal(req)
+	response := doPost(t, s, projectURL(method), req, resp)
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if response.StatusCode != http.StatusOK {
+		body, err := io.ReadAll(response.Body)
 		if err != nil {
-			t.Fatalf("mustPost marshal: %v", err)
+			t.Fatalf("POST %s: reading error response: %v", method, err)
 		}
-	}
-	hr := httptest.NewRequest(http.MethodPost, projectURL(method), bytes.NewReader(body))
-	hr.Header.Set("Content-Type", "application/json")
-	rw := httptest.NewRecorder()
-	s.Handler().ServeHTTP(rw, hr)
-	if rw.Code != 200 {
-		t.Fatalf("POST %s: status %d, body: %s", method, rw.Code, rw.Body.Bytes())
-	}
-	if resp != nil {
-		if err := pjsonUnmarshal.Unmarshal(rw.Body.Bytes(), resp); err != nil {
-			t.Fatalf("mustPost unmarshal: %v\nbody: %s", err, rw.Body.Bytes())
-		}
+		t.Fatalf("POST %s: status %d, body: %s", method, response.StatusCode, body)
 	}
 }
 

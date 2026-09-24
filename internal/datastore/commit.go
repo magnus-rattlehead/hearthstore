@@ -2,21 +2,37 @@ package datastore
 
 import (
 	"context"
-	"database/sql"
+	"math"
 	"net/http"
-	"strings"
 	"time"
 
+	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
+	"github.com/magnus-rattlehead/hearthstore/internal/propertypath"
 	"github.com/magnus-rattlehead/hearthstore/internal/storage"
 )
 
-func (g *GRPCServer) Commit(ctx context.Context, req *datastorepb.CommitRequest) (*datastorepb.CommitResponse, error) {
+func (g *GRPCServer) Commit(ctx context.Context, req *datastorepb.CommitRequest) (out *datastorepb.CommitResponse, resultErr error) {
+	defer func() { resultErr = rpcError(resultErr) }()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := g.store.CheckAvailable(); err != nil {
+		return nil, err
+	}
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "commit request is required")
+	}
+	if proto.Size(req) > maxTransactionSize {
+		return nil, status.Error(codes.ResourceExhausted, "commit exceeds the 10 MiB Datastore API limit")
+	}
+	if err := validateCommitLimits(req); err != nil {
+		return nil, err
+	}
 	if req.ProjectId == "" {
 		return nil, status.Error(codes.InvalidArgument, "project_id is required")
 	}
@@ -32,11 +48,18 @@ func (g *GRPCServer) Commit(ctx context.Context, req *datastorepb.CommitRequest)
 		var ok bool
 		entry, ok = g.txns[txID]
 		if ok {
+			now := time.Now()
+			if now.Sub(entry.created) >= transactionMaxAge || now.Sub(entry.lastUsed) >= transactionIdle {
+				ok = false
+			}
 			delete(g.txns, txID)
 		}
 		g.txMu.Unlock()
 		if !ok {
-			return nil, status.Error(codes.NotFound, "transaction not found: "+txID)
+			return nil, status.Error(codes.InvalidArgument, "the referenced transaction has expired or is no longer valid")
+		}
+		if entry.project != req.ProjectId || entry.database != database {
+			return nil, status.Error(codes.InvalidArgument, "transaction belongs to another project or database")
 		}
 		if entry.readOnly && len(req.Mutations) > 0 {
 			return nil, status.Error(codes.FailedPrecondition, "read-only transaction cannot contain writes")
@@ -45,52 +68,31 @@ func (g *GRPCServer) Commit(ctx context.Context, req *datastorepb.CommitRequest)
 
 	commitTime := timestamppb.Now()
 
-	// Transactional commits use RunInTxCtx (isolated, OCC conflict check inside).
-	// Non-transactional commits (BulkWriter) use RunBatchedTx so concurrent RPCs
-	// are coalesced into one SQLite transaction.
+	// Explicit transactions keep their OCC read set; independent writes retry conflicts.
+	atomic := len(req.GetTransaction()) > 0 || req.GetSingleUseTransaction() != nil || req.Mode == datastorepb.CommitRequest_TRANSACTIONAL
 	runTx := g.store.RunBatchedTx
-	if len(req.GetTransaction()) > 0 {
+	if atomic {
 		runTx = g.store.RunInTxCtx
 	}
 
-	// Fast path: all mutations are simple upserts (complete key, baseVersion=0,
-	// no property mask, no transforms). Pre-compute outside the transaction since
-	// collectSimpleUpserts is pure computation.
+	// Classify simple upserts before opening the transaction.
 	bulkRows, isBulk := g.collectSimpleUpserts(req.ProjectId, database, req.Mutations)
 
 	var results []*datastorepb.MutationResult
 
-	// Non-transactional bulk upserts: split into small jobs so batchCommitLoop can
-	// preempt between chunks for transactional commits queued in priorityCh.
-	// A single 500-entity job can otherwise hold the write lock for several seconds.
-	if isBulk && len(req.GetTransaction()) == 0 {
-		const chunkSize = 10
+	// Independent bulk upserts adapt to Badger's transaction limit.
+	if isBulk && !atomic {
+		bulkResults, err := g.store.DsUpsertMany(ctx, req.ProjectId, database, bulkRows, commitTime)
+		if err != nil {
+			return nil, err
+		}
 		results = make([]*datastorepb.MutationResult, 0, len(bulkRows))
-		for start := 0; start < len(bulkRows); start += chunkSize {
-			end := start + chunkSize
-			if end > len(bulkRows) {
-				end = len(bulkRows)
-			}
-			chunk := bulkRows[start:end]
-			var chunkResults []*datastorepb.MutationResult
-			if err := runTx(ctx, func(tx *sql.Tx) error {
-				acc := storage.NewCommitAccumulator()
-				versions, err := g.store.DsUpsertManyTx(tx, req.ProjectId, database, chunk, commitTime, acc)
-				if err != nil {
-					return err
-				}
-				chunkResults = make([]*datastorepb.MutationResult, 0, len(chunk))
-				for _, r := range chunk {
-					chunkResults = append(chunkResults, &datastorepb.MutationResult{
-						Version:    versions[r.Path],
-						UpdateTime: commitTime,
-					})
-				}
-				return acc.Flush(tx)
-			}); err != nil {
-				return nil, err
-			}
-			results = append(results, chunkResults...)
+		for _, result := range bulkResults {
+			results = append(results, &datastorepb.MutationResult{
+				Key:        result.Key,
+				Version:    result.Version,
+				UpdateTime: result.UpdateTime,
+			})
 		}
 		return &datastorepb.CommitResponse{
 			MutationResults: results,
@@ -98,26 +100,31 @@ func (g *GRPCServer) Commit(ctx context.Context, req *datastorepb.CommitRequest)
 		}, nil
 	}
 
-	if err := runTx(ctx, func(tx *sql.Tx) error {
-		if err := checkOCCConflicts(tx, entry.reads); err != nil {
-			g.store.IncrOCCConflict()
+	if err := runTx(ctx, func(tx *storage.Txn) error {
+		if err := g.checkOCCConflicts(tx, entry.reads); err != nil {
 			return err
+		}
+		for scope := range entry.queries {
+			if err := g.store.CheckQueryScopeTx(tx, scope, entry.readTime.AsTime()); err != nil {
+				return err
+			}
 		}
 		acc := storage.NewCommitAccumulator()
 		results = make([]*datastorepb.MutationResult, 0, len(req.Mutations))
 
 		if isBulk {
-			versions, err := g.store.DsUpsertManyTx(tx, req.ProjectId, database, bulkRows, commitTime, acc)
+			bulkResults, err := g.store.DsUpsertManyTx(tx, req.ProjectId, database, bulkRows, commitTime, acc)
 			if err != nil {
 				return err
 			}
-			for _, r := range bulkRows {
+			for _, result := range bulkResults {
 				results = append(results, &datastorepb.MutationResult{
-					Version:    versions[r.Path],
-					UpdateTime: commitTime,
+					Key:        result.Key,
+					Version:    result.Version,
+					UpdateTime: result.UpdateTime,
 				})
 			}
-			return acc.Flush(tx)
+			return nil
 		}
 
 		for _, m := range req.Mutations {
@@ -127,7 +134,7 @@ func (g *GRPCServer) Commit(ctx context.Context, req *datastorepb.CommitRequest)
 			}
 			results = append(results, mr)
 		}
-		return acc.Flush(tx)
+		return nil
 	}); err != nil {
 		return nil, err
 	}
@@ -157,9 +164,7 @@ func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request, project st
 	writeProtoJSON(w, resp)
 }
 
-// collectSimpleUpserts checks whether every mutation is a plain upsert (complete key,
-// baseVersion=0, no property mask, no transforms). If so, it returns the batch rows
-// and true so the caller can use a single multi-row INSERT instead of N round-trips.
+// collectSimpleUpserts returns rows eligible for the batched Badger write path.
 func (g *GRPCServer) collectSimpleUpserts(project, database string, mutations []*datastorepb.Mutation) ([]storage.UpsertManyRow, bool) {
 	if len(mutations) == 0 {
 		return nil, false
@@ -173,11 +178,12 @@ func (g *GRPCServer) collectSimpleUpserts(project, database string, mutations []
 		if m.GetBaseVersion() != 0 || m.GetPropertyMask() != nil || len(m.PropertyTransforms) != 0 {
 			return nil, false
 		}
-		e := op.Upsert
-		if isIncompleteKey(e.Key) {
+		e := &datastorepb.Entity{Key: scopedKey(op.Upsert.Key, project, database), Properties: op.Upsert.Properties}
+		allocateID := isIncompleteKey(e.Key)
+		proj, db, ns, kind, parentPath, path := keyComponents(e.Key)
+		if len(e.Key.GetPath()) == 0 || kind == "" {
 			return nil, false
 		}
-		proj, db, ns, kind, parentPath, path := keyComponents(e.Key)
 		if proj == "" {
 			proj = project
 		}
@@ -193,104 +199,22 @@ func (g *GRPCServer) collectSimpleUpserts(project, database string, mutations []
 			Kind:       kind,
 			ParentPath: parentPath,
 			Entity:     e,
+			AllocateID: allocateID,
 		})
 	}
 	return rows, true
 }
 
-// applyMutationTx executes a single Mutation within the given transaction and returns its MutationResult.
-func (g *GRPCServer) applyMutationTx(tx *sql.Tx, project, database string, m *datastorepb.Mutation, commitTime *timestamppb.Timestamp, acc *storage.CommitAccumulator) (*datastorepb.MutationResult, error) {
-	var (
-		resultKey        *datastorepb.Key
-		version          int64
-		updateTime       *timestamppb.Timestamp
-		conflictDetected bool
-		entity           *datastorepb.Entity
-	)
-
+// applyMutationTx applies one mutation within tx.
+func (g *GRPCServer) applyMutationTx(tx *storage.Txn, project, database string, m *datastorepb.Mutation, commitTime *timestamppb.Timestamp, acc *storage.CommitAccumulator) (*datastorepb.MutationResult, error) {
+	var incoming *datastorepb.Entity
 	switch op := m.Operation.(type) {
-
 	case *datastorepb.Mutation_Insert:
-		e := op.Insert
-		proj, db, ns, kind, parentPath, _ := keyComponents(e.Key)
-		if proj == "" {
-			proj = project
-		}
-		if db == "" {
-			db = database
-		}
-		wasIncomplete := isIncompleteKey(e.Key)
-		if wasIncomplete {
-			allocID, err := g.store.DsAllocateIdsTx(tx, proj, db, ns, kind, 1)
-			if err != nil {
-				return nil, err
-			}
-			e = proto.Clone(e).(*datastorepb.Entity)
-			e.Key = withID(e.Key, allocID)
-		}
-		_, _, _, _, parentPath, path := keyComponents(e.Key)
-		var ct *timestamppb.Timestamp
-		var err error
-		entity, version, ct, updateTime, err = g.store.DsInsertTx(tx, proj, db, ns, path, kind, parentPath, e, acc)
-		if err != nil {
-			return nil, err
-		}
-		_ = ct
-		if wasIncomplete {
-			resultKey = entity.Key
-		}
-
+		incoming = op.Insert
 	case *datastorepb.Mutation_Update:
-		e := op.Update
-		proj, db, ns, _, _, path := keyComponents(e.Key)
-		if proj == "" {
-			proj = project
-		}
-		if db == "" {
-			db = database
-		}
-		e = applyPropertyMask(e, m.GetPropertyMask(), func() (*datastorepb.Entity, error) {
-			existing, _, err := g.store.DsGet(proj, db, ns, path)
-			return existing, err
-		})
-		var err error
-		entity, version, _, updateTime, conflictDetected, err = g.store.DsUpdateTx(tx, proj, db, ns, path, e, m.GetBaseVersion(), acc)
-		if err != nil {
-			return nil, err
-		}
-
+		incoming = op.Update
 	case *datastorepb.Mutation_Upsert:
-		e := op.Upsert
-		proj, db, ns, kind, parentPath, _ := keyComponents(e.Key)
-		if proj == "" {
-			proj = project
-		}
-		if db == "" {
-			db = database
-		}
-		wasIncomplete := isIncompleteKey(e.Key)
-		if wasIncomplete {
-			allocID, err := g.store.DsAllocateIdsTx(tx, proj, db, ns, kind, 1)
-			if err != nil {
-				return nil, err
-			}
-			e = proto.Clone(e).(*datastorepb.Entity)
-			e.Key = withID(e.Key, allocID)
-		}
-		_, _, _, _, parentPath, path := keyComponents(e.Key)
-		e = applyPropertyMask(e, m.GetPropertyMask(), func() (*datastorepb.Entity, error) {
-			existing, _, err := g.store.DsGet(proj, db, ns, path)
-			return existing, err
-		})
-		var err error
-		entity, version, _, updateTime, conflictDetected, err = g.store.DsUpsertTx(tx, proj, db, ns, path, kind, parentPath, e, m.GetBaseVersion(), acc)
-		if err != nil {
-			return nil, err
-		}
-		if wasIncomplete && entity != nil {
-			resultKey = entity.Key
-		}
-
+		incoming = op.Upsert
 	case *datastorepb.Mutation_Delete:
 		proj, db, ns, _, _, path := keyComponents(op.Delete)
 		if proj == "" {
@@ -302,60 +226,80 @@ func (g *GRPCServer) applyMutationTx(tx *sql.Tx, project, database string, m *da
 		if err := g.store.DsDeleteTx(tx, proj, db, ns, path, acc); err != nil {
 			return nil, err
 		}
-		updateTime = commitTime
-		return &datastorepb.MutationResult{UpdateTime: updateTime}, nil
-
+		return &datastorepb.MutationResult{UpdateTime: commitTime}, nil
 	default:
 		return nil, status.Error(codes.InvalidArgument, "unknown mutation operation")
 	}
-
-	if conflictDetected {
-		return &datastorepb.MutationResult{
-			Version:          version,
-			UpdateTime:       updateTime,
-			ConflictDetected: true,
-		}, nil
+	if incoming == nil || incoming.Key == nil {
+		return nil, status.Error(codes.InvalidArgument, "entity key is required")
 	}
-
-	var transformResults []*datastorepb.Value
-	if len(m.PropertyTransforms) > 0 && entity != nil {
-		var err error
-		entity, transformResults, err = applyPropertyTransforms(entity, m.PropertyTransforms, commitTime)
-		if err != nil {
-			return nil, err
-		}
-		if err := g.resaveEntityTx(tx, project, database, entity, acc); err != nil {
-			return nil, err
-		}
-	}
-
-	return &datastorepb.MutationResult{
-		Key:              resultKey,
-		Version:          version,
-		UpdateTime:       updateTime,
-		TransformResults: transformResults,
-	}, nil
-}
-
-// resaveEntityTx writes the transformed entity back to storage within the given transaction.
-func (g *GRPCServer) resaveEntityTx(tx *sql.Tx, project, database string, entity *datastorepb.Entity, acc *storage.CommitAccumulator) error {
-	proj, db, ns, kind, parentPath, path := keyComponents(entity.Key)
+	e := proto.Clone(incoming).(*datastorepb.Entity)
+	e.Key = scopedKey(e.Key, project, database)
+	proj, db, ns, kind, _, _ := keyComponents(e.Key)
 	if proj == "" {
 		proj = project
 	}
 	if db == "" {
 		db = database
 	}
-	_, _, _, _, _, err := g.store.DsUpdateTx(tx, proj, db, ns, path, entity, 0, acc)
-	_ = kind
-	_ = parentPath
-	return err
+	wasIncomplete := isIncompleteKey(e.Key)
+	if wasIncomplete {
+		if _, update := m.Operation.(*datastorepb.Mutation_Update); update {
+			return nil, status.Error(codes.InvalidArgument, "update requires a complete key")
+		}
+		key, err := g.allocateUnusedKeyTx(tx, proj, db, ns, kind, e.Key)
+		if err != nil {
+			return nil, err
+		}
+		e.Key = key
+	}
+	_, _, _, _, parent, path := keyComponents(e.Key)
+	var err error
+	e, err = applyPropertyMask(e, m.PropertyMask, func() (*datastorepb.Entity, error) {
+		existing, _, err := g.store.DsGetTx(tx, proj, db, ns, path)
+		return existing, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	var transforms []*datastorepb.Value
+	if len(m.PropertyTransforms) > 0 {
+		e, transforms, err = applyPropertyTransforms(e, m.PropertyTransforms, commitTime)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := validateEntityLimits(e); err != nil {
+		return nil, err
+	}
+	write := storage.EntityWrite{
+		Project: proj, Database: db, Namespace: ns, Path: path,
+		Kind: kind, ParentPath: parent, Entity: e, BaseVersion: m.GetBaseVersion(),
+	}
+	var written storage.WriteResult
+	switch m.Operation.(type) {
+	case *datastorepb.Mutation_Insert:
+		written, err = g.store.DsInsertTx(tx, write, acc)
+	case *datastorepb.Mutation_Update:
+		written, err = g.store.DsUpdateTx(tx, write, acc)
+	case *datastorepb.Mutation_Upsert:
+		written, err = g.store.DsUpsertTx(tx, write, acc)
+	}
+	if err != nil {
+		return nil, err
+	}
+	result := &datastorepb.MutationResult{Version: written.Version, UpdateTime: written.UpdateTime, ConflictDetected: written.Conflict}
+	if !written.Conflict {
+		result.TransformResults = transforms
+		if wasIncomplete {
+			result.Key = e.Key
+		}
+	}
+	return result, nil
 }
 
-// applyPropertyTransforms applies server-side transforms to an entity in memory.
-// Returns the modified entity and a per-transform result value slice.
-// Scalar transforms (setToServerValue, increment, max, min) return the new value.
-// Array transforms (append, remove) return null (per Datastore spec).
+// applyPropertyTransforms returns the transformed entity and protocol result values.
+// Scalar transforms return their new value; array transforms return null.
 func applyPropertyTransforms(entity *datastorepb.Entity, transforms []*datastorepb.PropertyTransform, commitTime *timestamppb.Timestamp) (*datastorepb.Entity, []*datastorepb.Value, error) {
 	if entity.Properties == nil {
 		entity.Properties = make(map[string]*datastorepb.Value)
@@ -371,7 +315,7 @@ func applyPropertyTransforms(entity *datastorepb.Entity, transforms []*datastore
 		case *datastorepb.PropertyTransform_SetToServerValue:
 			if tt.SetToServerValue == datastorepb.PropertyTransform_REQUEST_TIME {
 				v := &datastorepb.Value{
-					ValueType: &datastorepb.Value_TimestampValue{TimestampValue: commitTime},
+					ValueType: &datastorepb.Value_TimestampValue{TimestampValue: &timestamppb.Timestamp{Seconds: commitTime.Seconds, Nanos: commitTime.Nanos / 1_000_000 * 1_000_000}},
 				}
 				setNestedProp(entity, prop, v)
 				results = append(results, v)
@@ -380,27 +324,17 @@ func applyPropertyTransforms(entity *datastorepb.Entity, transforms []*datastore
 			}
 
 		case *datastorepb.PropertyTransform_Increment:
-			v := dsNumericOp(current, tt.Increment, func(a, b float64) float64 { return a + b })
+			v := dsNumericOp(current, tt.Increment, "increment")
 			setNestedProp(entity, prop, v)
 			results = append(results, v)
 
 		case *datastorepb.PropertyTransform_Maximum:
-			v := dsNumericOp(current, tt.Maximum, func(a, b float64) float64 {
-				if a >= b {
-					return a
-				}
-				return b
-			})
+			v := dsNumericOp(current, tt.Maximum, "maximum")
 			setNestedProp(entity, prop, v)
 			results = append(results, v)
 
 		case *datastorepb.PropertyTransform_Minimum:
-			v := dsNumericOp(current, tt.Minimum, func(a, b float64) float64 {
-				if a <= b {
-					return a
-				}
-				return b
-			})
+			v := dsNumericOp(current, tt.Minimum, "minimum")
 			setNestedProp(entity, prop, v)
 			results = append(results, v)
 
@@ -421,71 +355,41 @@ func applyPropertyTransforms(entity *datastorepb.Entity, transforms []*datastore
 	return entity, results, nil
 }
 
-// getNestedProp retrieves a property value by dot-separated path.
-// E.g. "nested.p1" fetches entity.Properties["nested"].EntityValue.Properties["p1"].
 func getNestedProp(entity *datastorepb.Entity, path string) *datastorepb.Value {
-	dot := strings.IndexByte(path, '.')
-	if dot < 0 {
-		if entity.Properties == nil {
-			return nil
+	return propertypath.Get(entity, path)
+}
+
+func setNestedProp(entity *datastorepb.Entity, path string, value *datastorepb.Value) {
+	propertypath.Set(entity, path, value)
+}
+
+func dsNumericOp(current, operand *datastorepb.Value, operation string) *datastorepb.Value {
+	if !isDsNumeric(current) {
+		return proto.Clone(operand).(*datastorepb.Value)
+	}
+	if operation != "increment" {
+		if math.IsNaN(dsNumericFloat(current)) || math.IsNaN(dsNumericFloat(operand)) {
+			return &datastorepb.Value{ValueType: &datastorepb.Value_DoubleValue{DoubleValue: math.NaN()}}
 		}
-		return entity.Properties[path]
+		comparison := compareTransformValues(current, operand)
+		if operation == "maximum" && comparison >= 0 || operation == "minimum" && comparison <= 0 {
+			return current
+		}
+		return proto.Clone(operand).(*datastorepb.Value)
 	}
-	head, tail := path[:dot], path[dot+1:]
-	if entity.Properties == nil {
-		return nil
+	a, aInt := current.GetValueType().(*datastorepb.Value_IntegerValue)
+	b, bInt := operand.GetValueType().(*datastorepb.Value_IntegerValue)
+	if aInt && bInt {
+		result := a.IntegerValue + b.IntegerValue
+		if b.IntegerValue > 0 && a.IntegerValue > math.MaxInt64-b.IntegerValue {
+			result = math.MaxInt64
+		}
+		if b.IntegerValue < 0 && a.IntegerValue < math.MinInt64-b.IntegerValue {
+			result = math.MinInt64
+		}
+		return &datastorepb.Value{ValueType: &datastorepb.Value_IntegerValue{IntegerValue: result}}
 	}
-	parent := entity.Properties[head]
-	if parent == nil {
-		return nil
-	}
-	ev := parent.GetEntityValue()
-	if ev == nil {
-		return nil
-	}
-	return getNestedProp(ev, tail)
-}
-
-// setNestedProp sets a property value by dot-separated path, creating intermediate
-// EntityValue wrappers as needed.
-func setNestedProp(entity *datastorepb.Entity, path string, v *datastorepb.Value) {
-	if entity.Properties == nil {
-		entity.Properties = make(map[string]*datastorepb.Value)
-	}
-	dot := strings.IndexByte(path, '.')
-	if dot < 0 {
-		entity.Properties[path] = v
-		return
-	}
-	head, tail := path[:dot], path[dot+1:]
-	parent := entity.Properties[head]
-	var ev *datastorepb.Entity
-	if parent != nil {
-		ev = parent.GetEntityValue()
-	}
-	if ev == nil {
-		ev = &datastorepb.Entity{}
-	}
-	setNestedProp(ev, tail, v)
-	entity.Properties[head] = &datastorepb.Value{
-		ValueType: &datastorepb.Value_EntityValue{EntityValue: ev},
-	}
-}
-
-func dsNumericOp(current, operand *datastorepb.Value, op func(a, b float64) float64) *datastorepb.Value {
-	var a float64
-	if current != nil {
-		a = dsNumericFloat(current)
-	}
-	b := dsNumericFloat(operand)
-	result := op(a, b)
-
-	_, aIsInt := current.GetValueType().(*datastorepb.Value_IntegerValue)
-	_, bIsInt := operand.GetValueType().(*datastorepb.Value_IntegerValue)
-	if (current == nil || aIsInt) && bIsInt {
-		return &datastorepb.Value{ValueType: &datastorepb.Value_IntegerValue{IntegerValue: int64(result)}}
-	}
-	return &datastorepb.Value{ValueType: &datastorepb.Value_DoubleValue{DoubleValue: result}}
+	return &datastorepb.Value{ValueType: &datastorepb.Value_DoubleValue{DoubleValue: dsNumericFloat(current) + dsNumericFloat(operand)}}
 }
 
 func appendMissing(current *datastorepb.Value, toAdd *datastorepb.ArrayValue) *datastorepb.Value {
@@ -497,8 +401,8 @@ func appendMissing(current *datastorepb.Value, toAdd *datastorepb.ArrayValue) *d
 	copy(out, existing)
 	for _, add := range toAdd.GetValues() {
 		found := false
-		for _, e := range existing {
-			if compareValues(e, add) == 0 {
+		for _, e := range out {
+			if compareTransformValues(e, add) == 0 {
 				found = true
 				break
 			}
@@ -518,7 +422,7 @@ func removeFromArray(current *datastorepb.Value, toRemove *datastorepb.ArrayValu
 	for _, e := range current.GetArrayValue().GetValues() {
 		keep := true
 		for _, rem := range toRemove.GetValues() {
-			if compareValues(e, rem) == 0 {
+			if compareTransformValues(e, rem) == 0 {
 				keep = false
 				break
 			}
@@ -530,49 +434,33 @@ func removeFromArray(current *datastorepb.Value, toRemove *datastorepb.ArrayValu
 	return &datastorepb.Value{ValueType: &datastorepb.Value_ArrayValue{ArrayValue: &datastorepb.ArrayValue{Values: out}}}
 }
 
-// applyPropertyMask applies a PropertyMask to a partial entity for Update/Upsert mutations.
-// If mask is nil or has no paths, the entity is returned unchanged (full-replace semantics).
-// Otherwise, the existing entity is fetched via fetchExisting, and for each path in the mask:
-//   - if the path is present in incoming, copy its value onto existing
-//   - if the path is absent in incoming, delete it from existing
-//
-// The returned entity is always a clone; the originals are not modified.
-func applyPropertyMask(incoming *datastorepb.Entity, mask *datastorepb.PropertyMask, fetchExisting func() (*datastorepb.Entity, error)) *datastorepb.Entity {
-	if mask == nil || len(mask.GetPaths()) == 0 {
-		return incoming
+// applyPropertyMask applies only explicitly masked fields; an empty mask preserves existing properties.
+func applyPropertyMask(incoming *datastorepb.Entity, mask *datastorepb.PropertyMask, fetchExisting func() (*datastorepb.Entity, error)) (*datastorepb.Entity, error) {
+	if mask == nil {
+		return incoming, nil
 	}
 	existing, err := fetchExisting()
-	if err != nil {
-		// Entity does not exist yet - write only the masked fields from incoming.
-		merged := proto.Clone(incoming).(*datastorepb.Entity)
-		if merged.Properties == nil {
-			merged.Properties = make(map[string]*datastorepb.Value)
-		}
-		for k := range merged.Properties {
-			masked := false
-			for _, p := range mask.GetPaths() {
-				if p == k {
-					masked = true
-					break
-				}
-			}
-			if !masked {
-				delete(merged.Properties, k)
-			}
-		}
-		return merged
+	if err != nil && status.Code(err) != codes.NotFound {
+		return nil, err
 	}
-	merged := proto.Clone(existing).(*datastorepb.Entity)
-	if merged.Properties == nil {
-		merged.Properties = make(map[string]*datastorepb.Value)
+	merged := &datastorepb.Entity{Key: incoming.Key}
+	if existing != nil {
+		merged = proto.Clone(existing).(*datastorepb.Entity)
+		merged.Key = incoming.Key
 	}
-	for _, p := range mask.GetPaths() {
-		if v, ok := incoming.GetProperties()[p]; ok {
-			merged.Properties[p] = v
-		} else {
-			delete(merged.Properties, p)
+	for _, path := range mask.Paths {
+		parts, err := parseMaskPath(path)
+		if err != nil {
+			return nil, err
 		}
+		if len(parts) == 1 && parts[0] == "__key__" {
+			continue
+		}
+		value := maskedValue(incoming, parts)
+		if value != nil {
+			value = proto.Clone(value).(*datastorepb.Value)
+		}
+		setMaskedValue(merged, incoming, parts, value)
 	}
-	merged.Key = incoming.Key
-	return merged
+	return merged, nil
 }
