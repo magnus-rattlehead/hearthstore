@@ -1,6 +1,7 @@
 package datastore
 
 import (
+	"context"
 	"testing"
 
 	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
@@ -16,33 +17,38 @@ func incompleteKey(kind string) *datastorepb.Key {
 	}
 }
 
-func TestAllocateIds_Unique(t *testing.T) {
+func testInsertIncompleteKeySkipsExistingAllocatedID(t *testing.T) {
+	probe := newTestDsServer(t)
+	var allocated datastorepb.AllocateIdsResponse
+	mustPost(t, probe, "allocateIds", &datastorepb.AllocateIdsRequest{
+		ProjectId: testProject,
+		Keys:      []*datastorepb.Key{incompleteKey("PlanBalanceChange")},
+	}, &allocated)
+	occupiedID := allocated.Keys[0].Path[0].GetId()
+
 	s := newTestDsServer(t)
-
-	var r1, r2 datastorepb.AllocateIdsResponse
-	mustPost(t, s, "allocateIds", &datastorepb.AllocateIdsRequest{
+	upsertEntity(t, s, dsEntity(dsKeyID("PlanBalanceChange", occupiedID), nil))
+	resp, err := s.grpc.Commit(context.Background(), &datastorepb.CommitRequest{
 		ProjectId: testProject,
-		Keys:      []*datastorepb.Key{incompleteKey("Widget")},
-	}, &r1)
-	mustPost(t, s, "allocateIds", &datastorepb.AllocateIdsRequest{
-		ProjectId: testProject,
-		Keys:      []*datastorepb.Key{incompleteKey("Widget")},
-	}, &r2)
-
-	id1 := r1.Keys[0].Path[0].GetId()
-	id2 := r2.Keys[0].Path[0].GetId()
-	if id1 == id2 {
-		t.Errorf("expected distinct IDs, both got %d", id1)
+		Mutations: []*datastorepb.Mutation{{
+			Operation: &datastorepb.Mutation_Insert{
+				Insert: dsEntity(incompleteKey("PlanBalanceChange"), nil),
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if id1 == 0 || id2 == 0 {
-		t.Errorf("IDs should be non-zero, got %d %d", id1, id2)
+	if got := resp.MutationResults[0].GetKey().GetPath()[0].GetId(); got == occupiedID || got == 0 {
+		t.Fatalf("allocated ID = %d, occupied ID = %d", got, occupiedID)
 	}
 }
 
-func TestAllocateIds_Monotonic(t *testing.T) {
+func testAllocateIDsScatteredAndReserved(t *testing.T) {
 	s := newTestDsServer(t)
 
 	ids := make([]int64, 5)
+	seen := make(map[int64]bool)
 	for i := range ids {
 		var resp datastorepb.AllocateIdsResponse
 		mustPost(t, s, "allocateIds", &datastorepb.AllocateIdsRequest{
@@ -50,16 +56,33 @@ func TestAllocateIds_Monotonic(t *testing.T) {
 			Keys:      []*datastorepb.Key{incompleteKey("Widget")},
 		}, &resp)
 		ids[i] = resp.Keys[0].Path[0].GetId()
+		if ids[i] == 0 || seen[ids[i]] {
+			t.Fatalf("allocated zero or duplicate ID: %v", ids[:i+1])
+		}
+		seen[ids[i]] = true
 	}
 	for i := 1; i < len(ids); i++ {
-		if ids[i] <= ids[i-1] {
-			t.Errorf("IDs not monotonically increasing: %v", ids)
-			break
+		if ids[i] == ids[i-1]+1 {
+			t.Fatalf("IDs are sequential rather than scattered: %v", ids)
 		}
+	}
+
+	reserved := newTestDsServer(t)
+	mustPost(t, reserved, "reserveIds", &datastorepb.ReserveIdsRequest{
+		ProjectId: testProject,
+		Keys:      []*datastorepb.Key{dsKeyID("Widget", ids[0])},
+	}, &datastorepb.ReserveIdsResponse{})
+	var resp datastorepb.AllocateIdsResponse
+	mustPost(t, reserved, "allocateIds", &datastorepb.AllocateIdsRequest{
+		ProjectId: testProject,
+		Keys:      []*datastorepb.Key{incompleteKey("Widget")},
+	}, &resp)
+	if got := resp.Keys[0].Path[0].GetId(); got == ids[0] {
+		t.Fatalf("reserved ID %d was allocated", got)
 	}
 }
 
-func TestAllocateIds_PerKind(t *testing.T) {
+func testAllocateIDsPerKind(t *testing.T) {
 	s := newTestDsServer(t)
 
 	var wa, ga datastorepb.AllocateIdsResponse
@@ -74,13 +97,12 @@ func TestAllocateIds_PerKind(t *testing.T) {
 
 	wid := wa.Keys[0].Path[0].GetId()
 	gid := ga.Keys[0].Path[0].GetId()
-	// Both should start at 1 (independent sequences per kind).
-	if wid != 1 || gid != 1 {
-		t.Errorf("each kind should start at 1: Widget=%d Gadget=%d", wid, gid)
+	if wid == 0 || gid == 0 || wid != gid {
+		t.Errorf("each kind should have an independent allocator: Widget=%d Gadget=%d", wid, gid)
 	}
 }
 
-func TestAllocateIds_CompleteKeyPassthrough(t *testing.T) {
+func testAllocateIDsCompleteKeyPassthrough(t *testing.T) {
 	s := newTestDsServer(t)
 
 	key := dsKeyID("Widget", 42)
@@ -93,4 +115,11 @@ func TestAllocateIds_CompleteKeyPassthrough(t *testing.T) {
 	if len(resp.Keys) != 1 || resp.Keys[0].Path[0].GetId() != 42 {
 		t.Errorf("complete key should pass through unchanged, got %v", resp.Keys)
 	}
+}
+
+func TestAllocateIDs(t *testing.T) {
+	t.Run("occupied_id", testInsertIncompleteKeySkipsExistingAllocatedID)
+	t.Run("unique_scattered_reserved", testAllocateIDsScatteredAndReserved)
+	t.Run("per_kind", testAllocateIDsPerKind)
+	t.Run("complete_key", testAllocateIDsCompleteKeyPassthrough)
 }

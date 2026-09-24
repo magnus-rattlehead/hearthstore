@@ -1,49 +1,52 @@
 package datastore
 
 import (
+	"bytes"
+	"context"
 	"net/http"
+	"strconv"
 	"testing"
 
 	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
+func testLookupRejectsMoreThanDatastoreLimit(t *testing.T, s *Server) {
+	keys := make([]*datastorepb.Key, maxLookupKeys+1)
+	_, err := s.grpc.Lookup(context.Background(), &datastorepb.LookupRequest{ProjectId: testProject, Keys: keys})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("lookup error = %v, want InvalidArgument", err)
+	}
+}
+
+func testLookupDefersBeforeSerializedResponseExceedsGRPCDefault(t *testing.T, s *Server) {
+	keys := make([]*datastorepb.Key, 5)
+	for i := range keys {
+		keys[i] = dsKey("LargeLookup", strconv.Itoa(i+1))
+		value := dsBlob(bytes.Repeat([]byte("x"), 900<<10))
+		value.ExcludeFromIndexes = true
+		upsertEntity(t, s, dsEntity(keys[i], map[string]*datastorepb.Value{"payload": value}))
+	}
+	response, err := s.grpc.Lookup(context.Background(), &datastorepb.LookupRequest{ProjectId: testProject, Keys: keys})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Deferred) == 0 {
+		t.Fatal("lookup did not defer any oversized response entries")
+	}
+	if got := proto.Size(response); got > maxLookupResponseBytes {
+		t.Fatalf("serialized response = %d bytes, exceeds %d", got, maxLookupResponseBytes)
+	}
+}
+
 func TestLookup(t *testing.T) {
+	s := newTestDsServer(t)
 	tests := []struct {
 		name string
 		run  func(t *testing.T, s *Server)
 	}{
-		{
-			name: "found",
-			run: func(t *testing.T, s *Server) {
-				key := dsKey("K_found", "w1")
-				upsertEntity(t, s, dsEntity(key, map[string]*datastorepb.Value{"color": dsStr("red")}))
-				var resp datastorepb.LookupResponse
-				mustPost(t, s, "lookup", &datastorepb.LookupRequest{ProjectId: testProject, Keys: []*datastorepb.Key{key}}, &resp)
-				if len(resp.Found) != 1 {
-					t.Fatalf("want 1 found, got %d", len(resp.Found))
-				}
-				if len(resp.Missing) != 0 {
-					t.Fatalf("want 0 missing, got %d", len(resp.Missing))
-				}
-				if got := resp.Found[0].Entity.Properties["color"].GetStringValue(); got != "red" {
-					t.Errorf("color = %q, want %q", got, "red")
-				}
-			},
-		},
-		{
-			name: "missing",
-			run: func(t *testing.T, s *Server) {
-				key := dsKey("K_missing", "nonexistent")
-				var resp datastorepb.LookupResponse
-				mustPost(t, s, "lookup", &datastorepb.LookupRequest{ProjectId: testProject, Keys: []*datastorepb.Key{key}}, &resp)
-				if len(resp.Missing) != 1 {
-					t.Fatalf("want 1 missing, got %d", len(resp.Missing))
-				}
-				if len(resp.Found) != 0 {
-					t.Fatalf("want 0 found, got %d", len(resp.Found))
-				}
-			},
-		},
 		{
 			name: "mixed",
 			run: func(t *testing.T, s *Server) {
@@ -54,6 +57,9 @@ func TestLookup(t *testing.T) {
 				mustPost(t, s, "lookup", &datastorepb.LookupRequest{ProjectId: testProject, Keys: []*datastorepb.Key{k1, k2}}, &resp)
 				if len(resp.Found) != 1 || len(resp.Missing) != 1 {
 					t.Errorf("want found=1 missing=1, got found=%d missing=%d", len(resp.Found), len(resp.Missing))
+				}
+				if got := resp.Found[0].Entity.Properties["x"].GetIntegerValue(); got != 1 {
+					t.Errorf("found x = %d, want 1", got)
 				}
 			},
 		},
@@ -114,8 +120,13 @@ func TestLookup(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			s := newTestDsServer(t)
 			tc.run(t, s)
 		})
 	}
+	t.Run("key_limit", func(t *testing.T) {
+		testLookupRejectsMoreThanDatastoreLimit(t, s)
+	})
+	t.Run("response_size", func(t *testing.T) {
+		testLookupDefersBeforeSerializedResponseExceedsGRPCDefault(t, s)
+	})
 }

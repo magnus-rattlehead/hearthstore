@@ -6,31 +6,7 @@ import (
 	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
 )
 
-func TestRollback_Success(t *testing.T) {
-	s := newTestDsServer(t)
-
-	var begin datastorepb.BeginTransactionResponse
-	mustPost(t, s, "beginTransaction", &datastorepb.BeginTransactionRequest{ProjectId: testProject}, &begin)
-
-	r := doPost(t, s, projectURL("rollback"), &datastorepb.RollbackRequest{
-		ProjectId:   testProject,
-		Transaction: begin.Transaction,
-	}, nil)
-	if r.StatusCode != 200 {
-		t.Errorf("rollback: status %d", r.StatusCode)
-	}
-
-	// Transaction should no longer exist.
-	s.grpc.txMu.Lock()
-	_, exists := s.grpc.txns[string(begin.Transaction)]
-	s.grpc.txMu.Unlock()
-	if exists {
-		t.Error("transaction still in map after rollback")
-	}
-}
-
-func TestRollback_UnknownTx(t *testing.T) {
-	s := newTestDsServer(t)
+func testRollbackUnknownTx(t *testing.T, s *Server) {
 
 	r := doPost(t, s, projectURL("rollback"), &datastorepb.RollbackRequest{
 		ProjectId:   testProject,
@@ -41,8 +17,7 @@ func TestRollback_UnknownTx(t *testing.T) {
 	}
 }
 
-func TestRollback_DoubleRollback(t *testing.T) {
-	s := newTestDsServer(t)
+func testRollbackDoubleRollback(t *testing.T, s *Server) {
 
 	var begin datastorepb.BeginTransactionResponse
 	mustPost(t, s, "beginTransaction", &datastorepb.BeginTransactionRequest{ProjectId: testProject}, &begin)
@@ -55,8 +30,23 @@ func TestRollback_DoubleRollback(t *testing.T) {
 	if r1.StatusCode != 200 {
 		t.Fatalf("first rollback: %d", r1.StatusCode)
 	}
+	s.grpc.txMu.Lock()
+	_, exists := s.grpc.txns[string(begin.Transaction)]
+	s.grpc.txMu.Unlock()
+	if exists {
+		t.Error("transaction still in map after rollback")
+	}
 	r2 := doPost(t, s, projectURL("rollback"), rbReq, nil)
 	if r2.StatusCode != 404 {
 		t.Errorf("second rollback: want 404, got %d", r2.StatusCode)
 	}
+}
+
+func TestRollback(t *testing.T) {
+	t.Run("lifecycle", func(t *testing.T) {
+		testRollbackDoubleRollback(t, newTestDsServer(t))
+	})
+	t.Run("unknown_transaction", func(t *testing.T) {
+		testRollbackUnknownTx(t, newTestDsServer(t))
+	})
 }

@@ -2,17 +2,30 @@ package datastore
 
 import (
 	"bytes"
-	"cmp"
 	"slices"
-	"strings"
 
 	datastorepb "cloud.google.com/go/datastore/apiv1/datastorepb"
+	"github.com/magnus-rattlehead/hearthstore/internal/keycodec"
+	"github.com/magnus-rattlehead/hearthstore/internal/storage"
+	"github.com/magnus-rattlehead/hearthstore/internal/valuecodec"
 	"google.golang.org/protobuf/proto"
 )
 
 // compareValues returns -1, 0, or 1 (a < b, a == b, a > b).
-// Follows Datastore type ordering: null < bool < number < timestamp < string < blob < key < geo < array < entity.
 func compareValues(a, b *datastorepb.Value) int {
+	// Query predicates, tuple deduplication, indexes and external sorts must use
+	// the same Datastore representation (not transform numeric equivalence).
+	if a.GetArrayValue() != nil && b.GetArrayValue() != nil {
+		return slices.CompareFunc(a.GetArrayValue().Values, b.GetArrayValue().Values, compareValues)
+	}
+	left, _ := storage.OrderedQueryValue(a, false)
+	right, _ := storage.OrderedQueryValue(b, false)
+	return bytes.Compare(left, right)
+}
+
+// compareTransformValues retains mathematical int/double equivalence for
+// mutation transforms, whose contract differs from query index ordering.
+func compareTransformValues(a, b *datastorepb.Value) int {
 	if a == nil && b == nil {
 		return 0
 	}
@@ -25,14 +38,7 @@ func compareValues(a, b *datastorepb.Value) int {
 
 	// Numbers (int + double) share the same type rank.
 	if isDsNumeric(a) && isDsNumeric(b) {
-		af, bf := dsNumericFloat(a), dsNumericFloat(b)
-		if af < bf {
-			return -1
-		}
-		if af > bf {
-			return 1
-		}
-		return 0
+		return bytes.Compare(valuecodec.Number(a), valuecodec.Number(b))
 	}
 
 	ta, tb := dsValueTypeRank(a), dsValueTypeRank(b)
@@ -117,13 +123,13 @@ func compareValues(a, b *datastorepb.Value) int {
 		return compareKeys(av.KeyValue, b.GetKeyValue())
 	case *datastorepb.Value_ArrayValue:
 		ae, be := av.ArrayValue.GetValues(), b.GetArrayValue().GetValues()
-		return slices.CompareFunc(ae, be, compareValues)
+		return slices.CompareFunc(ae, be, compareTransformValues)
 	}
 	return 0
 }
 
 func isDsNumeric(v *datastorepb.Value) bool {
-	switch v.ValueType.(type) {
+	switch v.GetValueType().(type) {
 	case *datastorepb.Value_IntegerValue, *datastorepb.Value_DoubleValue:
 		return true
 	}
@@ -169,48 +175,5 @@ func dsValueTypeRank(v *datastorepb.Value) int {
 // compareKeys compares two Datastore keys. Within the same kind, integer IDs
 // sort before string IDs; integer IDs compare numerically, string IDs lexicographically.
 func compareKeys(a, b *datastorepb.Key) int {
-	if a == nil && b == nil {
-		return 0
-	}
-	if a == nil {
-		return -1
-	}
-	if b == nil {
-		return 1
-	}
-	ap, bp := a.GetPartitionId(), b.GetPartitionId()
-	if c := strings.Compare(ap.GetProjectId(), bp.GetProjectId()); c != 0 {
-		return c
-	}
-	if c := strings.Compare(ap.GetNamespaceId(), bp.GetNamespaceId()); c != 0 {
-		return c
-	}
-	apes, bpes := a.GetPath(), b.GetPath()
-	return slices.CompareFunc(apes, bpes, func(ae, be *datastorepb.Key_PathElement) int {
-		return cmp.Or(strings.Compare(ae.GetKind(), be.GetKind()), comparePathElementID(ae, be))
-	})
-}
-
-func comparePathElementID(a, b *datastorepb.Key_PathElement) int {
-	ai, aIsInt := a.GetIdType().(*datastorepb.Key_PathElement_Id)
-	bi, bIsInt := b.GetIdType().(*datastorepb.Key_PathElement_Id)
-	an, aIsName := a.GetIdType().(*datastorepb.Key_PathElement_Name)
-	bn, bIsName := b.GetIdType().(*datastorepb.Key_PathElement_Name)
-	switch {
-	case aIsInt && bIsInt:
-		if ai.Id < bi.Id {
-			return -1
-		}
-		if ai.Id > bi.Id {
-			return 1
-		}
-		return 0
-	case aIsInt && bIsName:
-		return -1 // integer IDs sort before string IDs
-	case aIsName && bIsInt:
-		return 1
-	case aIsName && bIsName:
-		return strings.Compare(an.Name, bn.Name)
-	}
-	return 0
+	return bytes.Compare(keycodec.Ordered(a), keycodec.Ordered(b))
 }

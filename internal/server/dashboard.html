@@ -1,920 +1,708 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-
-<head>
-  <meta charset="UTF-8">
-  <title>hearthstore dashboard</title>
-  <style>
-    *,
-    *::before,
-    *::after {
-      box-sizing: border-box;
-    }
-
-    :root {
-      --bg: #0d0d0d;
-      --bg2: #161616;
-      --bg3: #1e1e1e;
-      --border: #2a2a2a;
-      --text: #c9c9c9;
-      --muted: #555;
-      --accent: #f90;
-      --blue: #4a9eff;
-      --green: #3dba6e;
-      --red: #e05555;
-      --yellow: #e0a020;
-      --purple: #a07be0;
-      --teal: #3db8b8;
-    }
-
-    [data-theme="light"] {
-      --bg: #f4f4f4;
-      --bg2: #ffffff;
-      --bg3: #eaeaea;
-      --border: #d0d0d0;
-      --text: #1a1a1a;
-      --muted: #888;
-      --accent: #c97000;
-      --blue: #1a6fd4;
-      --green: #1e8c4a;
-      --red: #c0392b;
-      --yellow: #b07800;
-      --purple: #6b3fbf;
-      --teal: #1a8c8c;
-    }
-
-    body {
-      font-family: monospace;
-      background: var(--bg);
-      color: var(--text);
-      margin: 0;
-      padding: 16px 20px;
-      font-size: 12px;
-    }
-
-    .header {
-      display: flex;
-      align-items: baseline;
-      gap: 16px;
-      margin-bottom: 20px;
-      padding-bottom: 12px;
-      border-bottom: 1px solid var(--border);
-    }
-
-    .header h1 {
-      margin: 0;
-      color: var(--accent);
-      font-weight: 600;
-      letter-spacing: .5px;
-    }
-
-    .meta {
-      color: var(--muted);
-    }
-
-    .stat-row {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-      gap: 10px;
-      margin-bottom: 14px;
-    }
-
-    .stat-card {
-      background: var(--bg2);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 12px 14px;
-    }
-
-    .stat-card .label {
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: .8px;
-      margin-bottom: 4px;
-    }
-
-    .stat-card .value {
-      font-weight: 700;
-      line-height: 1.1;
-      margin-bottom: 3px;
-    }
-
-    .stat-card .sub {
-      color: var(--muted);
-      margin-bottom: 8px;
-      min-height: 1em;
-    }
-
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-      gap: 10px;
-      margin-bottom: 14px;
-    }
-
-    .card {
-      background: var(--bg2);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 12px 14px;
-    }
-
-    .card h2 {
-      margin: 0 0 10px;
-      color: var(--accent);
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      font-weight: 600;
-    }
-
-    .kv {
-      border-collapse: collapse;
-      width: 100%;
-    }
-
-    .kv td {
-      padding: 3px 0;
-      vertical-align: middle;
-    }
-
-    .kv td:first-child {
-      color: var(--muted);
-      white-space: nowrap;
-      width: 55%;
-    }
-
-    .kv td:last-child {
-      color: var(--text);
-      text-align: right;
-      font-variant-numeric: tabular-nums;
-      word-break: break-word;
-      overflow-wrap: anywhere;
-      white-space: normal;
-    }
-
-    .kv tr:hover td {
-      color: #eee;
-    }
-
-    .bar-bg {
-      height: 3px;
-      background: var(--border);
-      border-radius: 2px;
-      margin-top: 4px;
-    }
-
-    .bar-fill {
-      height: 3px;
-      border-radius: 2px;
-      transition: width .3s;
-    }
-
-    .recent {
-      width: 100%;
-      border-collapse: collapse;
-    }
-
-    .recent th {
-      color: var(--muted);
-      text-align: left;
-      padding: 3px 8px 6px 0;
-      border-bottom: 1px solid var(--border);
-      font-weight: normal;
-      white-space: nowrap;
-    }
-
-    .recent td {
-      padding: 2px 8px 2px 0;
-      white-space: nowrap;
-      font-variant-numeric: tabular-nums;
-    }
-
-    .recent td.path {
-      max-width: 260px;
-      color: var(--muted);
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .recent tr.ok td {
-      color: var(--text);
-    }
-
-    .recent tr.warn td {
-      color: var(--yellow);
-    }
-
-    .recent tr.err td {
-      color: var(--red);
-    }
-
-    .recent tr:hover td {
-      background: var(--bg3);
-    }
-
-    .theme-btn {
-      background: none;
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      color: var(--muted);
-      cursor: pointer;
-      font: inherit;
-      padding: 2px 8px;
-      margin-left: auto;
-      transition: color .15s, border-color .15s;
-    }
-
-    .theme-btn:hover {
-      color: var(--text);
-      border-color: var(--muted);
-    }
-
-    .rpc-panel {
-      position: fixed;
-      top: 0;
-      right: 0;
-      bottom: 0;
-      width: 33vw;
-      min-width: 340px;
-      background: var(--bg2);
-      border-left: 1px solid var(--border);
-      padding: 16px;
-      transform: translateX(100%);
-      transition: transform .2s ease;
-      overflow-y: auto;
-      z-index: 100;
-    }
-
-    .rpc-panel.open {
-      transform: translateX(0);
-    }
-
-    .rpc-panel-close {
-      background: none;
-      border: none;
-      color: var(--muted);
-      cursor: pointer;
-      font: inherit;
-      float: right;
-      padding: 0;
-      line-height: 1;
-    }
-
-    .rpc-panel-close:hover {
-      color: var(--text);
-    }
-
-    .rpc-panel h3 {
-      margin: 0 0 14px;
-      color: var(--accent);
-      text-transform: uppercase;
-      letter-spacing: 1px;
-    }
-
-    .rpc-panel .err-block {
-      margin-top: 10px;
-      padding: 8px 10px;
-      background: var(--bg3);
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      color: var(--red);
-      word-break: break-all;
-      white-space: pre-wrap;
-    }
-
-    .recent tr[data-idx] {
-      cursor: pointer;
-    }
-
-    .recent tr.selected td {
-      background: var(--bg3);
-    }
-
-    .ops-toolbar {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-      gap: 8px;
-      margin-bottom: 10px;
-      align-items: end;
-    }
-
-    .ops-toolbar label {
-      display: grid;
-      gap: 3px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: .6px;
-      min-width: 0;
-    }
-
-    .ops-toolbar input,
-    .ops-toolbar select {
-      width: 100%;
-      min-width: 0;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      color: var(--text);
-      font: inherit;
-      padding: 4px 6px;
-    }
-
-    .ops-toolbar .ops-actions {
-      display: flex;
-      gap: 6px;
-      align-items: center;
-    }
-
-    .ops-btn {
-      background: var(--bg3);
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      color: var(--text);
-      cursor: pointer;
-      font: inherit;
-      padding: 4px 8px;
-    }
-
-    .ops-btn:hover {
-      border-color: var(--muted);
-    }
-
-    .ops-count {
-      color: var(--muted);
-      margin-bottom: 8px;
-    }
-
-    /* detail sections */
-    .rpc-section {
-      margin-top: 8px;
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      overflow: hidden;
-    }
-
-    .rpc-section>summary {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 5px 8px;
-      color: var(--accent);
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      cursor: pointer;
-      user-select: none;
-      list-style: none;
-      background: var(--bg3);
-    }
-
-    .rpc-section>summary::-webkit-details-marker {
-      display: none;
-    }
-
-    .rpc-section-title {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-    }
-
-    .rpc-section-title::before {
-      content: '▸';
-      color: var(--muted);
-    }
-
-    details[open].rpc-section>summary .rpc-section-title::before {
-      content: '▾';
-    }
-
-    .rpc-section-body {
-      padding: 6px 8px;
-    }
-
-    .rpc-copy {
-      background: none;
-      border: 1px solid var(--border);
-      border-radius: 3px;
-      color: var(--muted);
-      cursor: pointer;
-      font: inherit;
-      padding: 0 5px;
-      line-height: 1.4;
-    }
-
-    .rpc-copy:hover {
-      color: var(--text);
-      border-color: var(--muted);
-    }
-
-    .val-str {
-      color: var(--blue);
-    }
-
-    .val-num {
-      color: var(--green);
-    }
-
-    .val-bool {
-      color: var(--yellow);
-    }
-
-    .val-null {
-      color: var(--muted);
-      font-style: italic;
-    }
-
-    .val-arr {
-      color: var(--purple);
-    }
-  </style>
-</head>
-
-<body>
-
-  <div class="header">
-    <h1>hearthstore</h1>
-    <span id="uptime" style="color:var(--muted)"></span>
-    <span class="meta" id="ts" style="margin-left:auto"></span>
-    <button class="theme-btn" id="theme-toggle" onclick="toggleTheme()">light</button>
-  </div>
-
-  <div class="stat-row" id="stats"></div>
-
-
-  <div class="grid" id="detail"></div>
-
-  <div class="card" id="recent-card" style="margin-bottom:14px">
-    <h2>Operations <span style="color:var(--muted);font-weight:normal">(queryable session log)</span></h2>
-    <div class="ops-toolbar" id="ops-filters">
-      <label>method <input id="f-method" autocomplete="off"></label>
-      <label>source <input id="f-source" autocomplete="off"></label>
-      <label>status
-        <select id="f-status">
-          <option value="">all</option>
-          <option value="2">2xx</option>
-          <option value="3">3xx</option>
-          <option value="4">4xx</option>
-          <option value="5">5xx</option>
-        </select>
-      </label>
-      <label>error
-        <select id="f-error">
-          <option value="">all</option>
-          <option value="true">errors</option>
-        </select>
-      </label>
-      <label>search <input id="f-q" autocomplete="off"></label>
-      <label>path <input id="f-path" autocomplete="off"></label>
-      <label>collection <input id="f-collection" autocomplete="off"></label>
-      <label>detail <input id="f-detail" autocomplete="off"></label>
-      <label>min ms <input id="f-min-latency" type="number" min="0"></label>
-      <label>limit <input id="f-limit" type="number" min="1" max="1000" value="100"></label>
-      <div class="ops-actions">
-        <button class="ops-btn" id="ops-apply" type="button">apply</button>
-        <button class="ops-btn" id="ops-clear" type="button">clear</button>
-      </div>
-    </div>
-    <div class="ops-count" id="ops-count"></div>
-    <div id="recent-wrap"></div>
-  </div>
-
-  <div class="rpc-panel" id="rpc-panel">
-    <button class="rpc-panel-close" id="rpc-panel-close">×</button>
-    <h3>RPC Detail</h3>
-    <div id="rpc-panel-body"></div>
-  </div>
-
-  <script>
-    (function () {
-      const stored = localStorage.getItem('hs-theme');
-      const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-      const useDark = stored ? stored === 'dark' : prefersDark;
-      if (!useDark) {
-        document.documentElement.setAttribute('data-theme', 'light');
-        document.getElementById('theme-toggle').textContent = 'dark';
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>hearthstore dashboard</title>
+    <style>
+      .table-wrap {
+        overflow-x: auto;
       }
-    })();
-    function toggleTheme() {
-      const isLight = document.documentElement.getAttribute('data-theme') === 'light';
-      if (isLight) {
-        document.documentElement.removeAttribute('data-theme');
-        localStorage.setItem('hs-theme', 'dark');
-        document.getElementById('theme-toggle').textContent = 'light';
-      } else {
-        document.documentElement.setAttribute('data-theme', 'light');
-        localStorage.setItem('hs-theme', 'light');
-        document.getElementById('theme-toggle').textContent = 'dark';
+
+      .table-wrap table {
+        width: 100%;
       }
-    }
 
-    let operationEntries = [];
-    let selectedIdx = -1;
-    let _copySlots = {};
-
-    function esc(s) {
-      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-    }
-
-    // --- detail panel helpers ---
-
-    const DETAIL_KEY_ORDER = [
-      // request
-      'kind', 'kinds', 'namespace', 'database', 'keys', 'paths', 'mutations', 'inserts',
-      'updates', 'upserts', 'deletes', 'mode', 'aggregations', 'aggregation_count',
-      'filter', 'order_by', 'limit', 'offset', 'start_cursor', 'keys_only', 'projection',
-      'distinct_on', 'transforms', 'transform_ops', 'property_masks', 'property_mask',
-      'read_time_at', 'request_txn', 'new_transaction', 'txn_id_prefix', 'previous_transaction',
-      'analyze', 'gql', 'parent_paths', 'transaction', 'collection', 'parent', 'group',
-      'page_size', 'doc', 'docs', 'mask', 'sets', 'merges', 'xforms', 'writes', 'collections',
-      // response
-      'found', 'missing', 'deferred', 'results', 'skipped_results', 'more_results',
-      'end_cursor', 'conflicts', 'allocated_keys', 'allocated_paths', 'allocated',
-      'allocated_ids', 'txn_returned', 'read_time', 'commit_time', 'elapsed_ms',
-      'write_results', 'successes', 'failures', 'field_count', 'update_time', 'create_time',
-      'scanned', 'execution_duration_ms', 'name',
-    ];
-
-    const RESPONSE_KEYS = new Set([
-      'found', 'missing', 'deferred', 'results', 'skipped_results', 'more_results',
-      'end_cursor', 'conflicts', 'allocated_keys', 'allocated_paths', 'allocated',
-      'allocated_ids', 'txn_returned', 'read_time', 'commit_time', 'elapsed_ms',
-      'write_results', 'successes', 'failures', 'field_count', 'update_time', 'create_time',
-      'scanned', 'execution_duration_ms', 'name', 'docs',
-    ]);
-
-    function isResponseKey(k) {
-      return RESPONSE_KEYS.has(k) || k.startsWith('agg_');
-    }
-
-    function valSpan(v) {
-      if (v === null || v === undefined) {
-        return '<span class="val-null">null</span>';
+      .table-wrap th,
+      .table-wrap td {
+        padding: 0.5rem 1rem;
+        text-align: center;
       }
-      if (typeof v === 'boolean') {
-        return `<span class="val-bool">${v}</span>`;
+
+      .rpc-panel {
+        position: fixed;
+        inset: 0 0 0 auto;
+        z-index: 1;
+        width: min(32rem, 100%);
+        box-sizing: border-box;
+        overflow: auto;
+        padding: 1rem;
+        background: Canvas;
+        color: CanvasText;
+        border-left: 1px solid;
       }
-      if (typeof v === 'number') {
-        return `<span class="val-num">${v}</span>`;
-      }
-      if (Array.isArray(v)) {
-        const full = v.join(', ');
-        const display = v.length > 5
-          ? v.slice(0, 5).join(', ') + ' … +' + (v.length - 5) + ' more'
-          : full;
-        return `<span class="val-arr" title="${esc(full)}">${esc(display)}</span>`;
-      }
-      const s = String(v);
-      const display = s.length > 160 ? s.slice(0, 157) + '…' : s;
-      return `<span class="val-str" title="${esc(s)}">${esc(display)}</span>`;
-    }
+    </style>
+  </head>
 
-    function renderKV(entries) {
-      if (!entries.length) return '';
-      return '<table class="kv">' +
-        entries.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${valSpan(v)}</td></tr>`).join('') +
-        '</table>';
-    }
+  <body>
+    <main>
+      <section aria-labelledby="indexes-heading">
+        <details class="indexes-details">
+          <summary id="indexes-heading">
+            Datastore indexes (click to expand)
+            <span id="indexes-count">(0)</span>
+          </summary>
+          <div class="table-wrap">
+            <table class="indexes">
+              <thead>
+                <tr>
+                  <th aria-sort="none">
+                    <button
+                      class="sort-button"
+                      data-index-sort="project"
+                      type="button"
+                    >
+                      project
+                    </button>
+                  </th>
+                  <th aria-sort="none">
+                    <button
+                      class="sort-button"
+                      data-index-sort="kind"
+                      type="button"
+                    >
+                      kind
+                    </button>
+                  </th>
+                  <th aria-sort="none">
+                    <button
+                      class="sort-button"
+                      data-index-sort="properties"
+                      type="button"
+                    >
+                      properties
+                    </button>
+                  </th>
+                  <th aria-sort="none">
+                    <button
+                      class="sort-button"
+                      data-index-sort="source"
+                      type="button"
+                    >
+                      source
+                    </button>
+                  </th>
+                  <th aria-sort="none">
+                    <button
+                      class="sort-button"
+                      data-index-sort="state"
+                      type="button"
+                    >
+                      state
+                    </button>
+                  </th>
+                  <th aria-sort="none">
+                    <button
+                      class="sort-button"
+                      data-index-sort="progress"
+                      type="button"
+                    >
+                      progress
+                    </button>
+                  </th>
+                  <th aria-sort="none">
+                    <button
+                      class="sort-button"
+                      data-index-sort="error"
+                      type="button"
+                    >
+                      error
+                    </button>
+                  </th>
+                </tr>
+              </thead>
+              <tbody id="indexes-body">
+                <tr>
+                  <td colspan="7" class="muted">none</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </section>
 
-    function orderedEntries(obj, filter) {
-      const done = new Set();
-      const out = [];
-      for (const k of DETAIL_KEY_ORDER) {
-        if (k in obj && (!filter || filter(k))) {out.push([k, obj[k]]); done.add(k);}
-      }
-      Object.keys(obj).filter(k => !done.has(k) && (!filter || filter(k))).sort()
-        .forEach(k => out.push([k, obj[k]]));
-      return out;
-    }
+      <section aria-labelledby="operations-heading">
+        <h2 id="operations-heading">Operations</h2>
+        <form class="filter-form" id="ops-filters">
+          <label
+            >method
+            <select id="f-method">
+              <option value="">all</option>
+            </select>
+          </label>
+          <label
+            >status
+            <select id="f-status">
+              <option value="">all</option>
+              <option value="2">2xx</option>
+              <option value="3">3xx</option>
+              <option value="4">4xx</option>
+              <option value="5">5xx</option>
+            </select>
+          </label>
+          <label
+            >error
+            <select id="f-error">
+              <option value="">all</option>
+              <option value="true">errors</option>
+            </select>
+          </label>
+          <label>search <input id="f-q" autocomplete="off" /></label>
+          <label>path <input id="f-path" autocomplete="off" /></label>
+          <label
+            >min ms <input id="f-min-latency" type="number" min="0"
+          /></label>
+          <label
+            >limit
+            <select id="f-limit">
+              <option value="25">25</option>
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="250">250</option>
+              <option value="500">500</option>
+              <option value="1000">1000</option>
+            </select>
+          </label>
+          <div class="filter-actions">
+            <button id="ops-apply" type="submit">apply</button>
+            <button id="ops-clear" type="reset">clear</button>
+          </div>
+        </form>
+        <p class="operations-count" id="ops-count" aria-live="polite">
+          loading...
+        </p>
+        <div class="table-wrap">
+          <table class="recent">
+            <thead>
+              <tr>
+                <th>time</th>
+                <th>method</th>
+                <th>path</th>
+                <th class="number">latency</th>
+                <th class="number">status</th>
+              </tr>
+            </thead>
+            <tbody id="operations-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
 
-    function panelCopy(slot, ev) {
-      ev.stopPropagation();
-      const text = _copySlots[slot];
-      if (text && navigator.clipboard) navigator.clipboard.writeText(text).catch(() => { });
-    }
+    <aside
+      class="rpc-panel"
+      id="rpc-panel"
+      aria-labelledby="rpc-panel-title"
+      aria-hidden="true"
+      hidden
+    >
+      <button
+        class="rpc-panel-close"
+        id="rpc-panel-close"
+        aria-label="Close RPC detail"
+      >
+        x
+      </button>
+      <h3 id="rpc-panel-title">RPC detail</h3>
+      <div id="rpc-panel-body"></div>
+    </aside>
 
-    function makeSection(title, entries, slot) {
-      if (!entries.length) return '';
-      _copySlots[slot] = JSON.stringify(Object.fromEntries(entries), null, 2);
-      return `<details open class="rpc-section">
-        <summary><span class="rpc-section-title">${esc(title)}</span>
-          <button class="rpc-copy" onclick="panelCopy('${slot}',event)">[copy]</button></summary>
-        <div class="rpc-section-body">${renderKV(entries)}</div>
-      </details>`;
-    }
-
-    function makeSummarySection(e) {
-      const statusColor = e.status >= 500 ? 'var(--red)' : e.status >= 400 ? 'var(--yellow)' : 'var(--green)';
-      const rows = [
-        ['time', e.t],
-        ['method', e.method || '—'],
-        ['path', e.path || '—'],
-        ['latency', e.latency_ms + ' ms'],
-        ['status', e.status || '—'],
-      ];
-      const tableRows = rows.map(([k, v]) => {
-        if (k === 'status') {
-          return `<tr><td>${esc(k)}</td><td style="color:${statusColor}">${esc(String(v))}</td></tr>`;
-        }
-        if (k === 'path') {
-          return `<tr><td>${esc(k)}</td><td style="word-break:break-all;color:var(--muted)">${esc(String(v))}</td></tr>`;
-        }
-        return `<tr><td>${esc(k)}</td><td>${esc(String(v))}</td></tr>`;
-      }).join('');
-      const slotData = JSON.stringify(Object.fromEntries(rows), null, 2);
-      _copySlots['summary'] = slotData;
-      return `<details open class="rpc-section">
-        <summary><span class="rpc-section-title">Summary</span>
-          <button class="rpc-copy" onclick="panelCopy('summary',event)">[copy]</button></summary>
-        <div class="rpc-section-body"><table class="kv">${tableRows}</table></div>
-      </details>`;
-    }
-
-    // --- end helpers ---
-
-    function openPanel(idx) {
-      const e = operationEntries[idx];
-      if (!e) return;
-      selectedIdx = idx;
-      document.querySelectorAll('.recent tbody tr').forEach(tr => tr.classList.remove('selected'));
-      const tr = document.querySelector(`.recent tbody tr[data-idx="${idx}"]`);
-      if (tr) tr.classList.add('selected');
-
-      _copySlots = {};
-      const details = e.details || {};
-      const reqEntries = orderedEntries(details, k => !isResponseKey(k));
-      const respEntries = orderedEntries(details, k => isResponseKey(k));
-
-      const errSection = e.err
-        ? `<div class="rpc-section" style="margin-top:8px;border-color:var(--red)">
-            <div class="rpc-section-body" style="color:var(--red);word-break:break-all;white-space:pre-wrap">${esc(e.err)}</div>
-          </div>`
-        : '';
-
-      document.getElementById('rpc-panel-body').innerHTML =
-        makeSummarySection(e) +
-        makeSection('Request', reqEntries, 'req') +
-        makeSection('Response', respEntries, 'resp') +
-        errSection;
-
-      document.getElementById('rpc-panel').classList.add('open');
-    }
-
-    function closePanel() {
-      selectedIdx = -1;
-      document.getElementById('rpc-panel').classList.remove('open');
-      document.querySelectorAll('.recent tbody tr').forEach(tr => tr.classList.remove('selected'));
-    }
-
-    const MAX_HIST = 90;
-    const history = [];
-
-    function pushHist(d) {
-      const c = d.counters, rt = d.runtime, s = d.storage;
-      const p = history[history.length - 1];
-      history.push({
-        commits: p ? c.commit_total - p._ca : 0,
-        rpcs: p ? c.rpc_total - p._ra : 0,
-        listen: p ? c.listen_events - p._la : 0,
-        heap_mb: rt.heap_inuse_mb,
-        goroutines: rt.goroutines,
-        _ca: c.commit_total, _ra: c.rpc_total, _la: c.listen_events,
+    <script>
+      let operationEntries = [];
+      let selectedIdx = -1;
+      let selectedOperationID = null;
+      let copySlots = {};
+      let indexEntries = [];
+      let indexSortKey = null;
+      let indexSortDirection = "asc";
+      const operationMethods = new Set();
+      const indexCollator = new Intl.Collator(undefined, {
+        numeric: true,
+        sensitivity: "base",
       });
-      if (history.length > MAX_HIST) history.shift();
-    }
 
-    function fmt(n, d) {
-      d = d || 0;
-      if (n == null) return '—';
-      if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
-      if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
-      return Number(n).toFixed(d);
-    }
-    function fmtBytes(b) {
-      if (b >= 1 << 30) return (b / (1 << 30)).toFixed(2) + ' GB';
-      if (b >= 1 << 20) return (b / (1 << 20)).toFixed(1) + ' MB';
-      if (b >= 1 << 10) return (b / (1 << 10)).toFixed(0) + ' KB';
-      return b + ' B';
-    }
-    function fmtUptime(sec) {
-      const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
-      return [h, m, s].map(x => String(x).padStart(2, '0')).join(':');
-    }
+      function esc(value) {
+        return String(value)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
 
-    function sparkline(values, color) {
-      const W = 200, H = 36;
-      if (values.length < 2) return `<svg viewBox="0 0 ${W} ${H}" style="display:block;width:100%;height:${H}px"></svg>`;
-      const max = Math.max(...values, 1);
-      const pts = values.map((v, i) => {
-        const x = (i / (values.length - 1)) * W;
-        const y = H - (v / max) * (H - 3) - 1;
-        return `${x.toFixed(1)},${y.toFixed(1)}`;
-      }).join(' ');
-      const area = `M0,${H} L${pts} L${W},${H} Z`;
-      const line = `M${pts}`;
-      const gid = 'sp' + color.replace(/[^a-z0-9]/gi, '');
-      return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" style="display:block;width:100%;height:${H}px">
-    <defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="${color}" stop-opacity=".45"/>
-      <stop offset="100%" stop-color="${color}" stop-opacity=".03"/>
-    </linearGradient></defs>
-    <path d="${area}" fill="url(#${gid})"/>
-    <path d="${line}" fill="none" stroke="${color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
-  </svg>`;
-    }
+      function fmt(value, decimals = 0) {
+        if (value == null) return "-";
+        if (value >= 1e9) return (value / 1e9).toFixed(1) + "B";
+        if (value >= 1e6) return (value / 1e6).toFixed(1) + "M";
+        if (value >= 1e3) return (value / 1e3).toFixed(1) + "k";
+        return Number(value).toFixed(decimals);
+      }
 
-    function bar(val, cap, color) {
-      const pct = cap > 0 ? Math.min(100, (val / cap) * 100) : 0;
-      const c = pct > 80 ? 'var(--red)' : pct > 50 ? 'var(--yellow)' : (color || 'var(--green)');
-      return `<div class="bar-bg"><div class="bar-fill" style="width:${pct.toFixed(1)}%;background:${c}"></div></div>`;
-    }
+      function setText(id, value) {
+        document.getElementById(id).textContent = value;
+      }
 
-    function kv(pairs) {
-      return `<table class="kv">${pairs.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('')}</table>`;
-    }
+      function indexProperties(index) {
+        return (index.properties || [])
+          .map((property) => property.name + (property.desc ? " desc" : ""))
+          .join(", ");
+      }
 
-    function statCard(label, value, sub, sparkVals, color) {
-      const sp = sparkVals && sparkVals.length > 1 ? sparkline(sparkVals, color) : `<div style="height:36px"></div>`;
-      return `<div class="stat-card">
-    <div class="label">${label}</div>
-    <div class="value" style="color:${color}">${value}</div>
-    <div class="sub">${sub || ''}</div>
-    ${sp}
-  </div>`;
-    }
+      function indexValue(index, key) {
+        if (key === "properties") return indexProperties(index);
+        if (key === "progress") {
+          return index.total_entities > 0
+            ? index.processed_entities / index.total_entities
+            : null;
+        }
+        return index[key] || null;
+      }
 
-    function render(d) {
-      pushHist(d);
-      const c = d.counters, s = d.storage, rt = d.runtime, db = d.db;
+      function renderIndexes(indexes = indexEntries) {
+        indexEntries = indexes;
+        const sorted = indexes.map((index, position) => ({ index, position }));
+        if (indexSortKey) {
+          sorted.sort((left, right) => {
+            const leftValue = indexValue(left.index, indexSortKey);
+            const rightValue = indexValue(right.index, indexSortKey);
+            if (leftValue == null || rightValue == null) {
+              if (leftValue == null && rightValue == null)
+                return left.position - right.position;
+              return leftValue == null ? 1 : -1;
+            }
+            const comparison =
+              typeof leftValue === "number"
+                ? leftValue - rightValue
+                : indexCollator.compare(String(leftValue), String(rightValue));
+            return comparison === 0
+              ? left.position - right.position
+              : comparison * (indexSortDirection === "asc" ? 1 : -1);
+          });
+        }
 
-      const hC = history.map(h => h.commits);
-      const hR = history.map(h => h.rpcs);
-      const hL = history.map(h => h.listen);
-      const hH = history.map(h => h.heap_mb);
-      const hG = history.map(h => h.goroutines);
+        setText("indexes-count", `(${indexes.length})`);
+        document.getElementById("indexes-body").innerHTML = sorted.length
+          ? sorted
+              .map(({ index }) => {
+                const progress = index.total_entities
+                  ? `${fmt(index.processed_entities)} / ${fmt(index.total_entities)}`
+                  : "-";
+                return `<tr><td>${esc(index.project)}</td><td>${esc(index.kind)}</td><td>${esc(indexProperties(index))}</td><td>${esc(index.source)}</td><td>${esc(index.state)}</td><td>${progress}</td><td>${esc(index.error || "")}</td></tr>`;
+              })
+              .join("")
+          : '<tr><td colspan="7" class="muted">none</td></tr>';
 
-      const last = history[history.length - 1];
-      const cRate = last ? (last.commits / 2).toFixed(1) : '-';
-      const rRate = last ? (last.rpcs / 2).toFixed(1) : '-';
-      const lRate = last ? (last.listen / 2).toFixed(1) : '-';
+        document.querySelectorAll("[data-index-sort]").forEach((button) => {
+          const isActive = button.dataset.indexSort === indexSortKey;
+          button.parentElement.setAttribute(
+            "aria-sort",
+            isActive
+              ? indexSortDirection === "asc"
+                ? "ascending"
+                : "descending"
+              : "none",
+          );
+          button.textContent =
+            button.dataset.indexSort +
+            (isActive ? ` ${indexSortDirection}` : "");
+        });
+      }
 
-      document.getElementById('uptime').textContent = 'up ' + fmtUptime(d.uptime_sec);
-
-      document.getElementById('stats').innerHTML = [
-        statCard('commits/s', cRate, `total ${fmt(c.commit_total)}  err ${fmt(c.commit_errors)}`, hC, 'var(--green)'),
-        statCard('rpcs/s', rRate, `total ${fmt(c.rpc_total)}  err ${fmt(c.rpc_errors)}`, hR, 'var(--blue)'),
-        statCard('listen/s', lRate, `events ${fmt(c.listen_events)}  subs ${s.sub_entries}`, hL, 'var(--purple)'),
-        statCard('heap', rt.heap_inuse_mb.toFixed(1) + ' MB', `sys ${rt.sys_mb.toFixed(0)} MB  gc×${rt.num_gc}`, hH, 'var(--teal)'),
-        statCard('goroutines', rt.goroutines, `GOMAXPROCS ${rt.gomaxprocs}`, hG, 'var(--yellow)'),
-        statCard('occ conflicts', fmt(c.occ_conflicts), `batch preemptions ${fmt(c.batch_preempted)}`, null, c.occ_conflicts > 0 ? 'var(--red)' : 'var(--muted)'),
-      ].join('');
-
-      document.getElementById('detail').innerHTML = [
-        `<div class="card"><h2>Storage</h2>
-      ${kv([
-          ['batch_ch', `${s.batch_ch.len} / ${s.batch_ch.cap}`],
-          ['priority_ch', `${s.priority_ch.len} / ${s.priority_ch.cap}`],
-          ['subscribers', s.sub_entries],
-          ['scopes', s.by_scope],
-          ['coll groups', s.by_coll_g],
-          ['wdb open/use/idle', `${s.wdb.open}/${s.wdb.in_use}/${s.wdb.idle}`],
-          ['rdb open/use/idle', `${s.rdb.open}/${s.rdb.in_use}/${s.rdb.idle}`],
-          ['cpdb open/use/idle', `${s.cpdb.open}/${s.cpdb.in_use}/${s.cpdb.idle}`],
-          ['wdb waits', `${fmt(s.wdb.wait_count)} × ${fmt(s.wdb.wait_duration_ms, 1)} ms`],
-        ])}
-      ${bar(s.batch_ch.len, s.batch_ch.cap)}
-    </div>`,
-
-        `<div class="card"><h2>Database</h2>
-      ${kv([
-          ['documents', fmt(db.documents)],
-          ['doc_changes', fmt(db.document_changes)],
-          ['field_index', fmt(db.field_index)],
-          ['ds_documents', fmt(db.ds_documents)],
-          ['ds_doc_changes', fmt(db.ds_document_changes)],
-          ['ds_field_index', fmt(db.ds_field_index)],
-          ['ds_id_sequences', fmt(db.ds_id_sequences)],
-          ['db_size', fmtBytes(db.db_size_bytes)],
-          ['wal_size', fmtBytes(db.wal_size_bytes)],
-          ['freelist_pages', fmt(db.freelist_pages)],
-        ])}
-    </div>`,
-
-        `<div class="card"><h2>Runtime</h2>
-      ${kv([
-          ['goroutines', rt.goroutines],
-          ['rss', rt.rss_mb > 0 ? rt.rss_mb.toFixed(1) + ' MB' : '—'],
-          ['alloc', rt.alloc_mb.toFixed(1) + ' MB'],
-          ['heap_inuse', rt.heap_inuse_mb.toFixed(1) + ' MB'],
-          ['sys', rt.sys_mb.toFixed(1) + ' MB'],
-          ['heap_objects', fmt(rt.heap_objects)],
-          ['gc_cycles', rt.num_gc],
-          ['gc_pause_total', rt.pause_total_ms.toFixed(1) + ' ms'],
-          ['GOMAXPROCS', rt.gomaxprocs],
-        ])}
-    </div>`,
-      ].join('');
-
-    }
-
-    function filterVal(id) {
-      return document.getElementById(id).value.trim();
-    }
-
-    function operationParams() {
-      const params = new URLSearchParams();
-      const fields = [
-        ['f-method', 'method'],
-        ['f-source', 'source'],
-        ['f-status', 'status_class'],
-        ['f-error', 'error'],
-        ['f-q', 'q'],
-        ['f-path', 'path'],
-        ['f-collection', 'collection'],
-        ['f-detail', 'detail'],
-        ['f-min-latency', 'min_latency_ms'],
-        ['f-limit', 'limit'],
+      const DETAIL_KEY_ORDER = [
+        "kind",
+        "kinds",
+        "namespace",
+        "database",
+        "keys",
+        "paths",
+        "mutations",
+        "inserts",
+        "updates",
+        "upserts",
+        "deletes",
+        "mode",
+        "aggregations",
+        "aggregation_count",
+        "filter",
+        "order_by",
+        "limit",
+        "offset",
+        "start_cursor",
+        "keys_only",
+        "projection",
+        "distinct_on",
+        "transforms",
+        "transform_ops",
+        "property_masks",
+        "property_mask",
+        "read_time_at",
+        "request_txn",
+        "new_transaction",
+        "txn_id_prefix",
+        "previous_transaction",
+        "analyze",
+        "gql",
+        "parent_paths",
+        "transaction",
+        "collection",
+        "parent",
+        "group",
+        "page_size",
+        "doc",
+        "docs",
+        "mask",
+        "sets",
+        "merges",
+        "xforms",
+        "writes",
+        "collections",
+        "found",
+        "missing",
+        "deferred",
+        "results",
+        "skipped_results",
+        "more_results",
+        "end_cursor",
+        "conflicts",
+        "allocated_keys",
+        "allocated_paths",
+        "allocated",
+        "allocated_ids",
+        "txn_returned",
+        "read_time",
+        "commit_time",
+        "elapsed_ms",
+        "write_results",
+        "successes",
+        "failures",
+        "field_count",
+        "update_time",
+        "create_time",
+        "access_path",
+        "index_id",
+        "index_entries_scanned",
+        "scanned",
+        "execution_duration_ms",
+        "name",
       ];
-      for (const [id, key] of fields) {
-        const v = filterVal(id);
-        if (v) params.set(key, v);
+
+      const RESPONSE_KEYS = new Set([
+        "found",
+        "missing",
+        "deferred",
+        "results",
+        "skipped_results",
+        "more_results",
+        "end_cursor",
+        "conflicts",
+        "allocated_keys",
+        "allocated_paths",
+        "allocated",
+        "allocated_ids",
+        "txn_returned",
+        "read_time",
+        "commit_time",
+        "elapsed_ms",
+        "write_results",
+        "successes",
+        "failures",
+        "field_count",
+        "update_time",
+        "create_time",
+        "access_path",
+        "index_id",
+        "index_entries_scanned",
+        "scanned",
+        "execution_duration_ms",
+        "name",
+        "docs",
+      ]);
+
+      function isResponseKey(key) {
+        return RESPONSE_KEYS.has(key) || key.startsWith("agg_");
       }
-      params.set('order', 'desc');
-      return params;
-    }
 
-    function renderOperations(result) {
-      operationEntries = result.entries || [];
-      const rows = operationEntries.map((e, i) => {
-        const cls = e.err || e.status >= 500 ? 'err' : e.status >= 400 ? 'warn' : 'ok';
-        const path = e.path || '';
-        const shortPath = path.length > 60 ? '…' + path.slice(-59) : path;
-        return `<tr class="${cls}" data-idx="${i}">
-      <td style="color:var(--muted)">${esc(e.t)}</td>
-      <td style="color:var(--muted);width:92px">${esc(e.source || '')}</td>
-      <td style="color:var(--muted);width:120px">${esc(e.method || '')}</td>
-      <td class="path" title="${esc(path)}">${esc(shortPath)}</td>
-      <td style="text-align:right;width:60px">${e.latency_ms}ms</td>
-      <td style="text-align:right;width:48px">${e.status || ''}</td>
-    </tr>`;
-      }).join('');
-      document.getElementById('ops-count').textContent =
-        `${fmt(result.matched)} matched / ${fmt(result.total)} total  session ${result.session_id || '—'}`;
-      document.getElementById('recent-wrap').innerHTML =
-        `<table class="recent"><thead><tr>
-      <th>time</th><th>source</th><th>method</th><th>path</th>
-      <th style="text-align:right">lat</th><th style="text-align:right">status</th>
-    </tr></thead><tbody>${rows}</tbody></table>`;
-      if (selectedIdx >= 0) {
-        const sel = document.querySelector(`.recent tbody tr[data-idx="${selectedIdx}"]`);
-        if (sel) sel.classList.add('selected');
+      function valSpan(value) {
+        if (value == null) return '<span class="val-null">null</span>';
+        if (typeof value === "boolean")
+          return `<span class="val-bool">${value}</span>`;
+        if (typeof value === "number")
+          return `<span class="val-num">${value}</span>`;
+        if (Array.isArray(value)) {
+          const full = value.join(", ");
+          const omitted = value.at(-1);
+          const hasOmittedCount =
+            typeof omitted === "string" && /^\+\d+ more$/.test(omitted);
+          const display = hasOmittedCount
+            ? value.slice(0, -1).join(", ") + ", " + omitted
+            : value.length > 5
+              ? value.slice(0, 5).join(", ") +
+                " ... +" +
+                (value.length - 5) +
+                " more"
+              : full;
+          return `<span class="val-arr" title="${esc(full)}">${esc(display)}</span>`;
+        }
+        const stringValue = String(value);
+        const display =
+          stringValue.length > 160
+            ? stringValue.slice(0, 157) + "..."
+            : stringValue;
+        return `<span class="val-str" title="${esc(stringValue)}">${esc(display)}</span>`;
       }
-    }
 
-    async function refreshOperations() {
-      try {
-        const r = await fetch('/_/operations?' + operationParams().toString());
-        if (r.ok) renderOperations(await r.json());
-      } catch (e) {console.error(e);}
-    }
+      function renderKV(entries) {
+        return (
+          '<table class="metrics"><tbody>' +
+          entries
+            .map(
+              ([key, value]) =>
+                `<tr><th scope="row">${esc(key)}</th><td>${valSpan(value)}</td></tr>`,
+            )
+            .join("") +
+          "</tbody></table>"
+        );
+      }
 
-    async function poll() {
-      try {
-        const r = await fetch('/_/metrics');
-        if (r.ok) render(await r.json());
+      function orderedEntries(object, filter) {
+        const added = new Set();
+        const entries = [];
+        for (const key of DETAIL_KEY_ORDER) {
+          if (key in object && (!filter || filter(key))) {
+            entries.push([key, object[key]]);
+            added.add(key);
+          }
+        }
+        Object.keys(object)
+          .filter((key) => !added.has(key) && (!filter || filter(key)))
+          .sort()
+          .forEach((key) => entries.push([key, object[key]]));
+        return entries;
+      }
+
+      function panelCopy(slot, event) {
+        event.stopPropagation();
+        if (copySlots[slot] && navigator.clipboard) {
+          navigator.clipboard.writeText(copySlots[slot]).catch(() => {});
+        }
+      }
+
+      function makeSection(title, entries, slot) {
+        if (!entries.length) return "";
+        copySlots[slot] = JSON.stringify(Object.fromEntries(entries), null, 2);
+        return `<details open class="rpc-section">
+          <summary><span>${esc(title)}</span>
+            <button class="rpc-copy" onclick="panelCopy('${slot}', event)" type="button">copy</button>
+          </summary>
+          <div class="rpc-section-body">${renderKV(entries)}</div>
+        </details>`;
+      }
+
+      function makeSummarySection(entry) {
+        const rows = [
+          ["time", entry.t],
+          ["method", entry.method || "-"],
+          ["path", entry.path || "-"],
+          ["latency", entry.latency_ms + " ms"],
+          ["status", entry.status || "-"],
+        ];
+        copySlots.summary = JSON.stringify(Object.fromEntries(rows), null, 2);
+        return `<details open class="rpc-section">
+          <summary><span>Summary</span>
+            <button class="rpc-copy" onclick="panelCopy('summary', event)" type="button">copy</button>
+          </summary>
+          <div class="rpc-section-body">${renderKV(rows)}</div>
+        </details>`;
+      }
+
+      function openPanel(index) {
+        const entry = operationEntries[index];
+        if (!entry) return;
+        selectedIdx = index;
+        selectedOperationID = entry.id;
+        document
+          .querySelectorAll(".recent tbody tr")
+          .forEach((row) => row.classList.remove("selected"));
+        document
+          .querySelector(`.recent tbody tr[data-idx="${index}"]`)
+          ?.classList.add("selected");
+
+        copySlots = {};
+        const details = entry.details || {};
+        const request = orderedEntries(details, (key) => !isResponseKey(key));
+        const response = orderedEntries(details, isResponseKey);
+        const error = entry.err
+          ? `<div class="error-block">${esc(entry.err)}</div>`
+          : "";
+        document.getElementById("rpc-panel-body").innerHTML =
+          makeSummarySection(entry) +
+          makeSection("Request", request, "request") +
+          makeSection("Response", response, "response") +
+          error;
+        document.getElementById("rpc-panel").hidden = false;
+        document
+          .getElementById("rpc-panel")
+          .setAttribute("aria-hidden", "false");
+      }
+
+      function closePanel() {
+        selectedIdx = -1;
+        selectedOperationID = null;
+        document.getElementById("rpc-panel").hidden = true;
+        document
+          .getElementById("rpc-panel")
+          .setAttribute("aria-hidden", "true");
+        document
+          .querySelectorAll(".recent tbody tr")
+          .forEach((row) => row.classList.remove("selected"));
+      }
+
+      function filterVal(id) {
+        return document.getElementById(id).value.trim();
+      }
+
+      function operationParams() {
+        const params = new URLSearchParams();
+        const fields = [
+          ["f-method", "method"],
+          ["f-status", "status_class"],
+          ["f-error", "error"],
+          ["f-q", "q"],
+          ["f-path", "path"],
+          ["f-min-latency", "min_latency_ms"],
+          ["f-limit", "limit"],
+        ];
+        for (const [id, key] of fields) {
+          const value = filterVal(id);
+          if (value) params.set(key, value);
+        }
+        params.set("order", "desc");
+        return params;
+      }
+
+      function updateOperationFilterOptions(entries) {
+        for (const entry of entries) {
+          if (entry.method) operationMethods.add(entry.method);
+        }
+
+        const select = document.getElementById("f-method");
+        const selected = select.value;
+        select.length = 1;
+        for (const value of [...operationMethods].sort((a, b) =>
+          a.localeCompare(b),
+        )) {
+          select.add(new Option(value, value));
+        }
+        select.value = selected;
+      }
+
+      function renderOperations(result) {
+        operationEntries = result.entries || [];
+        updateOperationFilterOptions(operationEntries);
+        document.getElementById("operations-body").innerHTML = operationEntries
+          .map((entry, index) => {
+            const className =
+              entry.err || entry.status >= 500
+                ? "err"
+                : entry.status >= 400
+                  ? "warn"
+                  : "ok";
+            const path = entry.path || "";
+            const shortPath = path.length > 60 ? "..." + path.slice(-57) : path;
+            return `<tr class="${className}" data-idx="${index}">
+              <td class="muted">${esc(entry.t)}</td>
+              <td class="muted">${esc(entry.method || "")}</td>
+              <td class="path" title="${esc(path)}">${esc(shortPath)}</td>
+              <td class="number">${entry.latency_ms} ms</td>
+              <td class="number">${entry.status || ""}</td>
+            </tr>`;
+          })
+          .join("");
+        setText(
+          "ops-count",
+          `${fmt(result.matched)} matched / ${fmt(result.total)} total - session ${result.session_id || "-"}`,
+        );
+        if (selectedOperationID != null) {
+          selectedIdx = operationEntries.findIndex(
+            (entry) => entry.id === selectedOperationID,
+          );
+        }
+        if (selectedIdx >= 0) {
+          document
+            .querySelector(`.recent tbody tr[data-idx="${selectedIdx}"]`)
+            ?.classList.add("selected");
+        } else if (selectedOperationID != null) {
+          closePanel();
+        }
+      }
+
+      async function refreshOperations() {
+        try {
+          const response = await fetch(
+            "/_/operations?" + operationParams().toString(),
+          );
+          if (response.ok) renderOperations(await response.json());
+        } catch (error) {
+          console.error(error);
+        }
+      }
+
+      async function pollIndexes() {
+        try {
+          const response = await fetch("/_/indexes");
+          if (response.ok) renderIndexes(await response.json());
+        } catch (error) {
+          console.error(error);
+        }
+        setTimeout(pollIndexes, 2000);
+      }
+
+      async function pollOperations() {
         await refreshOperations();
-      } catch (e) {console.error(e);}
-      setTimeout(poll, 2000);
-    }
-    poll();
-
-    document.getElementById('recent-wrap').addEventListener('click', function (ev) {
-      const tr = ev.target.closest('tr[data-idx]');
-      if (!tr) return;
-      const idx = parseInt(tr.dataset.idx, 10);
-      if (idx === selectedIdx) {closePanel(); return;}
-      openPanel(idx);
-    });
-    document.getElementById('ops-apply').addEventListener('click', function () {
-      closePanel();
-      refreshOperations();
-    });
-    document.getElementById('ops-clear').addEventListener('click', function () {
-      document.querySelectorAll('#ops-filters input').forEach(el => {
-        el.value = el.id === 'f-limit' ? '100' : '';
-      });
-      document.querySelectorAll('#ops-filters select').forEach(el => {el.value = '';});
-      closePanel();
-      refreshOperations();
-    });
-    document.getElementById('ops-filters').addEventListener('keydown', function (ev) {
-      if (ev.key === 'Enter') {
-        closePanel();
-        refreshOperations();
+        setTimeout(pollOperations, 2000);
       }
-    });
-    document.getElementById('rpc-panel-close').addEventListener('click', closePanel);
-    document.addEventListener('keydown', function (ev) {if (ev.key === 'Escape') closePanel();});
-  </script>
-</body>
 
+      document
+        .getElementById("operations-body")
+        .addEventListener("click", (event) => {
+          const row = event.target.closest("tr[data-idx]");
+          if (!row) return;
+          const index = Number.parseInt(row.dataset.idx, 10);
+          index === selectedIdx ? closePanel() : openPanel(index);
+        });
+      document.querySelectorAll("[data-index-sort]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const key = button.dataset.indexSort;
+          if (indexSortKey === key) {
+            indexSortDirection = indexSortDirection === "asc" ? "desc" : "asc";
+          } else {
+            indexSortKey = key;
+            indexSortDirection = "asc";
+          }
+          renderIndexes();
+        });
+      });
+      document
+        .getElementById("ops-filters")
+        .addEventListener("submit", (event) => {
+          event.preventDefault();
+          closePanel();
+          refreshOperations();
+        });
+      document.getElementById("ops-filters").addEventListener("reset", () => {
+        setTimeout(() => {
+          closePanel();
+          refreshOperations();
+        });
+      });
+      document
+        .getElementById("rpc-panel-close")
+        .addEventListener("click", closePanel);
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") closePanel();
+      });
+
+      pollIndexes();
+      pollOperations();
+    </script>
+  </body>
 </html>

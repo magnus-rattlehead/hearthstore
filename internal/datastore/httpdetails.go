@@ -211,6 +211,16 @@ func DSMutationDetails(req *datastorepb.CommitRequest) map[string]any {
 	kindSet := map[string]struct{}{}
 	transformOps := map[string]struct{}{}
 	var paths []string
+	pathCount := 0
+	addPath := func(path string) {
+		if path == "" {
+			return
+		}
+		pathCount++
+		if len(paths) < 5 {
+			paths = append(paths, path)
+		}
+	}
 
 	for _, m := range mutations {
 		for _, pt := range m.PropertyTransforms {
@@ -239,31 +249,19 @@ func DSMutationDetails(req *datastorepb.CommitRequest) map[string]any {
 			if k := entityKind(op.Insert); k != "" {
 				kindSet[k] = struct{}{}
 			}
-			if len(paths) < 5 {
-				if seg := entityLastSeg(op.Insert.GetKey()); seg != "" {
-					paths = append(paths, seg)
-				}
-			}
+			addPath(entityLastSeg(op.Insert.GetKey()))
 		case *datastorepb.Mutation_Update:
 			updates++
 			if k := entityKind(op.Update); k != "" {
 				kindSet[k] = struct{}{}
 			}
-			if len(paths) < 5 {
-				if seg := entityLastSeg(op.Update.GetKey()); seg != "" {
-					paths = append(paths, seg)
-				}
-			}
+			addPath(entityLastSeg(op.Update.GetKey()))
 		case *datastorepb.Mutation_Upsert:
 			upserts++
 			if k := entityKind(op.Upsert); k != "" {
 				kindSet[k] = struct{}{}
 			}
-			if len(paths) < 5 {
-				if seg := entityLastSeg(op.Upsert.GetKey()); seg != "" {
-					paths = append(paths, seg)
-				}
-			}
+			addPath(entityLastSeg(op.Upsert.GetKey()))
 		case *datastorepb.Mutation_Delete:
 			deletes++
 			if dp := op.Delete.GetPath(); len(dp) > 0 {
@@ -271,13 +269,11 @@ func DSMutationDetails(req *datastorepb.CommitRequest) map[string]any {
 				if last.GetKind() != "" {
 					kindSet[last.GetKind()] = struct{}{}
 				}
-				if len(paths) < 5 {
-					switch id := last.GetIdType().(type) {
-					case *datastorepb.Key_PathElement_Name:
-						paths = append(paths, id.Name)
-					case *datastorepb.Key_PathElement_Id:
-						paths = append(paths, fmt.Sprintf("%d", id.Id))
-					}
+				switch id := last.GetIdType().(type) {
+				case *datastorepb.Key_PathElement_Name:
+					addPath(id.Name)
+				case *datastorepb.Key_PathElement_Id:
+					addPath(fmt.Sprintf("%d", id.Id))
 				}
 			}
 		}
@@ -299,6 +295,9 @@ func DSMutationDetails(req *datastorepb.CommitRequest) map[string]any {
 		d["kinds"] = sortedKeys(kindSet)
 	}
 	if len(paths) > 0 {
+		if pathCount > len(paths) {
+			paths = append(paths, fmt.Sprintf("+%d more", pathCount-len(paths)))
+		}
 		d["paths"] = paths
 	}
 	if transforms > 0 {
